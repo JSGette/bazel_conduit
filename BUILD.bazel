@@ -1,1 +1,26 @@
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//proto:def.bzl", "go_proto_library")
+
 package(default_visibility = ["//visibility:public"])
+
+gazelle(name = "gazelle")
+
+go_proto_library(
+    name = "go_http_proto",
+    importpath = "google.golang.org/genproto/googleapis/api/httpbody",
+    protos = ["@googleapis//google/api:http_proto"],
+)
+
+go_proto_library(
+    name = "go_annotations_proto",
+    importpath = "google.golang.org/genproto/googleapis/api/annotations",
+    protos = ["@googleapis//google/api:annotations_proto"],
+    deps = [":go_http_proto"],
+)
+
+go_proto_library(
+    name = "go_build_proto",
+    importpath = "google.golang.org/genproto/googleapis/devtools/build/v1",
+    protos = ["@googleapis//google/devtools/build/v1:build_proto"],
+    deps = [":go_annotations_proto"],
+)
