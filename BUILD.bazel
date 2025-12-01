@@ -20,6 +20,7 @@ go_proto_library(
 
 go_proto_library(
     name = "go_build_proto",
+    compilers = ["@rules_go//proto:go_grpc"],
     importpath = "google.golang.org/genproto/googleapis/devtools/build/v1",
     protos = ["@googleapis//google/devtools/build/v1:build_proto"],
     deps = [":go_annotations_proto"],

@@ -1,0 +1,21 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "conduit_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/JSGette/bazel_conduit/cmd/conduit",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//:go_build_proto",
+        "//internal/bes",
+        "//internal/graph",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//reflection",
+    ],
+)
+
+go_binary(
+    name = "conduit",
+    embed = [":conduit_lib"],
+    visibility = ["//visibility:public"],
+)
