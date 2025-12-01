@@ -9,6 +9,7 @@ go_library(
         "//:go_build_proto",
         "//internal/bes",
         "//internal/graph",
+        "//internal/writer",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//reflection",
     ],

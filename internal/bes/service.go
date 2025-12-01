@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/JSGette/bazel_conduit/internal/graph"
+	"github.com/JSGette/bazel_conduit/internal/writer"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -17,11 +18,12 @@ type Service struct {
 	build.UnimplementedPublishBuildEventServer
 
 	graphManager *graph.Manager
+	jsonWriter   *writer.JSONWriter
 	logger       *slog.Logger
 }
 
 // NewService creates a new BES service instance
-func NewService(graphManager *graph.Manager, logger *slog.Logger) *Service {
+func NewService(graphManager *graph.Manager, jsonWriter *writer.JSONWriter, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -30,6 +32,7 @@ func NewService(graphManager *graph.Manager, logger *slog.Logger) *Service {
 
 	return &Service{
 		graphManager: graphManager,
+		jsonWriter:   jsonWriter,
 		logger:       logger,
 	}
 }
@@ -65,6 +68,15 @@ func (s *Service) PublishLifecycleEvent(
 		"invocation_id", invocationID,
 		"event_type", eventType,
 	)
+
+	// Write to JSON file if enabled
+	if err := s.jsonWriter.WriteLifecycleEvent(req); err != nil {
+		s.logger.Warn("Failed to write lifecycle event to JSON",
+			"error", err,
+			"build_id", buildID,
+		)
+		// Don't fail the request if JSON write fails
+	}
 
 	// Create or get graph
 	if buildID != "" {
@@ -168,6 +180,16 @@ func (s *Service) PublishBuildToolEventStream(
 			"event_type", eventType,
 		)
 
+		// Write to JSON file if enabled
+		if err := s.jsonWriter.WriteToolEvent(currentBuildID, currentInvocationID, seqNum, event); err != nil {
+			s.logger.Warn("Failed to write event to JSON",
+				"error", err,
+				"build_id", currentBuildID,
+				"sequence", seqNum,
+			)
+			// Don't fail the request if JSON write fails
+		}
+
 		// Store the event in the graph
 		if graphObj != nil {
 			eventID := fmt.Sprintf("%s-%d", currentBuildID, seqNum)
@@ -208,6 +230,14 @@ func (s *Service) PublishBuildToolEventStream(
 			"total_events", lastSeqNum,
 			"total_stored_events", graphObj.GetEventCount(),
 		)
+
+		// Close JSON file for this build
+		if err := s.jsonWriter.CloseBuild(currentBuildID); err != nil {
+			s.logger.Warn("Failed to close JSON file",
+				"error", err,
+				"build_id", currentBuildID,
+			)
+		}
 
 		// Schedule cleanup after 5 minutes
 		s.graphManager.ScheduleCleanup(currentBuildID, 5*60*1000000000)

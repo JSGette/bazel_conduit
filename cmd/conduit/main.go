@@ -11,14 +11,17 @@ import (
 
 	"github.com/JSGette/bazel_conduit/internal/bes"
 	"github.com/JSGette/bazel_conduit/internal/graph"
+	"github.com/JSGette/bazel_conduit/internal/writer"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
 
 var (
-	address = flag.String("address", "localhost:8080", "Address to listen on")
-	logJSON = flag.Bool("log-json", false, "Log in JSON format")
+	address   = flag.String("address", "localhost:8080", "Address to listen on")
+	logJSON   = flag.Bool("log-json", false, "Log in JSON format")
+	dumpJSON  = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
+	outputDir = flag.String("output-dir", "./bep-events", "Directory to write JSON event files")
 )
 
 func main() {
@@ -41,14 +44,28 @@ func main() {
 	logger.Info("Starting Bazel Conduit",
 		"address", *address,
 		"version", "0.1.0-dev",
+		"dump_json", *dumpJSON,
 	)
 
 	// Create graph manager
 	graphConfig := graph.DefaultConfig()
 	graphManager := graph.NewManager(graphConfig, logger)
 
+	// Create JSON writer if enabled
+	writerConfig := writer.Config{
+		OutputDir: *outputDir,
+		Enabled:   *dumpJSON,
+	}
+	jsonWriter, err := writer.NewJSONWriter(writerConfig, logger)
+	if err != nil {
+		logger.Error("Failed to create JSON writer",
+			"error", err,
+		)
+		os.Exit(1)
+	}
+
 	// Create BES service
-	besService := bes.NewService(graphManager, logger)
+	besService := bes.NewService(graphManager, jsonWriter, logger)
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
@@ -98,6 +115,13 @@ func main() {
 
 		// Stop accepting new connections
 		grpcServer.GracefulStop()
+
+		// Close JSON writer
+		if jsonWriter != nil {
+			if err := jsonWriter.Close(); err != nil {
+				logger.Error("Failed to close JSON writer", "error", err)
+			}
+		}
 
 		// Cleanup graph manager
 		graphManager.Shutdown()

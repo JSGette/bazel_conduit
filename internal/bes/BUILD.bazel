@@ -8,6 +8,7 @@ go_library(
     deps = [
         "//:go_build_proto",
         "//internal/graph",
+        "//internal/writer",
         "@org_golang_google_protobuf//types/known/emptypb",
     ],
 )
