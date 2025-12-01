@@ -1,5 +1,5 @@
-load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@rules_go//proto:def.bzl", "go_proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
 
 # Combined proto library for all dependencies
 proto_library(
@@ -70,4 +70,3 @@ go_proto_library(
     proto = ":deps_proto",
     visibility = ["//visibility:public"],
 )
-

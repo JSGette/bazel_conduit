@@ -10,22 +10,20 @@ import (
 	"syscall"
 
 	"github.com/JSGette/bazel_conduit/internal/bes"
-	"github.com/JSGette/bazel_conduit/internal/graph"
 	"github.com/JSGette/bazel_conduit/internal/translator"
-	"github.com/JSGette/bazel_conduit/internal/writer"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
 
 var (
-	address      = flag.String("address", "localhost:8080", "Address to listen on")
-	logJSON      = flag.Bool("log-json", false, "Log in JSON format")
-	dumpJSON     = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
-	outputDir    = flag.String("output-dir", "./bep-events", "Directory to write JSON event files")
-	dumpOTel     = flag.Bool("dump-otel", true, "Dump OTel spans to JSON files (enabled by default)")
-	otelDir      = flag.String("otel-dir", "./otel-spans", "Directory to write OTel span files")
-	otelBufSize  = flag.Int("otel-buffer-size", 100, "Number of spans to buffer before flushing")
+	address     = flag.String("address", "localhost:8080", "Address to listen on")
+	logJSON     = flag.Bool("log-json", false, "Log in JSON format")
+	dumpJSON    = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
+	outputDir   = flag.String("output-dir", "./bep-events", "Directory to write JSON event files")
+	dumpOTel    = flag.Bool("dump-otel", true, "Dump OTel spans to JSON files (enabled by default)")
+	otelDir     = flag.String("otel-dir", "./otel-spans", "Directory to write OTel span files")
+	otelBufSize = flag.Int("otel-buffer-size", 100, "Number of spans to buffer before flushing")
 )
 
 func main() {
@@ -33,15 +31,10 @@ func main() {
 
 	// Setup logger
 	var logger *slog.Logger
-	if *logJSON {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
-		}))
-	} else {
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
-		}))
-	}
+
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
 
 	slog.SetDefault(logger)
 
@@ -51,23 +44,6 @@ func main() {
 		"dump_json", *dumpJSON,
 		"dump_otel", *dumpOTel,
 	)
-
-	// Create graph manager
-	graphConfig := graph.DefaultConfig()
-	graphManager := graph.NewManager(graphConfig, logger)
-
-	// Create JSON writer if enabled
-	writerConfig := writer.Config{
-		OutputDir: *outputDir,
-		Enabled:   *dumpJSON,
-	}
-	jsonWriter, err := writer.NewJSONWriter(writerConfig, logger)
-	if err != nil {
-		logger.Error("Failed to create JSON writer",
-			"error", err,
-		)
-		os.Exit(1)
-	}
 
 	// Create OTel writer
 	otelWriterConfig := &translator.OTelWriterConfig{
@@ -84,7 +60,7 @@ func main() {
 	}
 
 	// Create BES service
-	besService := bes.NewService(graphManager, jsonWriter, otelWriter, logger)
+	besService := bes.NewService(logger)
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
@@ -135,22 +111,11 @@ func main() {
 		// Stop accepting new connections
 		grpcServer.GracefulStop()
 
-		// Close JSON writer
-		if jsonWriter != nil {
-			if err := jsonWriter.Close(); err != nil {
-				logger.Error("Failed to close JSON writer", "error", err)
-			}
-		}
-
 		// Close OTel writer
 		if otelWriter != nil {
 			otelWriter.CloseAll()
 			logger.Info("OTel writer closed")
 		}
-
-		// Cleanup graph manager
-		graphManager.Shutdown()
-
 		logger.Info("Shutdown complete")
 	}
 }

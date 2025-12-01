@@ -15,7 +15,6 @@ proto_library(
     ],
 )
 
-
 # Go proto library
 go_proto_library(
     name = "go_build_event_stream_proto",
@@ -31,7 +30,6 @@ go_proto_library(
         "//proto/build_event_stream/deps:package_load_metrics_proto",
     ],
 )
-
 
 go_library(
     name = "build_event_stream",
