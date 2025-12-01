@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/JSGette/bazel_conduit/internal/graph"
+	"github.com/JSGette/bazel_conduit/internal/translator"
 	"github.com/JSGette/bazel_conduit/internal/writer"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -19,11 +20,12 @@ type Service struct {
 
 	graphManager *graph.Manager
 	jsonWriter   *writer.JSONWriter
+	otelWriter   *translator.OTelWriter
 	logger       *slog.Logger
 }
 
 // NewService creates a new BES service instance
-func NewService(graphManager *graph.Manager, jsonWriter *writer.JSONWriter, logger *slog.Logger) *Service {
+func NewService(graphManager *graph.Manager, jsonWriter *writer.JSONWriter, otelWriter *translator.OTelWriter, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -33,6 +35,7 @@ func NewService(graphManager *graph.Manager, jsonWriter *writer.JSONWriter, logg
 	return &Service{
 		graphManager: graphManager,
 		jsonWriter:   jsonWriter,
+		otelWriter:   otelWriter,
 		logger:       logger,
 	}
 }
@@ -102,6 +105,7 @@ func (s *Service) PublishBuildToolEventStream(
 	var currentBuildID string
 	var currentInvocationID string
 	var graphObj *graph.EventGraph
+	var trans *translator.Translator
 	var lastSeqNum int64
 
 	s.logger.Info("Build tool event stream opened")
@@ -160,6 +164,13 @@ func (s *Service) PublishBuildToolEventStream(
 				"build_id", currentBuildID,
 				"trace_id", graphObj.TraceID,
 			)
+
+			// Create translator for BEP to OTel translation
+			trans = translator.NewTranslator(currentBuildID, currentInvocationID, s.logger)
+			s.logger.Debug("Translator initialized",
+				"build_id", currentBuildID,
+				"trace_id", trans.TraceID().String(),
+			)
 		}
 
 		// Validate sequence number
@@ -188,6 +199,28 @@ func (s *Service) PublishBuildToolEventStream(
 				"sequence", seqNum,
 			)
 			// Don't fail the request if JSON write fails
+		}
+
+		// Translate BEP event to OTel span
+		if trans != nil && s.otelWriter != nil {
+			span, err := trans.TranslateEvent(orderedEvent)
+			if err != nil {
+				s.logger.Warn("Failed to translate event to OTel span",
+					"error", err,
+					"build_id", currentBuildID,
+					"sequence", seqNum,
+				)
+			} else {
+				// Write OTel span to file if enabled
+				if err := s.otelWriter.WriteSpan(span); err != nil {
+					s.logger.Warn("Failed to write OTel span",
+						"error", err,
+						"build_id", currentBuildID,
+						"sequence", seqNum,
+						"span_id", span.SpanID.String(),
+					)
+				}
+			}
 		}
 
 		// Store the event in the graph
@@ -231,12 +264,26 @@ func (s *Service) PublishBuildToolEventStream(
 			"total_stored_events", graphObj.GetEventCount(),
 		)
 
+		// Log translation summary
+		if trans != nil {
+			s.logger.Info("OTel translation completed",
+				"trace_id", trans.TraceID().String(),
+				"total_spans", trans.GetSpanCount(),
+				"build_id", currentBuildID,
+			)
+		}
+
 		// Close JSON file for this build
 		if err := s.jsonWriter.CloseBuild(currentBuildID); err != nil {
 			s.logger.Warn("Failed to close JSON file",
 				"error", err,
 				"build_id", currentBuildID,
 			)
+		}
+
+		// Close OTel writer for this build
+		if s.otelWriter != nil {
+			s.otelWriter.CloseWriter(currentBuildID)
 		}
 
 		// Schedule cleanup after 5 minutes

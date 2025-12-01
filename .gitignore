@@ -1,1 +1,4 @@
 bazel-*
+bep-events/
+otel-spans/
+*.jsonl

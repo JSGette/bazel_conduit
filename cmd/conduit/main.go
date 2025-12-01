@@ -11,6 +11,7 @@ import (
 
 	"github.com/JSGette/bazel_conduit/internal/bes"
 	"github.com/JSGette/bazel_conduit/internal/graph"
+	"github.com/JSGette/bazel_conduit/internal/translator"
 	"github.com/JSGette/bazel_conduit/internal/writer"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
@@ -18,10 +19,13 @@ import (
 )
 
 var (
-	address   = flag.String("address", "localhost:8080", "Address to listen on")
-	logJSON   = flag.Bool("log-json", false, "Log in JSON format")
-	dumpJSON  = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
-	outputDir = flag.String("output-dir", "./bep-events", "Directory to write JSON event files")
+	address      = flag.String("address", "localhost:8080", "Address to listen on")
+	logJSON      = flag.Bool("log-json", false, "Log in JSON format")
+	dumpJSON     = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
+	outputDir    = flag.String("output-dir", "./bep-events", "Directory to write JSON event files")
+	dumpOTel     = flag.Bool("dump-otel", true, "Dump OTel spans to JSON files (enabled by default)")
+	otelDir      = flag.String("otel-dir", "./otel-spans", "Directory to write OTel span files")
+	otelBufSize  = flag.Int("otel-buffer-size", 100, "Number of spans to buffer before flushing")
 )
 
 func main() {
@@ -45,6 +49,7 @@ func main() {
 		"address", *address,
 		"version", "0.1.0-dev",
 		"dump_json", *dumpJSON,
+		"dump_otel", *dumpOTel,
 	)
 
 	// Create graph manager
@@ -64,8 +69,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create OTel writer
+	otelWriterConfig := &translator.OTelWriterConfig{
+		Enabled:    *dumpOTel,
+		OutputDir:  *otelDir,
+		BufferSize: *otelBufSize,
+	}
+	otelWriter := translator.NewOTelWriter(otelWriterConfig, logger)
+	if otelWriter != nil {
+		logger.Info("OTel writer initialized",
+			"output_dir", *otelDir,
+			"buffer_size", *otelBufSize,
+		)
+	}
+
 	// Create BES service
-	besService := bes.NewService(graphManager, jsonWriter, logger)
+	besService := bes.NewService(graphManager, jsonWriter, otelWriter, logger)
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
@@ -121,6 +140,12 @@ func main() {
 			if err := jsonWriter.Close(); err != nil {
 				logger.Error("Failed to close JSON writer", "error", err)
 			}
+		}
+
+		// Close OTel writer
+		if otelWriter != nil {
+			otelWriter.CloseAll()
+			logger.Info("OTel writer closed")
 		}
 
 		// Cleanup graph manager

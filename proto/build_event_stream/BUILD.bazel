@@ -1,0 +1,41 @@
+load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//proto:def.bzl", "go_proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+
+# Proto library for build_event_stream
+proto_library(
+    name = "build_event_stream_proto",
+    srcs = ["build_event_stream.proto"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//proto/build_event_stream/deps:deps_proto",
+        "@protobuf//:any_proto",
+        "@protobuf//:duration_proto",
+        "@protobuf//:timestamp_proto",
+    ],
+)
+
+
+# Go proto library
+go_proto_library(
+    name = "go_build_event_stream_proto",
+    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream",
+    proto = ":build_event_stream_proto",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//proto/build_event_stream/deps:action_cache_proto",
+        "//proto/build_event_stream/deps:analysis_cache_service_metadata_status_proto",
+        "//proto/build_event_stream/deps:command_line_proto",
+        "//proto/build_event_stream/deps:failure_details_proto",
+        "//proto/build_event_stream/deps:invocation_policy_proto",
+        "//proto/build_event_stream/deps:package_load_metrics_proto",
+    ],
+)
+
+
+go_library(
+    name = "build_event_stream",
+    embed = [":go_build_event_stream_proto"],
+    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream",
+    visibility = ["//visibility:public"],
+)
