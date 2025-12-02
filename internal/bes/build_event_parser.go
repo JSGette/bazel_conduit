@@ -37,7 +37,7 @@ type BuildContext struct {
 	invocationID string
 	traceID      trace.TraceID
 	rootCtx      context.Context
-	rootSpan     trace.Span
+	rootSpan     trace.Span // Root span for the entire invocation
 
 	// Map event IDs to their contexts (for parenting)
 	eventContexts map[string]context.Context // eventID -> context containing span
@@ -47,9 +47,10 @@ type BuildContext struct {
 	childToParent map[string]string // childEventID -> parentEventID
 
 	// Timing and lifecycle
-	startTime    time.Time
-	lastActivity time.Time
-	finished     bool
+	startTime       time.Time
+	lastActivity    time.Time
+	finished        bool
+	rootSpanStarted bool // Track if root span has been created
 
 	mu sync.RWMutex
 }
@@ -103,12 +104,11 @@ func (p *BuildEventParser) ParseBuildEventStreamBuildEvent(
 			"build_id", buildID,
 			"invocation_id", invocationID,
 			"type", csf.Type.String())
-
-		// End all open spans for this build
+		
+		// End all open child spans (but not the root span - that's for lifecycle events)
 		buildCtx := p.getBuildContext(invocationID)
 		if buildCtx != nil {
-			buildCtx.finishBuild()
-			p.scheduleCleanup(invocationID)
+			buildCtx.finishChildSpans()
 		}
 		return nil
 	}
@@ -170,10 +170,10 @@ func (p *BuildEventParser) ParseBuildEventStreamBuildEvent(
 	}
 	// Otherwise, span stays open for children to nest under
 
-	// 11. Cleanup on build finished
+	// 11. On BuildFinished, end child spans (root span ends via lifecycle event)
 	if eventType == "BuildFinished" {
-		buildCtx.finishBuild()
-		p.scheduleCleanup(invocationID)
+		buildCtx.finishChildSpans()
+		// Note: Don't cleanup yet - wait for InvocationAttemptFinished lifecycle event
 	}
 
 	return nil
@@ -205,15 +205,16 @@ func (p *BuildEventParser) getOrCreateBuildContext(
 	}))
 
 	buildCtx := &BuildContext{
-		buildID:       buildID,
-		invocationID:  invocationID,
-		traceID:       traceID,
-		rootCtx:       rootCtx,
-		eventContexts: make(map[string]context.Context),
-		eventSpans:    make(map[string]trace.Span),
-		childToParent: make(map[string]string),
-		startTime:     time.Now(),
-		lastActivity:  time.Now(),
+		buildID:         buildID,
+		invocationID:    invocationID,
+		traceID:         traceID,
+		rootCtx:         rootCtx,
+		eventContexts:   make(map[string]context.Context),
+		eventSpans:      make(map[string]trace.Span),
+		childToParent:   make(map[string]string),
+		startTime:       time.Now(),
+		lastActivity:    time.Now(),
+		rootSpanStarted: false,
 	}
 
 	p.activeBuilds.Store(invocationID, buildCtx)
@@ -224,6 +225,96 @@ func (p *BuildEventParser) getOrCreateBuildContext(
 		"trace_id", traceID.String())
 
 	return buildCtx
+}
+
+// StartInvocationSpan creates the root span for the invocation (from lifecycle event)
+func (p *BuildEventParser) StartInvocationSpan(
+	ctx context.Context,
+	buildID string,
+	invocationID string,
+	eventType string,
+) error {
+	buildCtx := p.getOrCreateBuildContext(ctx, buildID, invocationID)
+
+	buildCtx.mu.Lock()
+	defer buildCtx.mu.Unlock()
+
+	// Don't create multiple root spans
+	if buildCtx.rootSpanStarted {
+		p.logger.Debug("Root span already started",
+			"invocation_id", invocationID)
+		return nil
+	}
+
+	// Create root span for the entire invocation
+	spanCtx, span := p.tracer.Start(
+		buildCtx.rootCtx,
+		"Bazel Invocation",
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithTimestamp(time.Now()),
+	)
+
+	// Add invocation attributes
+	span.SetAttributes(
+		attribute.String("invocation.id", invocationID),
+		attribute.String("invocation.build_id", buildID),
+		attribute.String("invocation.event", eventType),
+	)
+
+	buildCtx.rootSpan = span
+	buildCtx.rootCtx = spanCtx
+	buildCtx.rootSpanStarted = true
+
+	p.logger.Info("Started root invocation span",
+		"invocation_id", invocationID,
+		"build_id", buildID,
+		"trace_id", buildCtx.traceID.String())
+
+	return nil
+}
+
+// EndInvocationSpan ends the root span for the invocation (from lifecycle event)
+func (p *BuildEventParser) EndInvocationSpan(
+	invocationID string,
+	success bool,
+) error {
+	buildCtx := p.getBuildContext(invocationID)
+	if buildCtx == nil {
+		p.logger.Warn("No build context found for invocation",
+			"invocation_id", invocationID)
+		return nil
+	}
+
+	buildCtx.mu.Lock()
+	
+	if !buildCtx.rootSpanStarted {
+		buildCtx.mu.Unlock()
+		p.logger.Debug("Root span not started",
+			"invocation_id", invocationID)
+		return nil
+	}
+
+	if buildCtx.rootSpan != nil && buildCtx.rootSpan.IsRecording() {
+		// Set status based on success
+		if success {
+			buildCtx.rootSpan.SetStatus(codes.Ok, "Invocation completed successfully")
+		} else {
+			buildCtx.rootSpan.SetStatus(codes.Error, "Invocation failed")
+		}
+
+		buildCtx.rootSpan.End()
+
+		p.logger.Info("Ended root invocation span",
+			"invocation_id", invocationID,
+			"success", success)
+	}
+	
+	buildCtx.mu.Unlock()
+
+	// Schedule cleanup after ending the root span
+	p.scheduleCleanup(invocationID)
+
+	return nil
 }
 
 // findParentContext finds the parent context for an event
@@ -272,7 +363,20 @@ func (bc *BuildContext) registerChildren(
 	}
 }
 
-// finishBuild marks the build as finished and ends all open spans (idempotent)
+// finishChildSpans ends all open child spans (but not the root span)
+func (bc *BuildContext) finishChildSpans() {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	// End all remaining open child spans
+	for _, span := range bc.eventSpans {
+		if span.IsRecording() {
+			span.End()
+		}
+	}
+}
+
+// finishBuild marks the build as finished and ends all spans including root (idempotent)
 func (bc *BuildContext) finishBuild() {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -284,11 +388,16 @@ func (bc *BuildContext) finishBuild() {
 
 	bc.finished = true
 
-	// End all remaining open spans
+	// End all remaining open child spans
 	for _, span := range bc.eventSpans {
 		if span.IsRecording() {
 			span.End()
 		}
+	}
+
+	// End root span if it exists
+	if bc.rootSpan != nil && bc.rootSpan.IsRecording() {
+		bc.rootSpan.End()
 	}
 }
 

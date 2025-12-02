@@ -47,6 +47,7 @@ func (s *Service) PublishLifecycleEvent(
 	}
 
 	streamID := orderedEvent.GetStreamId()
+	event := orderedEvent.GetEvent()
 
 	projectID := req.GetProjectId()
 	buildID := ""
@@ -57,10 +58,46 @@ func (s *Service) PublishLifecycleEvent(
 		invocationID = streamID.GetInvocationId()
 	}
 
+	// Determine event type
+	var eventType string
+	switch event.GetEvent().(type) {
+	case *build.BuildEvent_InvocationAttemptStarted_:
+		eventType = "InvocationAttemptStarted"
+		// Create root span for the invocation
+		if err := s.parser.StartInvocationSpan(ctx, buildID, invocationID, eventType); err != nil {
+			s.logger.Error("Failed to start invocation span",
+				"error", err,
+				"invocation_id", invocationID)
+		}
+
+	case *build.BuildEvent_InvocationAttemptFinished_:
+		eventType = "InvocationAttemptFinished"
+		// End root span for the invocation
+		finished := event.GetInvocationAttemptFinished()
+		// Consider successful if status is not set or result is SUCCESS
+		success := finished == nil || 
+			finished.InvocationStatus == nil || 
+			finished.InvocationStatus.Result == build.BuildStatus_COMMAND_SUCCEEDED
+
+		if err := s.parser.EndInvocationSpan(invocationID, success); err != nil {
+			s.logger.Error("Failed to end invocation span",
+				"error", err,
+				"invocation_id", invocationID)
+		}
+
+	case *build.BuildEvent_BuildEnqueued_:
+		eventType = "BuildEnqueued"
+	case *build.BuildEvent_BuildFinished_:
+		eventType = "BuildFinished"
+	default:
+		eventType = fmt.Sprintf("%T", event.GetEvent())
+	}
+
 	s.logger.Info("Received lifecycle event",
 		"project_id", projectID,
 		"build_id", buildID,
 		"invocation_id", invocationID,
+		"event_type", eventType,
 	)
 
 	return &emptypb.Empty{}, nil
