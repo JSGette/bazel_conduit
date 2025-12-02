@@ -60,11 +60,13 @@ func (s *Service) PublishLifecycleEvent(
 
 	// Determine event type
 	var eventType string
+	eventTime := event.GetEventTime()
+
 	switch event.GetEvent().(type) {
 	case *build.BuildEvent_InvocationAttemptStarted_:
 		eventType = "InvocationAttemptStarted"
 		// Create root span for the invocation
-		if err := s.parser.StartInvocationSpan(ctx, buildID, invocationID, eventType); err != nil {
+		if err := s.parser.StartInvocationSpan(ctx, buildID, invocationID, eventType, eventTime); err != nil {
 			s.logger.Error("Failed to start invocation span",
 				"error", err,
 				"invocation_id", invocationID)
@@ -75,11 +77,11 @@ func (s *Service) PublishLifecycleEvent(
 		// End root span for the invocation
 		finished := event.GetInvocationAttemptFinished()
 		// Consider successful if status is not set or result is SUCCESS
-		success := finished == nil || 
-			finished.InvocationStatus == nil || 
+		success := finished == nil ||
+			finished.InvocationStatus == nil ||
 			finished.InvocationStatus.Result == build.BuildStatus_COMMAND_SUCCEEDED
 
-		if err := s.parser.EndInvocationSpan(invocationID, success); err != nil {
+		if err := s.parser.EndInvocationSpan(invocationID, success, eventTime); err != nil {
 			s.logger.Error("Failed to end invocation span",
 				"error", err,
 				"invocation_id", invocationID)

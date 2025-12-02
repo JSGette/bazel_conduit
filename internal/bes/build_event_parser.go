@@ -18,6 +18,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.28.0"
 	"go.opentelemetry.io/otel/trace"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // BuildEventParser manages parsing BEP events and creating OpenTelemetry spans
@@ -104,7 +105,7 @@ func (p *BuildEventParser) ParseBuildEventStreamBuildEvent(
 			"build_id", buildID,
 			"invocation_id", invocationID,
 			"type", csf.Type.String())
-		
+
 		// End all open child spans (but not the root span - that's for lifecycle events)
 		buildCtx := p.getBuildContext(invocationID)
 		if buildCtx != nil {
@@ -233,6 +234,7 @@ func (p *BuildEventParser) StartInvocationSpan(
 	buildID string,
 	invocationID string,
 	eventType string,
+	eventTime *timestamppb.Timestamp,
 ) error {
 	buildCtx := p.getOrCreateBuildContext(ctx, buildID, invocationID)
 
@@ -246,12 +248,18 @@ func (p *BuildEventParser) StartInvocationSpan(
 		return nil
 	}
 
+	// Use event time if available, otherwise current time
+	startTime := time.Now()
+	if eventTime != nil && eventTime.IsValid() {
+		startTime = eventTime.AsTime()
+	}
+
 	// Create root span for the entire invocation
 	spanCtx, span := p.tracer.Start(
 		buildCtx.rootCtx,
 		"Bazel Invocation",
 		trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithTimestamp(time.Now()),
+		trace.WithTimestamp(startTime),
 	)
 
 	// Add invocation attributes
@@ -264,11 +272,13 @@ func (p *BuildEventParser) StartInvocationSpan(
 	buildCtx.rootSpan = span
 	buildCtx.rootCtx = spanCtx
 	buildCtx.rootSpanStarted = true
+	buildCtx.startTime = startTime
 
 	p.logger.Info("Started root invocation span",
 		"invocation_id", invocationID,
 		"build_id", buildID,
-		"trace_id", buildCtx.traceID.String())
+		"trace_id", buildCtx.traceID.String(),
+		"start_time", startTime)
 
 	return nil
 }
@@ -277,6 +287,7 @@ func (p *BuildEventParser) StartInvocationSpan(
 func (p *BuildEventParser) EndInvocationSpan(
 	invocationID string,
 	success bool,
+	eventTime *timestamppb.Timestamp,
 ) error {
 	buildCtx := p.getBuildContext(invocationID)
 	if buildCtx == nil {
@@ -286,7 +297,7 @@ func (p *BuildEventParser) EndInvocationSpan(
 	}
 
 	buildCtx.mu.Lock()
-	
+
 	if !buildCtx.rootSpanStarted {
 		buildCtx.mu.Unlock()
 		p.logger.Debug("Root span not started",
@@ -302,13 +313,21 @@ func (p *BuildEventParser) EndInvocationSpan(
 			buildCtx.rootSpan.SetStatus(codes.Error, "Invocation failed")
 		}
 
-		buildCtx.rootSpan.End()
+		// Use event time if available, otherwise current time
+		endTime := time.Now()
+		if eventTime != nil && eventTime.IsValid() {
+			endTime = eventTime.AsTime()
+		}
+
+		buildCtx.rootSpan.End(trace.WithTimestamp(endTime))
 
 		p.logger.Info("Ended root invocation span",
 			"invocation_id", invocationID,
-			"success", success)
+			"success", success,
+			"end_time", endTime,
+			"duration", endTime.Sub(buildCtx.startTime))
 	}
-	
+
 	buildCtx.mu.Unlock()
 
 	// Schedule cleanup after ending the root span
