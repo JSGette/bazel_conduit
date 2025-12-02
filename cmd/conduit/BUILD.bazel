@@ -8,7 +8,6 @@ go_library(
     deps = [
         "//:go_build_proto",
         "//internal/bes",
-        "//internal/translator",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//reflection",
     ],

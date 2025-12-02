@@ -7,9 +7,7 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/JSGette/bazel_conduit/internal/graph"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -29,7 +27,7 @@ func NewService(logger *slog.Logger) *Service {
 
 	logger.Info("Initializing BES service")
 
-	parser := NewBuildEventParser(logger, true, true)
+	parser := NewBuildEventParser(logger)
 
 	return &Service{
 		logger: logger,
@@ -49,7 +47,6 @@ func (s *Service) PublishLifecycleEvent(
 	}
 
 	streamID := orderedEvent.GetStreamId()
-	event := orderedEvent.GetEvent()
 
 	projectID := req.GetProjectId()
 	buildID := ""
@@ -60,13 +57,10 @@ func (s *Service) PublishLifecycleEvent(
 		invocationID = streamID.GetInvocationId()
 	}
 
-	eventType := graph.GetEventType(event)
-
 	s.logger.Info("Received lifecycle event",
 		"project_id", projectID,
 		"build_id", buildID,
 		"invocation_id", invocationID,
-		"event_type", eventType,
 	)
 
 	return &emptypb.Empty{}, nil
@@ -112,43 +106,6 @@ func (s *Service) PublishBuildToolEventStream(
 		seqNum := orderedEvent.GetSequenceNumber()
 		event := orderedEvent.GetEvent()
 
-		eventTypes := map[string]string{
-			"progress":                      "Progress",
-			"aborted":                       "Aborted",
-			"started":                       "BuildStarted",
-			"unstructuredCommandLine":       "UnstructuredCommandLine",
-			"structuredCommandLine":         "StructuredCommandLine",
-			"options_parsed":                "OptionsParsed",
-			"workspace_status":              "WorkspaceStatus",
-			"fetch":                         "Fetch",
-			"configuration":                 "Configuration",
-			"pattern_expanded":              "PatternExpanded",
-			"targetConfigured":              "TargetConfigured",
-			"action_executed":               "ActionExecuted",
-			"namedSet":                      "NamedSetOfFiles",
-			"targetCompleted":               "TargetComplete",
-			"testResult":                    "TestResult",
-			"testProgress":                  "TestProgress",
-			"testSummary":                   "TestSummary",
-			"targetSummary":                 "TargetSummary",
-			"buildFinished":                 "BuildFinished",
-			"buildToolLogs":                 "BuildToolLogs",
-			"buildMetrics":                  "BuildMetrics",
-			"workspace_info":                "WorkspaceInfo",
-			"build_metadata":                "BuildMetadata",
-			"convenienceSymlinksIdentified": "ConvenienceSymlinksIdentified",
-			"execRequest":                   "ExecRequest",
-		}
-
-		s.logger.Debug("Available event types",
-			"event_types", eventTypes,
-		)
-
-		jsonEvent, err := protojson.Marshal(event)
-		s.logger.Debug("RECEIVED BUILD TOOL EVENT",
-			"event", string(jsonEvent),
-		)
-
 		// First event initializes the stream
 		if currentBuildID == "" && streamID != nil {
 			currentBuildID = streamID.GetBuildId()
@@ -159,15 +116,22 @@ func (s *Service) PublishBuildToolEventStream(
 				"build_id", currentBuildID,
 				"invocation_id", currentInvocationID,
 			)
+		}
 
-			// Create or get existing event graph for this build
-			if err != nil {
-				s.logger.Error("Failed to create event graph",
-					"error", err,
-					"build_id", currentBuildID,
-				)
-				return err
-			}
+		// Parse the event and create spans
+		err = s.parser.ParseBuildEventStreamBuildEvent(
+			stream.Context(),
+			currentBuildID,
+			currentInvocationID,
+			event,
+		)
+		if err != nil {
+			s.logger.Error("Failed to parse build event",
+				"error", err,
+				"build_id", currentBuildID,
+				"sequence", seqNum,
+			)
+			// Continue processing even if one event fails
 		}
 
 		// Validate sequence number

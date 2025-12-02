@@ -10,20 +10,15 @@ import (
 	"syscall"
 
 	"github.com/JSGette/bazel_conduit/internal/bes"
-	"github.com/JSGette/bazel_conduit/internal/translator"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
 
 var (
-	address     = flag.String("address", "localhost:8080", "Address to listen on")
-	logJSON     = flag.Bool("log-json", false, "Log in JSON format")
-	dumpJSON    = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
-	outputDir   = flag.String("output-dir", "./bep-events", "Directory to write JSON event files")
-	dumpOTel    = flag.Bool("dump-otel", true, "Dump OTel spans to JSON files (enabled by default)")
-	otelDir     = flag.String("otel-dir", "./otel-spans", "Directory to write OTel span files")
-	otelBufSize = flag.Int("otel-buffer-size", 100, "Number of spans to buffer before flushing")
+	address  = flag.String("address", "localhost:8080", "Address to listen on")
+	logJSON  = flag.Bool("log-json", false, "Log in JSON format")
+	dumpJSON = flag.Bool("dump-json", false, "Dump BEP events to JSON files")
 )
 
 func main() {
@@ -42,24 +37,9 @@ func main() {
 		"address", *address,
 		"version", "0.1.0-dev",
 		"dump_json", *dumpJSON,
-		"dump_otel", *dumpOTel,
 	)
 
-	// Create OTel writer
-	otelWriterConfig := &translator.OTelWriterConfig{
-		Enabled:    *dumpOTel,
-		OutputDir:  *otelDir,
-		BufferSize: *otelBufSize,
-	}
-	otelWriter := translator.NewOTelWriter(otelWriterConfig, logger)
-	if otelWriter != nil {
-		logger.Info("OTel writer initialized",
-			"output_dir", *otelDir,
-			"buffer_size", *otelBufSize,
-		)
-	}
-
-	// Create BES service
+	// Create BES service with OpenTelemetry support
 	besService := bes.NewService(logger)
 
 	// Create gRPC server
@@ -111,11 +91,6 @@ func main() {
 		// Stop accepting new connections
 		grpcServer.GracefulStop()
 
-		// Close OTel writer
-		if otelWriter != nil {
-			otelWriter.CloseAll()
-			logger.Info("OTel writer closed")
-		}
 		logger.Info("Shutdown complete")
 	}
 }
