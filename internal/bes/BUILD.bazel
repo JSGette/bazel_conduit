@@ -29,6 +29,9 @@ go_test(
     deps = [
         "//:go_build_proto",
         "//proto/build_event_stream",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest",
         "@org_golang_google_protobuf//types/known/anypb",
+        "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )

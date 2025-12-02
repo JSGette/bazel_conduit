@@ -16,6 +16,7 @@ use_repo(
     "com_github_google_uuid",
     "io_opentelemetry_go_otel",
     "io_opentelemetry_go_otel_sdk",
+    "io_opentelemetry_go_otel_sdk_metric",
     "io_opentelemetry_go_otel_trace",
     "org_golang_google_grpc",
     "org_golang_google_protobuf",

@@ -97,14 +97,41 @@ func (p *BuildEventParser) ParseBuildEventStreamBuildEvent(
 	invocationID string,
 	event *build.BuildEvent,
 ) error {
-	// 1. Unmarshal BazelEvent from Any
+	// 1. Handle ComponentStreamFinished (signals end of stream)
+	if csf := event.GetComponentStreamFinished(); csf != nil {
+		p.logger.Debug("Received ComponentStreamFinished",
+			"build_id", buildID,
+			"invocation_id", invocationID,
+			"type", csf.Type.String())
+
+		// End all open spans for this build
+		buildCtx := p.getBuildContext(invocationID)
+		if buildCtx != nil {
+			buildCtx.finishBuild()
+			p.scheduleCleanup(invocationID)
+		}
+		return nil
+	}
+
+	// 2. Check if this is a BazelEvent (most common case)
+	if event.GetBazelEvent() == nil {
+		// Log other non-BazelEvent types for debugging
+		p.logger.Debug("Received non-BazelEvent",
+			"build_id", buildID,
+			"invocation_id", invocationID,
+			"event_type", fmt.Sprintf("%T", event.GetEvent()),
+			"event", event.String())
+		return nil
+	}
+
+	// 2. Unmarshal BazelEvent from Any
 	bazelEvent := &build_event_stream.BuildEvent{}
 	if err := event.GetBazelEvent().UnmarshalTo(bazelEvent); err != nil {
 		p.logger.Error("Failed to unmarshal Bazel event", "error", err)
 		return err
 	}
 
-	// 2. Extract event ID and type
+	// 3. Extract event ID and type
 	eventID := extractEventID(bazelEvent.Id)
 	eventType := getEventType(bazelEvent)
 
@@ -114,13 +141,13 @@ func (p *BuildEventParser) ParseBuildEventStreamBuildEvent(
 		"build_id", buildID,
 		"invocation_id", invocationID)
 
-	// 3. Get or create build context
+	// 4. Get or create build context
 	buildCtx := p.getOrCreateBuildContext(ctx, buildID, invocationID)
 
-	// 4. Find parent context
+	// 5. Find parent context
 	parentCtx := buildCtx.findParentContext(eventID)
 
-	// 5. Create span with parent
+	// 6. Create span with parent
 	spanCtx, span := p.tracer.Start(
 		parentCtx,
 		eventType, // Use event type as span name
@@ -128,27 +155,35 @@ func (p *BuildEventParser) ParseBuildEventStreamBuildEvent(
 		trace.WithTimestamp(getEventStartTime(bazelEvent)),
 	)
 
-	// 6. Add attributes
+	// 7. Add attributes
 	p.addSpanAttributes(span, bazelEvent, buildID, invocationID, eventID)
 
-	// 7. Store span context for children
+	// 8. Store span context for children
 	buildCtx.storeEventContext(eventID, spanCtx, span)
 
-	// 8. Register announced children
+	// 9. Register announced children
 	buildCtx.registerChildren(eventID, bazelEvent.Children)
 
-	// 9. Handle span lifecycle
+	// 10. Handle span lifecycle
 	if shouldEndSpanImmediately(bazelEvent) {
 		span.End(trace.WithTimestamp(getEventEndTime(bazelEvent)))
 	}
 	// Otherwise, span stays open for children to nest under
 
-	// 10. Cleanup on build finished
+	// 11. Cleanup on build finished
 	if eventType == "BuildFinished" {
 		buildCtx.finishBuild()
 		p.scheduleCleanup(invocationID)
 	}
 
+	return nil
+}
+
+// getBuildContext gets existing build context (without creating)
+func (p *BuildEventParser) getBuildContext(invocationID string) *BuildContext {
+	if val, ok := p.activeBuilds.Load(invocationID); ok {
+		return val.(*BuildContext)
+	}
 	return nil
 }
 
@@ -237,10 +272,15 @@ func (bc *BuildContext) registerChildren(
 	}
 }
 
-// finishBuild marks the build as finished and ends all open spans
+// finishBuild marks the build as finished and ends all open spans (idempotent)
 func (bc *BuildContext) finishBuild() {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+
+	// Already finished, nothing to do
+	if bc.finished {
+		return
+	}
 
 	bc.finished = true
 
