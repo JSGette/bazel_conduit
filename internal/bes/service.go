@@ -18,6 +18,7 @@ type Service struct {
 	build.UnimplementedPublishBuildEventServer
 
 	logger *slog.Logger
+	parser *BuildEventParser
 }
 
 // NewService creates a new BES service instance
@@ -28,8 +29,11 @@ func NewService(logger *slog.Logger) *Service {
 
 	logger.Info("Initializing BES service")
 
+	parser := NewBuildEventParser(logger, true, true)
+
 	return &Service{
 		logger: logger,
+		parser: parser,
 	}
 }
 
