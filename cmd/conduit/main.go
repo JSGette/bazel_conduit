@@ -44,8 +44,19 @@ func main() {
 		"dump_otel", *dumpOTel,
 	)
 
-	// Create BES service
-	besService := bes.NewService(logger)
+	// Create BES service with configuration
+	besService, err := bes.NewService(logger, bes.ServiceConfig{
+		DumpJSON: *dumpJSON,
+		DumpOTel: *dumpOTel,
+		OTelDir:  *otelDir,
+	})
+	if err != nil {
+		logger.Error("Failed to create BES service",
+			"error", err,
+		)
+		os.Exit(1)
+	}
+	defer besService.Close()
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
@@ -87,6 +98,7 @@ func main() {
 	select {
 	case err := <-serverErrors:
 		logger.Error("Server error", "error", err)
+		besService.Close()
 	case sig := <-shutdown:
 		logger.Info("Shutdown signal received", "signal", sig.String())
 
@@ -95,6 +107,11 @@ func main() {
 
 		// Stop accepting new connections
 		grpcServer.GracefulStop()
+
+		// Close the BES service to flush any remaining data
+		if err := besService.Close(); err != nil {
+			logger.Error("Error closing BES service", "error", err)
+		}
 
 		logger.Info("Shutdown complete")
 	}

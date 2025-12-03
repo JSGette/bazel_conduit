@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
 
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -17,23 +20,45 @@ type Service struct {
 	build.UnimplementedPublishBuildEventServer
 
 	logger *slog.Logger
-	parser *BuildEventParser
+	config ServiceConfig
+}
+
+// ServiceConfig holds configuration for the BES service
+type ServiceConfig struct {
+	DumpJSON bool
+	DumpOTel bool
+	OTelDir  string
 }
 
 // NewService creates a new BES service instance
-func NewService(logger *slog.Logger) *Service {
+func NewService(logger *slog.Logger, config ServiceConfig) (*Service, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	logger.Info("Initializing BES service")
+	logger.Info("Initializing BES service",
+		"dump_json", config.DumpJSON,
+		"dump_otel", config.DumpOTel,
+		"otel_dir", config.OTelDir,
+	)
 
-	parser := NewBuildEventParser(logger, true, true)
+	// Create output directory if needed
+	if config.DumpOTel {
+		if err := os.MkdirAll(config.OTelDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create OTEL output directory: %w", err)
+		}
+	}
 
 	return &Service{
 		logger: logger,
-		parser: parser,
-	}
+		config: config,
+	}, nil
+}
+
+// Close cleans up resources held by the service
+func (s *Service) Close() error {
+	s.logger.Info("Closing BES service")
+	return nil
 }
 
 // PublishLifecycleEvent handles high-level build lifecycle events
@@ -77,6 +102,39 @@ func (s *Service) PublishBuildToolEventStream(
 	var lastSeqNum int64
 
 	s.logger.Info("Build tool event stream opened")
+
+	// Create a new parser and exporter for this build
+	var parser *BuildEventParser
+	var exporter TraceExporter
+
+	if s.config.DumpOTel {
+		// Generate unique filename with timestamp
+		timestamp := time.Now().Format("20060102-150405")
+		filename := filepath.Join(s.config.OTelDir, fmt.Sprintf("otel-spans-%s.json", timestamp))
+
+		s.logger.Info("Creating JSON exporter for build", "filename", filename)
+
+		var err error
+		exporter, err = NewJSONFileExporter(filename)
+		if err != nil {
+			s.logger.Error("Failed to create JSON exporter", "error", err)
+			// Continue without exporter
+		}
+	}
+
+	if exporter != nil {
+		parser = NewBuildEventParserWithExporter(s.logger, exporter)
+	} else {
+		parser = NewBuildEventParser(s.logger, s.config.DumpJSON, s.config.DumpOTel)
+	}
+
+	defer func() {
+		if parser != nil {
+			if err := parser.Close(); err != nil {
+				s.logger.Error("Failed to close parser", "error", err)
+			}
+		}
+	}()
 
 	// Process events from the stream
 	for {
@@ -177,6 +235,19 @@ func (s *Service) PublishBuildToolEventStream(
 
 		lastSeqNum = seqNum
 
+		// Parse the event through the BuildEventParser
+		if event != nil && parser != nil {
+			_, err := parser.ParseBuildEvent(event)
+			if err != nil {
+				s.logger.Error("Failed to parse build event",
+					"error", err,
+					"build_id", currentBuildID,
+					"sequence", seqNum,
+				)
+				// Continue processing despite parse errors
+			}
+		}
+
 		// Send acknowledgment back to Bazel
 		resp := &build.PublishBuildToolEventStreamResponse{
 			StreamId:       streamID,
@@ -192,6 +263,9 @@ func (s *Service) PublishBuildToolEventStream(
 			return err
 		}
 	}
+
+	s.logger.Info("Build stream complete")
+	// Parser will be closed by the defer function
 
 	return nil
 }

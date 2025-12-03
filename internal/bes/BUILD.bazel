@@ -3,14 +3,25 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "bes",
     srcs = [
+        "attributes.go",
         "build_event_parser.go",
+        "exporter.go",
+        "json_exporter.go",
+        "namedset_cache.go",
         "service.go",
+        "span_registry.go",
+        "trace_context.go",
     ],
     importpath = "github.com/JSGette/bazel_conduit/internal/bes",
     visibility = ["//:__subpackages__"],
     deps = [
         "//:go_build_proto",
         "//proto/build_event_stream",
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest",
+        "@io_opentelemetry_go_otel_trace//:trace",
         "@org_golang_google_protobuf//encoding/protojson",
         "@org_golang_google_protobuf//types/known/emptypb",
     ],
@@ -18,11 +29,25 @@ go_library(
 
 go_test(
     name = "bes_test",
-    srcs = ["build_event_parser_test.go"],
+    srcs = [
+        "attributes_test.go",
+        "build_event_parser_test.go",
+        "exporter_test.go",
+        "json_exporter_test.go",
+        "namedset_cache_test.go",
+        "span_registry_test.go",
+        "trace_context_test.go",
+    ],
     embed = [":bes"],
     deps = [
         "//:go_build_proto",
         "//proto/build_event_stream",
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest",
+        "@io_opentelemetry_go_otel_trace//:trace",
         "@org_golang_google_protobuf//types/known/anypb",
+        "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )
