@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/JSGette/bazel_conduit/internal/graph"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -49,7 +48,6 @@ func (s *Service) PublishLifecycleEvent(
 	}
 
 	streamID := orderedEvent.GetStreamId()
-	event := orderedEvent.GetEvent()
 
 	projectID := req.GetProjectId()
 	buildID := ""
@@ -60,13 +58,10 @@ func (s *Service) PublishLifecycleEvent(
 		invocationID = streamID.GetInvocationId()
 	}
 
-	eventType := graph.GetEventType(event)
-
 	s.logger.Info("Received lifecycle event",
 		"project_id", projectID,
 		"build_id", buildID,
 		"invocation_id", invocationID,
-		"event_type", eventType,
 	)
 
 	return &emptypb.Empty{}, nil

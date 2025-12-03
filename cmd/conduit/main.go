@@ -10,7 +10,6 @@ import (
 	"syscall"
 
 	"github.com/JSGette/bazel_conduit/internal/bes"
-	"github.com/JSGette/bazel_conduit/internal/translator"
 	build "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -44,20 +43,6 @@ func main() {
 		"dump_json", *dumpJSON,
 		"dump_otel", *dumpOTel,
 	)
-
-	// Create OTel writer
-	otelWriterConfig := &translator.OTelWriterConfig{
-		Enabled:    *dumpOTel,
-		OutputDir:  *otelDir,
-		BufferSize: *otelBufSize,
-	}
-	otelWriter := translator.NewOTelWriter(otelWriterConfig, logger)
-	if otelWriter != nil {
-		logger.Info("OTel writer initialized",
-			"output_dir", *otelDir,
-			"buffer_size", *otelBufSize,
-		)
-	}
 
 	// Create BES service
 	besService := bes.NewService(logger)
@@ -111,11 +96,6 @@ func main() {
 		// Stop accepting new connections
 		grpcServer.GracefulStop()
 
-		// Close OTel writer
-		if otelWriter != nil {
-			otelWriter.CloseAll()
-			logger.Info("OTel writer closed")
-		}
 		logger.Info("Shutdown complete")
 	}
 }
