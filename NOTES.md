@@ -106,3 +106,10 @@ that they are still in progress (just a theory). I saw another one that containe
     }
   }
 ```
+## OTEL Conversion ##
+1. The trace is started with lifecycle's message `started`.
+2. Other lifecycle messages add additional data to the trace itself (attributes of the trace, not spans inside of the trace).
+3. Each targetConfigured creates a new span, the name of the span corresponds to target's label. Then we wait for targetCompleted
+message and namedSet to fill details of the span (duration, list of output files, target kind, status - successful, failed, skipped, etc.).
+4. Once we receieve lastMessage, the trace is considered as complete. We add data from lifecycle messages (buildMetrics, workspaceStatus, etc.) to the trace.
+5. We export OTEL trace in OTEL JSON format.
