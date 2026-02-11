@@ -4,6 +4,7 @@
 //! OpenTelemetry traces for observability.
 
 pub mod bep;
+pub mod grpc;
 pub mod state;
 
 // Re-export proto types

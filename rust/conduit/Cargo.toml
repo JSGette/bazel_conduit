@@ -6,20 +6,14 @@ rust-version = "1.93"
 description = "BEP to OpenTelemetry trace converter"
 
 [dependencies]
-# Proto
-prost = "0.13"
-prost-types = "0.13"
-
 # OTel
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 
-# gRPC
-tonic = "0.12"
-
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 
 # Concurrency
 dashmap = "6"
@@ -39,4 +33,3 @@ thiserror = "2"
 anyhow = "1"
 
 [build-dependencies]
-tonic-build = "0.12"

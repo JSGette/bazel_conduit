@@ -188,8 +188,8 @@ impl EventRouter {
     }
 
     fn handle_configuration(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        if let Some(config_id) = event.bazel_event.get("id")
-            .and_then(|id| id.get("configuration"))
+        if let Some(config_id) = event.id
+            .get("configuration")
             .and_then(|c| c.get("id"))
             .and_then(|v| v.as_str())
         {
@@ -255,10 +255,8 @@ impl EventRouter {
     fn handle_pattern(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         if let Some(_payload) = event.get_payload("expanded") {
             // Pattern expanded contains the list of configured targets
-            let patterns: Vec<String> = event
-                .bazel_event
-                .get("id")
-                .and_then(|id| id.get("pattern"))
+            let patterns: Vec<String> = event.id
+                .get("pattern")
                 .and_then(|p| p.get("pattern"))
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -271,10 +269,8 @@ impl EventRouter {
     }
 
     fn handle_target_configured(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let target_id = event
-            .bazel_event
-            .get("id")
-            .and_then(|id| id.get("targetConfigured"))
+        let target_id = event.id
+            .get("targetConfigured")
             .and_then(|tc| tc.get("label"))
             .and_then(|v| v.as_str());
 
@@ -293,17 +289,15 @@ impl EventRouter {
             self.state.start_target(
                 label.to_string(),
                 target_kind.map(String::from),
-                event.event_time.clone(),
+                None, // No event_time in NDJSON format
             );
         }
         Ok(())
     }
 
     fn handle_target_completed(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let target_id = event
-            .bazel_event
-            .get("id")
-            .and_then(|id| id.get("targetCompleted"))
+        let target_id = event.id
+            .get("targetCompleted")
             .and_then(|tc| tc.get("label"))
             .and_then(|v| v.as_str());
 
@@ -341,17 +335,15 @@ impl EventRouter {
                 label.to_string(),
                 success,
                 file_sets,
-                event.event_time.clone(),
+                None, // No event_time in NDJSON format
             );
         }
         Ok(())
     }
 
     fn handle_named_set(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let set_id = event
-            .bazel_event
-            .get("id")
-            .and_then(|id| id.get("namedSet"))
+        let set_id = event.id
+            .get("namedSet")
             .and_then(|ns| ns.get("id"))
             .and_then(|v| v.as_str());
 
@@ -380,7 +372,7 @@ impl EventRouter {
     }
 
     fn handle_action_completed(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let action_id = event.bazel_event.get("id").and_then(|id| id.get("actionCompleted"));
+        let action_id = event.id.get("actionCompleted");
 
         if let Some(action_id) = action_id {
             let label = action_id.get("label").and_then(|v| v.as_str());

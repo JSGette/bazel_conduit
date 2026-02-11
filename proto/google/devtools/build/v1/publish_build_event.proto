@@ -1,0 +1,117 @@
+// Copyright 2015 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package google.devtools.build.v1;
+
+import "proto/google/devtools/build/v1/build_events.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "BackendProto";
+option java_package = "com.google.devtools.build.v1";
+
+// A service for publishing BuildEvents.
+service PublishBuildEvent {
+  // Publish a build event stating the new state of a build (typically from the
+  // build queue). The BuildEnqueued event must be published before all other
+  // events for the same build ID.
+  //
+  // The backend will return a STREAM_FINALIZED error on subsequent
+  // attempts to update the build or publish other events for this build ID.
+  rpc PublishLifecycleEvent(PublishLifecycleEventRequest)
+      returns (google.protobuf.Empty) {}
+
+  // Publish build tool events belonging to the same stream to a backend job
+  // using bidirectional streaming.
+  rpc PublishBuildToolEventStream(stream PublishBuildToolEventStreamRequest)
+      returns (stream PublishBuildToolEventStreamResponse) {}
+}
+
+// Publishes 'lifecycle events' that update the high-level state of a build:
+// - BuildEnqueued: When a build is scheduled.
+// - InvocationAttemptStarted: When work for a build starts; there can be
+//     multiple attempts.
+// - InvocationAttemptFinished: When work for a build finishes.
+// - BuildFinished: When a build is finished.
+message PublishLifecycleEventRequest {
+  // The type of service the build is on.
+  enum ServiceLevel {
+    // Non-interactive builds.
+    NONINTERACTIVE = 0;
+    // Interactive builds.
+    INTERACTIVE = 1;
+  }
+
+  // The lifecycle build event.
+  OrderedBuildEvent build_event = 1;
+
+  // If the next event for this build or invocation should wait for a
+  // previous publishing call to finish, the client should set this to be the
+  // same value of that previous call's stream_timeout. The build system
+  // should wait at least as long as the timeout before giving up.
+  google.protobuf.Duration stream_timeout = 2;
+
+  // Additional information about the build request.
+  repeated string notification_keywords = 3;
+
+  // Name of the project being built.
+  string project_id = 6;
+
+  // For lifecycle events, the service level is used to indicate if this is
+  // an INTERACTIVE or NONINTERACTIVE build.
+  ServiceLevel service_level = 5;
+}
+
+// States which event has been committed. Any failure to commit will cause
+// RPC errors, hence not recorded by this proto.
+message PublishBuildToolEventStreamResponse {
+  // The stream that contains this event.
+  StreamId stream_id = 1;
+
+  // The sequence number of this event that has been committed.
+  int64 sequence_number = 2;
+}
+
+// Build event with contextual information about the stream it belongs to and
+// its position in that stream.
+message OrderedBuildEvent {
+  // Which build event stream this event belongs to.
+  StreamId stream_id = 1;
+
+  // The position of this event in the stream.
+  int64 sequence_number = 2;
+
+  // The actual event.
+  BuildEvent event = 3;
+}
+
+// Streaming request message for PublishBuildToolEventStream.
+message PublishBuildToolEventStreamRequest {
+  // The build event with position info.
+  OrderedBuildEvent ordered_build_event = 4;
+
+  // Additional information about the build request.
+  repeated string notification_keywords = 5;
+
+  // Name of the project being built.
+  string project_id = 6;
+
+  // Whether to require acknowledging previously-sent events before
+  // sending more events.
+  bool check_preceding_lifecycle_events_present = 7;
+}

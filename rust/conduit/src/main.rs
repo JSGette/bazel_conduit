@@ -1,6 +1,8 @@
 use clap::Parser;
 use conduit_lib::bep::{BepDecoder, EventRouter};
+use conduit_lib::grpc::run_server;
 use std::fs::File;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{info, error, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -10,13 +12,17 @@ use tracing_subscriber::FmtSubscriber;
 #[command(name = "conduit")]
 #[command(about = "Convert Bazel Build Event Protocol events to OpenTelemetry traces")]
 struct Args {
-    /// Input BEP JSON file
+    /// Input BEP JSON file (mutually exclusive with gRPC server mode)
     #[arg(short, long)]
     input: Option<PathBuf>,
 
-    /// gRPC server port for BES (Build Event Service)
+    /// Start gRPC server for BES (Build Event Service)
+    #[arg(short, long)]
+    serve: bool,
+
+    /// gRPC server port
     #[arg(short = 'p', long, default_value = "8080")]
-    grpc_port: u16,
+    port: u16,
 
     /// Datadog Agent endpoint for OTLP export
     #[arg(long, default_value = "localhost:4317")]
@@ -27,7 +33,8 @@ struct Args {
     log_level: String,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Set up logging
@@ -52,10 +59,16 @@ fn main() -> anyhow::Result<()> {
     if let Some(input_path) = args.input {
         // Process BEP JSON file
         process_json_file(&input_path)?;
+    } else if args.serve {
+        // Start gRPC server
+        let addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
+        run_server(addr).await?;
     } else {
-        // Start gRPC server (not yet implemented)
-        info!("gRPC server mode not yet implemented");
-        info!("Use --input <file> to process a BEP JSON file");
+        info!("Usage:");
+        info!("  Process JSON file: conduit --input <file.json>");
+        info!("  Start gRPC server: conduit --serve [--port 8080]");
+        info!("");
+        info!("For Bazel, use: bazel build //... --bes_backend=grpc://localhost:{}", args.port);
     }
 
     Ok(())

@@ -1,0 +1,42 @@
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "http_proto",
+    srcs = ["http.proto"],
+)
+
+proto_library(
+    name = "annotations_proto",
+    srcs = ["annotations.proto"],
+    deps = [
+        ":http_proto",
+        "@protobuf//:descriptor_proto",
+    ],
+)
+
+proto_library(
+    name = "field_behavior_proto",
+    srcs = ["field_behavior.proto"],
+    deps = [
+        "@protobuf//:descriptor_proto",
+    ],
+)
+
+# Combined proto library
+proto_library(
+    name = "api_proto",
+    deps = [
+        ":annotations_proto",
+        ":field_behavior_proto",
+        ":http_proto",
+    ],
+)
+
+# Rust prost library
+rust_prost_library(
+    name = "api_rust_proto",
+    proto = ":api_proto",
+)

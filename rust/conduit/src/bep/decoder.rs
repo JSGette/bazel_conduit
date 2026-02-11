@@ -27,29 +27,40 @@ impl BepDecoder {
         Self
     }
 
-    /// Decode BEP events from a JSON file
+    /// Decode BEP events from a JSON file (NDJSON format - one event per line)
     ///
-    /// The JSON format is an array of objects with `bazelEvent` containing
-    /// the JSON representation of the protobuf.
+    /// This is the format produced by Bazel's --build_event_json_file flag.
     pub fn decode_json_file<R: Read>(
         &self,
         reader: R,
     ) -> Result<Vec<BepJsonEvent>, DecodeError> {
         let reader = BufReader::new(reader);
-        let events: Vec<BepJsonEvent> = serde_json::from_reader(reader)?;
+        let mut events = Vec::new();
+        
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: BepJsonEvent = serde_json::from_str(&line)?;
+            events.push(event);
+        }
+        
         Ok(events)
     }
 
-    /// Decode BEP events from a newline-delimited JSON stream
+    /// Decode BEP events from a newline-delimited JSON stream (iterator version)
     pub fn decode_ndjson<R: Read>(
         &self,
         reader: R,
     ) -> impl Iterator<Item = Result<BepJsonEvent, DecodeError>> {
         let reader = BufReader::new(reader);
-        reader.lines().map(|line| {
-            let line = line?;
-            let event: BepJsonEvent = serde_json::from_str(&line)?;
-            Ok(event)
+        reader.lines().filter_map(|line| {
+            match line {
+                Ok(l) if l.trim().is_empty() => None,
+                Ok(l) => Some(serde_json::from_str(&l).map_err(DecodeError::from)),
+                Err(e) => Some(Err(DecodeError::from(e))),
+            }
         })
     }
 }
@@ -61,47 +72,56 @@ impl Default for BepDecoder {
 }
 
 /// A BEP event as it appears in JSON format (from Bazel's --build_event_json_file)
+///
+/// The JSON format directly contains the BuildEvent fields (id, children, payload).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BepJsonEvent {
-    /// Event timestamp
+    /// Event ID - determines the event type
     #[serde(default)]
-    pub event_time: Option<String>,
+    pub id: serde_json::Value,
 
-    /// The actual build event (JSON representation of protobuf)
-    pub bazel_event: serde_json::Value,
+    /// Child event IDs
+    #[serde(default)]
+    pub children: Vec<serde_json::Value>,
+
+    /// Whether this is the last message
+    #[serde(default)]
+    pub last_message: bool,
+
+    /// All other fields (payload) captured dynamically
+    #[serde(flatten)]
+    pub payload: serde_json::Map<String, serde_json::Value>,
 }
 
 impl BepJsonEvent {
     /// Extract the event ID type from the JSON event
     pub fn event_type(&self) -> Option<&str> {
-        self.bazel_event
-            .get("id")
-            .and_then(|id| id.as_object())
+        self.id
+            .as_object()
             .and_then(|obj| obj.keys().next())
             .map(|s| s.as_str())
     }
 
     /// Check if this is the last message in the stream
     pub fn is_last_message(&self) -> bool {
-        self.bazel_event
-            .get("lastMessage")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        self.last_message
     }
 
     /// Get the event payload for a specific event type
     pub fn get_payload(&self, event_type: &str) -> Option<&serde_json::Value> {
-        self.bazel_event.get(event_type)
+        self.payload.get(event_type)
     }
 
-    /// Get the children event IDs
-    pub fn children(&self) -> Vec<&serde_json::Value> {
-        self.bazel_event
-            .get("children")
-            .and_then(|c| c.as_array())
-            .map(|arr| arr.iter().collect())
-            .unwrap_or_default()
+    /// Get the raw event as a JSON value (for compatibility)
+    pub fn as_json(&self) -> serde_json::Value {
+        let mut map = self.payload.clone();
+        map.insert("id".to_string(), self.id.clone());
+        map.insert("children".to_string(), serde_json::json!(self.children));
+        if self.last_message {
+            map.insert("lastMessage".to_string(), serde_json::Value::Bool(true));
+        }
+        serde_json::Value::Object(map)
     }
 }
 
@@ -111,19 +131,8 @@ mod tests {
 
     #[test]
     fn test_bep_json_event_type() {
-        let json = r#"{
-            "eventTime": "2025-12-03T09:43:51.130Z",
-            "bazelEvent": {
-                "@type": "type.googleapis.com/build_event_stream.BuildEvent",
-                "id": {
-                    "started": {}
-                },
-                "started": {
-                    "uuid": "test-uuid",
-                    "command": "build"
-                }
-            }
-        }"#;
+        // Real format from Bazel's --build_event_json_file
+        let json = r#"{"id":{"started":{}},"started":{"uuid":"test-uuid","command":"build"}}"#;
 
         let event: BepJsonEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type(), Some("started"));
@@ -131,14 +140,28 @@ mod tests {
 
     #[test]
     fn test_last_message_detection() {
-        let json = r#"{
-            "bazelEvent": {
-                "id": {"buildFinished": {}},
-                "lastMessage": true
-            }
-        }"#;
+        let json = r#"{"id":{"buildFinished":{}},"lastMessage":true,"finished":{"exitCode":{"code":0}}}"#;
 
         let event: BepJsonEvent = serde_json::from_str(json).unwrap();
         assert!(event.is_last_message());
+    }
+
+    #[test]
+    fn test_ndjson_parsing() {
+        let ndjson = r#"{"id":{"started":{}},"started":{"uuid":"abc"}}
+{"id":{"buildFinished":{}},"lastMessage":true}"#;
+        
+        let decoder = BepDecoder::new();
+        let events: Vec<_> = decoder.decode_ndjson(ndjson.as_bytes()).collect();
+        
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_ok());
+        assert!(events[1].is_ok());
+        
+        let first = events[0].as_ref().unwrap();
+        assert_eq!(first.event_type(), Some("started"));
+        
+        let last = events[1].as_ref().unwrap();
+        assert!(last.is_last_message());
     }
 }

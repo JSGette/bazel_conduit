@@ -1,0 +1,39 @@
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "build_status_proto",
+    srcs = ["build_status.proto"],
+    deps = [
+        "@protobuf//:any_proto",
+    ],
+)
+
+proto_library(
+    name = "build_events_proto",
+    srcs = ["build_events.proto"],
+    deps = [
+        ":build_status_proto",
+        "@protobuf//:any_proto",
+        "@protobuf//:timestamp_proto",
+    ],
+)
+
+proto_library(
+    name = "publish_build_event_proto",
+    srcs = ["publish_build_event.proto"],
+    deps = [
+        ":build_events_proto",
+        "@protobuf//:any_proto",
+        "@protobuf//:duration_proto",
+        "@protobuf//:empty_proto",
+    ],
+)
+
+# Rust prost library with tonic gRPC support
+rust_prost_library(
+    name = "publish_build_event_rust_proto",
+    proto = ":publish_build_event_proto",
+)

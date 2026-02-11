@@ -1,0 +1,65 @@
+// Copyright 2015 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package google.api;
+
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_outer_classname = "HttpProto";
+option java_package = "com.google.api";
+option objc_class_prefix = "GAPI";
+
+// Defines the HTTP configuration for an API service.
+message Http {
+  // A list of HTTP configuration rules.
+  repeated HttpRule rules = 1;
+
+  // When set to true, URL path parameters will be fully URI-decoded.
+  bool fully_decode_reserved_expansion = 2;
+}
+
+// HttpRule defines the mapping of an RPC method to one or more HTTP REST API methods.
+message HttpRule {
+  // Selects a method to which this rule applies.
+  string selector = 1;
+
+  // Determines the URL pattern for the method.
+  oneof pattern {
+    string get = 2;
+    string put = 3;
+    string post = 4;
+    string delete = 5;
+    string patch = 6;
+    CustomHttpPattern custom = 8;
+  }
+
+  // The name of the request field whose value is mapped to the HTTP body.
+  string body = 7;
+
+  // Optional. The name of the response field whose value is mapped to the HTTP body.
+  string response_body = 12;
+
+  // Additional HTTP bindings for the selector.
+  repeated HttpRule additional_bindings = 11;
+}
+
+// A custom pattern is used for defining custom HTTP verb.
+message CustomHttpPattern {
+  // The name of this custom HTTP verb.
+  string kind = 1;
+  // The path matched by this custom verb.
+  string path = 2;
+}
