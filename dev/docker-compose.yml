@@ -1,0 +1,19 @@
+# Jaeger all-in-one for local OTel trace visualization.
+#
+# Usage:
+#   docker compose -f dev/docker-compose.yml up -d
+#   open http://localhost:16686   # Jaeger UI
+#
+# Conduit export:
+#   conduit --serve --export otlp --otlp-endpoint http://localhost:4317
+#   bazel build //... --bes_backend=grpc://localhost:8080
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"

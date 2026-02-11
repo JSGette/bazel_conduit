@@ -5,6 +5,7 @@
 
 pub mod bep;
 pub mod grpc;
+pub mod otel;
 pub mod state;
 
 // Re-export BEP proto types

@@ -3,6 +3,7 @@
 //! Routes BEP events to appropriate handlers based on event type.
 
 use super::decoder::BepJsonEvent;
+use crate::otel::OtelMapper;
 use crate::state::{ActionProcessingMode, BuildState};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
@@ -23,6 +24,7 @@ pub enum RouterError {
 /// Event router that processes BEP events
 pub struct EventRouter {
     state: BuildState,
+    mapper: Option<OtelMapper>,
 }
 
 impl EventRouter {
@@ -30,7 +32,14 @@ impl EventRouter {
     pub fn new() -> Self {
         Self {
             state: BuildState::new(),
+            mapper: None,
         }
+    }
+
+    /// Attach an OTel mapper for span generation.
+    pub fn with_mapper(mut self, mapper: OtelMapper) -> Self {
+        self.mapper = Some(mapper);
+        self
     }
 
     /// Get a reference to the build state
@@ -43,11 +52,16 @@ impl EventRouter {
         &mut self.state
     }
 
+    /// Finalize: end any remaining open spans and flush.
+    pub fn finish(&mut self) {
+        if let Some(mapper) = &mut self.mapper {
+            mapper.finish();
+        }
+    }
+
     /// Route a BEP JSON event to the appropriate handler
     pub fn route(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let event_type = event
-            .event_type()
-            .ok_or(RouterError::MissingEventId)?;
+        let event_type = event.event_type().ok_or(RouterError::MissingEventId)?;
 
         trace!(event_type, "Routing BEP event");
 
@@ -67,18 +81,23 @@ impl EventRouter {
             "targetCompleted" => self.handle_target_completed(event),
             "namedSet" => self.handle_named_set(event),
             "actionCompleted" => self.handle_action_completed(event),
+            "fetch" => self.handle_fetch(event),
 
             // Test events
             "testResult" => self.handle_test_result(event),
             "testSummary" => self.handle_test_summary(event),
 
-            // Ignored events
+            // Progress events (may have stderr/stdout content)
             "progress" => self.handle_progress(event),
+
+            // Metadata
+            "buildMetadata" => self.handle_build_metadata(event),
+
+            // Ignored events (no OTel value)
             "structuredCommandLine" => Ok(()), // Redundant with optionsParsed
-            "convenienceSymlinksIdentified" => Ok(()), // Not useful for tracing
-            "buildMetadata" => Ok(()), // Usually empty
-            "fetch" => Ok(()), // External resource fetch
-            "workspaceInfo" => Ok(()), // Workspace info
+            "convenienceSymlinksIdentified" => Ok(()), // Local filesystem detail
+            "workspaceInfo" => Ok(()), // Rarely populated
+            "buildToolLogs" => Ok(()), // BES-level, not BEP-level
 
             // Unknown events
             other => {
@@ -115,6 +134,15 @@ impl EventRouter {
             if let Some(millis) = start_time_millis {
                 self.state.set_start_time_millis(millis);
             }
+
+            // OTel: create root span
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_build_started(
+                    uuid.unwrap_or("unknown"),
+                    command.unwrap_or("unknown"),
+                    start_time_millis,
+                );
+            }
         }
 
         Ok(())
@@ -128,7 +156,12 @@ impl EventRouter {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
                 debug!(args_count = args.len(), "Unstructured command line");
-                self.state.set_command_args(args);
+                self.state.set_command_args(args.clone());
+
+                // OTel: add full command line as attribute
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_command_line(&args);
+                }
             }
         }
         Ok(())
@@ -157,16 +190,35 @@ impl EventRouter {
                 self.state.set_action_mode(ActionProcessingMode::Full);
             } else {
                 debug!("Using lightweight action processing (failed actions only)");
-                self.state.set_action_mode(ActionProcessingMode::Lightweight);
+                self.state
+                    .set_action_mode(ActionProcessingMode::Lightweight);
             }
 
             // Extract startup options
-            if let Some(startup) = payload.get("startupOptions").and_then(|v| v.as_array()) {
-                let opts: Vec<String> = startup
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                self.state.set_startup_options(opts);
+            let startup_opts: Vec<String> = payload
+                .get("startupOptions")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.state.set_startup_options(startup_opts.clone());
+
+            let explicit: Vec<String> = payload
+                .get("explicitCmdLine")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // OTel
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_options_parsed(&startup_opts, &explicit);
             }
         }
         Ok(())
@@ -174,13 +226,23 @@ impl EventRouter {
 
     fn handle_workspace_status(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         if let Some(payload) = event.get_payload("workspaceStatus") {
+            let mut items_map = std::collections::HashMap::new();
             if let Some(items) = payload.get("item").and_then(|v| v.as_array()) {
                 for item in items {
                     let key = item.get("key").and_then(|v| v.as_str());
                     let value = item.get("value").and_then(|v| v.as_str());
                     if let (Some(k), Some(v)) = (key, value) {
-                        self.state.add_workspace_status(k.to_string(), v.to_string());
+                        self.state
+                            .add_workspace_status(k.to_string(), v.to_string());
+                        items_map.insert(k.to_string(), v.to_string());
                     }
+                }
+            }
+
+            // OTel
+            if !items_map.is_empty() {
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_workspace_status(&items_map);
                 }
             }
         }
@@ -188,7 +250,8 @@ impl EventRouter {
     }
 
     fn handle_configuration(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        if let Some(config_id) = event.id
+        if let Some(config_id) = event
+            .id
             .get("configuration")
             .and_then(|c| c.get("id"))
             .and_then(|v| v.as_str())
@@ -209,6 +272,11 @@ impl EventRouter {
                     mnemonic.map(String::from),
                     platform.map(String::from),
                 );
+
+                // OTel: add configuration as span event on root
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_configuration(config_id, mnemonic, platform);
+                }
             }
         }
         Ok(())
@@ -235,6 +303,11 @@ impl EventRouter {
                 self.state.set_end_time_millis(millis);
             }
             self.state.mark_finished();
+
+            // OTel: record exit code (root span ends in finish())
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_build_finished(exit_code, finish_time_millis);
+            }
         }
         Ok(())
     }
@@ -244,6 +317,11 @@ impl EventRouter {
             debug!("Build metrics received");
             // Store metrics for later processing
             self.state.set_build_metrics(payload.clone());
+
+            // OTel: add metrics attributes to root span
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_build_metrics(payload);
+            }
         }
         Ok(())
     }
@@ -255,62 +333,98 @@ impl EventRouter {
     fn handle_pattern(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         if let Some(_payload) = event.get_payload("expanded") {
             // Pattern expanded contains the list of configured targets
-            let patterns: Vec<String> = event.id
+            let patterns: Vec<String> = event
+                .id
                 .get("pattern")
                 .and_then(|p| p.get("pattern"))
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             debug!(patterns = ?patterns, "Pattern expanded");
-            self.state.set_patterns(patterns);
+            self.state.set_patterns(patterns.clone());
+
+            // OTel: add build patterns as attribute
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_pattern(&patterns);
+            }
         }
         Ok(())
     }
 
     fn handle_target_configured(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let target_id = event.id
+        let target_id = event
+            .id
             .get("targetConfigured")
             .and_then(|tc| tc.get("label"))
             .and_then(|v| v.as_str());
 
         if let Some(label) = target_id {
-            let target_kind = event
-                .get_payload("configured")
+            let payload = event.get_payload("configured");
+            let target_kind = payload
                 .and_then(|c| c.get("targetKind"))
                 .and_then(|v| v.as_str());
+
+            let tags: Vec<String> = payload
+                .and_then(|c| c.get("tag"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             debug!(
                 label,
                 target_kind,
+                tags = ?tags,
                 "Target configured"
             );
 
             self.state.start_target(
                 label.to_string(),
                 target_kind.map(String::from),
-                None, // No event_time in NDJSON format
+                None,
             );
+
+            // OTel: create target span with BES event_time as start
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_target_configured(
+                    label,
+                    target_kind,
+                    &tags,
+                    event.event_time_nanos,
+                );
+            }
         }
         Ok(())
     }
 
     fn handle_target_completed(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let target_id = event.id
+        let target_id = event
+            .id
             .get("targetCompleted")
             .and_then(|tc| tc.get("label"))
             .and_then(|v| v.as_str());
 
         if let Some(label) = target_id {
-            let success = event
-                .get_payload("completed")
+            let payload = event.get_payload("completed");
+
+            // In proto3 JSON, `true` is the default for bool and is often
+            // omitted from the wire.  Bazel only sets `success: false`
+            // explicitly when a target genuinely fails.
+            let success = payload
                 .and_then(|c| c.get("success"))
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
 
             // Get output files from fileSets references
-            let file_sets: Vec<String> = event
-                .get_payload("completed")
+            let file_sets: Vec<String> = payload
                 .and_then(|c| c.get("outputGroup"))
                 .and_then(|og| og.as_array())
                 .map(|arr| {
@@ -324,25 +438,49 @@ impl EventRouter {
                 })
                 .unwrap_or_default();
 
+            // Tags from the BUILD rule
+            let tags: Vec<String> = payload
+                .and_then(|c| c.get("tag"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             debug!(
                 label,
                 success,
                 file_sets = ?file_sets,
+                tags = ?tags,
                 "Target completed"
             );
 
             self.state.complete_target(
                 label.to_string(),
                 success,
-                file_sets,
-                None, // No event_time in NDJSON format
+                file_sets.clone(),
+                None,
             );
+
+            // OTel: end target span with resolved file sets + BES event_time
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_target_completed(
+                    label,
+                    success,
+                    &file_sets,
+                    &tags,
+                    event.event_time_nanos,
+                );
+            }
         }
         Ok(())
     }
 
     fn handle_named_set(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let set_id = event.id
+        let set_id = event
+            .id
             .get("namedSet")
             .and_then(|ns| ns.get("id"))
             .and_then(|v| v.as_str());
@@ -366,7 +504,12 @@ impl EventRouter {
                 "Named set"
             );
 
-            self.state.cache_named_set(id.to_string(), files);
+            self.state.cache_named_set(id.to_string(), files.clone());
+
+            // OTel: cache in mapper for later resolution during targetCompleted
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_named_set(id, files);
+            }
         }
         Ok(())
     }
@@ -426,6 +569,35 @@ impl EventRouter {
                 success,
                 exit_code,
             );
+
+            // OTel: create failed action span
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_action_failed(label, mnemonic, exit_code, primary_output);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_fetch(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        let url = event
+            .id
+            .get("fetch")
+            .and_then(|f| f.get("url"))
+            .and_then(|v| v.as_str());
+
+        if let Some(url) = url {
+            let success = event
+                .get_payload("fetch")
+                .and_then(|f| f.get("success"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            debug!(url, success, "Fetch event");
+
+            // OTel: create fetch span
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_fetch(url, success);
+            }
         }
         Ok(())
     }
@@ -434,30 +606,131 @@ impl EventRouter {
     // Test event handlers
     // =========================================================================
 
-    fn handle_test_result(&mut self, _event: &BepJsonEvent) -> Result<(), RouterError> {
-        // Test results - deferred for now
-        debug!("Test result received (handling deferred)");
+    fn handle_test_result(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        let label = event
+            .id
+            .get("testResult")
+            .and_then(|tr| tr.get("label"))
+            .and_then(|v| v.as_str());
+
+        if let Some(label) = label {
+            let payload = event.get_payload("testResult");
+
+            let status = payload
+                .and_then(|p| p.get("status"))
+                .and_then(|v| v.as_str());
+            let cached = payload
+                .and_then(|p| p.get("cachedLocally"))
+                .and_then(|v| v.as_bool());
+            let strategy = payload
+                .and_then(|p| p.get("executionInfo"))
+                .and_then(|ei| ei.get("strategy"))
+                .and_then(|v| v.as_str());
+
+            // Test attempt info from the event ID
+            let attempt = event
+                .id
+                .get("testResult")
+                .and_then(|tr| tr.get("attempt"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let run = event
+                .id
+                .get("testResult")
+                .and_then(|tr| tr.get("run"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let shard = event
+                .id
+                .get("testResult")
+                .and_then(|tr| tr.get("shard"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+
+            debug!(
+                label,
+                status,
+                attempt,
+                cached,
+                "Test result"
+            );
+
+            // OTel: create test result span
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_test_result(label, status, attempt, run, shard, cached, strategy);
+            }
+        }
         Ok(())
     }
 
-    fn handle_test_summary(&mut self, _event: &BepJsonEvent) -> Result<(), RouterError> {
-        // Test summary - deferred for now
-        debug!("Test summary received (handling deferred)");
+    fn handle_test_summary(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        let label = event
+            .id
+            .get("testSummary")
+            .and_then(|ts| ts.get("label"))
+            .and_then(|v| v.as_str());
+
+        if let Some(label) = label {
+            let payload = event.get_payload("testSummary");
+
+            let overall_status = payload
+                .and_then(|p| p.get("overallStatus"))
+                .and_then(|v| v.as_str());
+            let total_run_count = payload
+                .and_then(|p| p.get("totalRunCount"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+
+            debug!(
+                label,
+                overall_status,
+                total_run_count,
+                "Test summary"
+            );
+
+            // OTel: add test summary as span event on root (target span is already ended)
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_test_summary(label, overall_status, total_run_count);
+            }
+        }
         Ok(())
     }
 
     // =========================================================================
-    // Progress events (mostly ignored)
+    // Progress events
     // =========================================================================
 
     fn handle_progress(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        // Progress events are mostly empty, ignore unless there's content
         if let Some(payload) = event.get_payload("progress") {
             let stdout = payload.get("stdout").and_then(|v| v.as_str());
             let stderr = payload.get("stderr").and_then(|v| v.as_str());
 
-            if stdout.is_some() || stderr.is_some() {
+            let has_content = stdout.map(|s| !s.is_empty()).unwrap_or(false)
+                || stderr.map(|s| !s.is_empty()).unwrap_or(false);
+
+            if has_content {
                 trace!("Progress event with output");
+
+                // OTel: add progress as span event on root
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_progress(stderr, stdout);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // Metadata
+    // =========================================================================
+
+    fn handle_build_metadata(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        if let Some(payload) = event.get_payload("buildMetadata") {
+            debug!("Build metadata received");
+
+            // OTel: add metadata as attributes on root
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_build_metadata(payload);
             }
         }
         Ok(())

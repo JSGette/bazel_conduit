@@ -92,6 +92,14 @@ pub struct BepJsonEvent {
     /// All other fields (payload) captured dynamically
     #[serde(flatten)]
     pub payload: serde_json::Map<String, serde_json::Value>,
+
+    /// BES-level event timestamp (nanoseconds since epoch).
+    ///
+    /// Populated from the BES `BuildEvent.event_time` when receiving events
+    /// over gRPC.  `None` for JSON-file input (Bazel's NDJSON format does
+    /// not include per-event timestamps).
+    #[serde(skip)]
+    pub event_time_nanos: Option<i64>,
 }
 
 impl BepJsonEvent {

@@ -24,21 +24,10 @@ pub struct BesServer {
 }
 
 impl BesServer {
-    pub fn new() -> Self {
+    pub fn new(router: EventRouter) -> Self {
         Self {
-            router: Arc::new(Mutex::new(EventRouter::new())),
+            router: Arc::new(Mutex::new(router)),
         }
-    }
-
-    /// Get a reference to the shared router (for accessing state after stream ends)
-    pub fn router(&self) -> Arc<Mutex<EventRouter>> {
-        self.router.clone()
-    }
-}
-
-impl Default for BesServer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -147,8 +136,9 @@ impl PublishBuildEvent for BesServer {
                         }
                     }
                     Ok(None) => {
-                        // Stream ended normally
-                        let router = router.lock().await;
+                        // Stream ended — finalize OTel spans, then print summary.
+                        let mut router = router.lock().await;
+                        router.finish();
                         let summary = router.state().summary();
                         info!("\n{}", summary);
                         info!("gRPC stream completed ({event_count} events processed)");
@@ -180,11 +170,22 @@ impl PublishBuildEvent for BesServer {
 fn extract_bep_event(req: &PublishBuildToolEventStreamRequest) -> Option<BepJsonEvent> {
     let ordered = req.ordered_build_event.as_ref()?;
     let bes_event = ordered.event.as_ref()?;
+
+    // Extract the BES-level event_time (nanoseconds since epoch)
+    // to preserve sub-millisecond precision for span timing.
+    let event_time_nanos = bes_event
+        .event_time
+        .as_ref()
+        .map(|ts| ts.seconds * 1_000_000_000 + ts.nanos as i64);
+
     let event = bes_event.event.as_ref()?;
 
     match event {
         BesEvent::BazelEvent(any) => match decode_any_to_bep_json(any) {
-            Ok(json_event) => Some(json_event),
+            Ok(mut json_event) => {
+                json_event.event_time_nanos = event_time_nanos;
+                Some(json_event)
+            }
             Err(e) => {
                 debug!(
                     type_url = %any.type_url,
@@ -306,7 +307,12 @@ fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde
             serde_json::json!({"namedSet": {"id": n.id}})
         }
         Id::TestResult(t) => {
-            serde_json::json!({"testResult": {"label": t.label}})
+            serde_json::json!({"testResult": {
+                "label": t.label,
+                "run": t.run,
+                "shard": t.shard,
+                "attempt": t.attempt,
+            }})
         }
         Id::TestSummary(t) => {
             serde_json::json!({"testSummary": {"label": t.label}})
@@ -395,14 +401,32 @@ fn add_payload_to_json(
                 "configured".to_string(),
                 serde_json::json!({
                     "targetKind": c.target_kind,
+                    "tag": c.tag,
                 }),
             );
         }
         Payload::Completed(c) => {
+            let output_groups: Vec<serde_json::Value> = c
+                .output_group
+                .iter()
+                .map(|og| {
+                    let file_sets: Vec<serde_json::Value> = og
+                        .file_sets
+                        .iter()
+                        .map(|fs| serde_json::json!({"id": fs.id}))
+                        .collect();
+                    serde_json::json!({
+                        "name": og.name,
+                        "fileSets": file_sets,
+                    })
+                })
+                .collect();
             map.insert(
                 "completed".to_string(),
                 serde_json::json!({
                     "success": c.success,
+                    "outputGroup": output_groups,
+                    "tag": c.tag,
                 }),
             );
         }
@@ -467,6 +491,47 @@ fn add_payload_to_json(
                 })),
             );
         }
+        Payload::Fetch(f) => {
+            map.insert(
+                "fetch".to_string(),
+                serde_json::json!({
+                    "success": f.success,
+                }),
+            );
+        }
+        Payload::TestResult(tr) => {
+            map.insert(
+                "testResult".to_string(),
+                serde_json::json!({
+                    "status": test_status_to_str(tr.status),
+                    "cachedLocally": tr.cached_locally,
+                    "executionInfo": tr.execution_info.as_ref().map(|ei| {
+                        serde_json::json!({
+                            "strategy": ei.strategy,
+                            "cachedRemotely": ei.cached_remotely,
+                            "exitCode": ei.exit_code,
+                        })
+                    }),
+                }),
+            );
+        }
+        Payload::TestSummary(ts) => {
+            map.insert(
+                "testSummary".to_string(),
+                serde_json::json!({
+                    "overallStatus": test_status_to_str(ts.overall_status),
+                    "totalRunCount": ts.total_run_count,
+                }),
+            );
+        }
+        Payload::BuildMetadata(bm) => {
+            map.insert(
+                "buildMetadata".to_string(),
+                serde_json::json!({
+                    "metadata": bm.metadata,
+                }),
+            );
+        }
         _ => {
             // Other payload types we don't process yet
             trace!("Unhandled payload type in proto-to-JSON conversion");
@@ -474,9 +539,25 @@ fn add_payload_to_json(
     }
 }
 
+/// Convert a BEP TestStatus enum (i32) to a human-readable string.
+fn test_status_to_str(status: i32) -> &'static str {
+    match status {
+        0 => "NO_STATUS",
+        1 => "PASSED",
+        2 => "FLAKY",
+        3 => "TIMEOUT",
+        4 => "FAILED",
+        5 => "INCOMPLETE",
+        6 => "REMOTE_FAILURE",
+        7 => "FAILED_TO_BUILD",
+        8 => "TOOL_HALTED_BEFORE_TESTING",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Run the BES gRPC server
-pub async fn run_server(addr: SocketAddr) -> anyhow::Result<()> {
-    let server = BesServer::new();
+pub async fn run_server(addr: SocketAddr, router: EventRouter) -> anyhow::Result<()> {
+    let server = BesServer::new(router);
 
     info!("Starting BES gRPC server on {}", addr);
     info!(
