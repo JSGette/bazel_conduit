@@ -1,7 +1,7 @@
 use clap::Parser;
 use conduit_lib::bep::{BepDecoder, EventRouter};
 use conduit_lib::grpc::run_server;
-use conduit_lib::otel::{ExportConfig, OtelMapper, init_tracer_provider};
+use conduit_lib::otel::{ExportConfig, OtelMapper, init_logger_provider, init_tracer_provider};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -74,11 +74,16 @@ async fn main() -> anyhow::Result<()> {
     // Initialise TracerProvider (None when export=none)
     let provider = init_tracer_provider(&export_config)?;
 
+    // Initialise LoggerProvider (None when export=none)
+    let log_provider = init_logger_provider(&export_config)?;
+
     // Build the mapper if we have a provider
     let make_mapper = || -> Option<OtelMapper> {
+        use opentelemetry::logs::LoggerProvider as _;
         use opentelemetry::trace::TracerProvider;
         let p = provider.as_ref()?;
-        Some(OtelMapper::new(p.tracer("conduit")))
+        let logger = log_provider.as_ref().map(|lp| lp.logger("conduit"));
+        Some(OtelMapper::new(p.tracer("conduit"), logger))
     };
 
     if let Some(input_path) = args.input {
@@ -101,6 +106,12 @@ async fn main() -> anyhow::Result<()> {
         info!("  Start gRPC server: conduit --serve [--port 8080] [--export stdout|otlp]");
         info!("");
         info!("For Bazel, use: bazel build //... --bes_backend=grpc://localhost:{}", args.port);
+    }
+
+    // Flush & shutdown the LoggerProvider (before TracerProvider so logs are sent first)
+    if let Some(lp) = log_provider {
+        lp.shutdown()?;
+        info!("LoggerProvider shut down");
     }
 
     // Flush & shutdown the TracerProvider

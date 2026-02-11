@@ -64,8 +64,8 @@ pub struct BuildState {
     // Named sets cache (set_id -> files)
     named_sets: DashMap<String, Vec<String>>,
 
-    // Failed actions
-    failed_actions: Vec<ActionState>,
+    // Actions (failed in lightweight mode, all in full mode)
+    actions: Vec<ActionState>,
 
     // Build metrics (stored as JSON for now)
     build_metrics: Option<serde_json::Value>,
@@ -89,7 +89,7 @@ impl BuildState {
             configurations: DashMap::new(),
             targets: DashMap::new(),
             named_sets: DashMap::new(),
-            failed_actions: Vec::new(),
+            actions: Vec::new(),
             build_metrics: None,
         }
     }
@@ -300,7 +300,7 @@ impl BuildState {
         success: bool,
         exit_code: Option<i32>,
     ) {
-        self.failed_actions.push(ActionState {
+        self.actions.push(ActionState {
             label,
             mnemonic,
             primary_output,
@@ -309,8 +309,16 @@ impl BuildState {
         });
     }
 
-    pub fn failed_actions(&self) -> &[ActionState] {
-        &self.failed_actions
+    pub fn actions(&self) -> &[ActionState] {
+        &self.actions
+    }
+
+    pub fn failed_actions(&self) -> Vec<&ActionState> {
+        self.actions.iter().filter(|a| !a.success).collect()
+    }
+
+    pub fn actions_count(&self) -> usize {
+        self.actions.len()
     }
 
     // =========================================================================
@@ -341,6 +349,7 @@ impl BuildState {
             .iter()
             .filter(|t| t.success == Some(false))
             .count();
+        let failed_actions = self.actions.iter().filter(|a| !a.success).count();
 
         BuildSummary {
             invocation_id: self.invocation_id.clone(),
@@ -349,7 +358,8 @@ impl BuildState {
             total_targets: self.targets.len(),
             successful_targets,
             failed_targets,
-            failed_actions: self.failed_actions.len(),
+            total_actions: self.actions.len(),
+            failed_actions,
             action_mode: self.action_mode,
         }
     }
@@ -370,6 +380,7 @@ pub struct BuildSummary {
     pub total_targets: usize,
     pub successful_targets: usize,
     pub failed_targets: usize,
+    pub total_actions: usize,
     pub failed_actions: usize,
     pub action_mode: ActionProcessingMode,
 }
@@ -388,7 +399,8 @@ impl std::fmt::Display for BuildSummary {
         }
         writeln!(f, "  Targets: {} total, {} successful, {} failed",
             self.total_targets, self.successful_targets, self.failed_targets)?;
-        writeln!(f, "  Failed Actions: {}", self.failed_actions)?;
+        writeln!(f, "  Actions: {} total, {} failed",
+            self.total_actions, self.failed_actions)?;
         writeln!(f, "  Action Mode: {}", self.action_mode)?;
         Ok(())
     }

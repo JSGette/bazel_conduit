@@ -5,6 +5,7 @@
 
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use opentelemetry::{Context, KeyValue};
+use opentelemetry_sdk::logs::LoggerProvider;
 use opentelemetry_sdk::trace::TracerProvider;
 use opentelemetry_sdk::Resource;
 
@@ -68,6 +69,41 @@ pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<Trac
                 .with_endpoint(endpoint)
                 .build()?;
             let provider = TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+    }
+}
+
+/// Initialise an OpenTelemetry [`LoggerProvider`] according to the export
+/// configuration.
+///
+/// Returns `None` when `config` is [`ExportConfig::None`].
+pub fn init_logger_provider(config: &ExportConfig) -> anyhow::Result<Option<LoggerProvider>> {
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", "conduit"),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+    ]);
+
+    match config {
+        ExportConfig::None => Ok(None),
+        ExportConfig::Stdout => {
+            let exporter = opentelemetry_stdout::LogExporter::default();
+            let provider = LoggerProvider::builder()
+                .with_simple_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+        ExportConfig::Otlp { endpoint } => {
+            use opentelemetry_otlp::WithExportConfig;
+            let exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()?;
+            let provider = LoggerProvider::builder()
                 .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
                 .with_resource(resource)
                 .build();

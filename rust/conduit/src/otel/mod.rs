@@ -5,4 +5,4 @@ pub mod mapper;
 pub mod trace_context;
 
 pub use mapper::OtelMapper;
-pub use trace_context::{ExportConfig, init_tracer_provider};
+pub use trace_context::{ExportConfig, init_logger_provider, init_tracer_provider};

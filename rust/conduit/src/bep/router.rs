@@ -6,7 +6,7 @@ use super::decoder::BepJsonEvent;
 use crate::otel::OtelMapper;
 use crate::state::{ActionProcessingMode, BuildState};
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 /// Errors that can occur during event routing
 #[derive(Error, Debug)]
@@ -186,12 +186,17 @@ impl EventRouter {
                 .any(|opt| opt.contains("build_event_publish_all_actions"));
 
             if has_all_actions {
-                info!("Detected --build_event_publish_all_actions flag");
+                info!("Detected --build_event_publish_all_actions → full action processing");
                 self.state.set_action_mode(ActionProcessingMode::Full);
             } else {
-                debug!("Using lightweight action processing (failed actions only)");
+                info!("Lightweight action processing (failed actions only)");
                 self.state
                     .set_action_mode(ActionProcessingMode::Lightweight);
+            }
+
+            // OTel: record action mode on root span
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_action_mode(self.state.action_mode());
             }
 
             // Extract startup options
@@ -413,6 +418,37 @@ impl EventRouter {
             .and_then(|v| v.as_str());
 
         if let Some(label) = target_id {
+            // Check if this is an aborted/skipped target first.
+            let aborted = event.payload.get("aborted");
+            if let Some(abort_info) = aborted {
+                let reason = abort_info.get("reason").and_then(|v| v.as_str());
+                let description = abort_info.get("description").and_then(|v| v.as_str());
+
+                debug!(
+                    label,
+                    reason,
+                    description,
+                    "Target skipped/aborted"
+                );
+
+                self.state.complete_target(
+                    label.to_string(),
+                    false,
+                    Vec::new(),
+                    None,
+                );
+
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_target_skipped(
+                        label,
+                        reason,
+                        description,
+                        event.event_time_nanos,
+                    );
+                }
+                return Ok(());
+            }
+
             let payload = event.get_payload("completed");
 
             // In proto3 JSON, `true` is the default for bool and is often
@@ -486,8 +522,10 @@ impl EventRouter {
             .and_then(|v| v.as_str());
 
         if let Some(id) = set_id {
-            let files: Vec<String> = event
-                .get_payload("namedSetOfFiles")
+            let payload = event.get_payload("namedSetOfFiles");
+
+            // Direct files in this set.
+            let files: Vec<String> = payload
                 .and_then(|ns| ns.get("files"))
                 .and_then(|f| f.as_array())
                 .map(|arr| {
@@ -498,9 +536,22 @@ impl EventRouter {
                 })
                 .unwrap_or_default();
 
+            // Child NamedSet references (transitive).
+            let child_set_ids: Vec<String> = payload
+                .and_then(|ns| ns.get("fileSets"))
+                .and_then(|fs| fs.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|fs| fs.get("id"))
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             trace!(
                 set_id = id,
                 files_count = files.len(),
+                child_sets = child_set_ids.len(),
                 "Named set"
             );
 
@@ -508,7 +559,7 @@ impl EventRouter {
 
             // OTel: cache in mapper for later resolution during targetCompleted
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_named_set(id, files);
+                mapper.on_named_set(id, files, &child_set_ids);
             }
         }
         Ok(())
@@ -520,6 +571,10 @@ impl EventRouter {
         if let Some(action_id) = action_id {
             let label = action_id.get("label").and_then(|v| v.as_str());
             let primary_output = action_id.get("primaryOutput").and_then(|v| v.as_str());
+            let configuration = action_id
+                .get("configuration")
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_str());
 
             let payload = event.get_payload("action");
             let success = payload
@@ -534,32 +589,47 @@ impl EventRouter {
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
 
+            // Full-mode fields (may be absent in lightweight mode)
+            let command_line: Vec<String> = payload
+                .and_then(|a| a.get("commandLine"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let stdout_path = payload
+                .and_then(|a| a.get("stdout"))
+                .and_then(|v| v.as_str());
+            let stderr_path = payload
+                .and_then(|a| a.get("stderr"))
+                .and_then(|v| v.as_str());
+            let start_time_nanos = payload
+                .and_then(|a| a.get("startTimeNanos"))
+                .and_then(|v| v.as_i64());
+            let end_time_nanos = payload
+                .and_then(|a| a.get("endTimeNanos"))
+                .and_then(|v| v.as_i64());
+
             // Check if we should process this action based on mode
-            match self.state.action_mode() {
-                ActionProcessingMode::Lightweight => {
-                    if success {
-                        trace!(
-                            label,
-                            mnemonic,
-                            "Skipping successful action (lightweight mode)"
-                        );
-                        return Ok(());
-                    }
-                }
-                ActionProcessingMode::Full => {
-                    // Full mode not yet implemented
-                    warn!("Full action processing not yet implemented");
-                    unimplemented!("Full action span processing requires future implementation");
-                }
+            let should_process = self.state.action_mode().should_create_span(success);
+            if !should_process {
+                trace!(
+                    label,
+                    mnemonic,
+                    "Skipping successful action (lightweight mode)"
+                );
+                return Ok(());
             }
 
-            // Process failed action
             debug!(
                 label,
                 mnemonic,
+                success,
                 exit_code,
                 primary_output,
-                "Action failed"
+                "Action completed"
             );
 
             self.state.record_action(
@@ -570,9 +640,21 @@ impl EventRouter {
                 exit_code,
             );
 
-            // OTel: create failed action span
+            // OTel: create action span
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_action_failed(label, mnemonic, exit_code, primary_output);
+                mapper.on_action_completed(
+                    label,
+                    mnemonic,
+                    success,
+                    exit_code,
+                    primary_output,
+                    configuration,
+                    &command_line,
+                    stdout_path,
+                    stderr_path,
+                    start_time_nanos,
+                    end_time_nanos,
+                );
             }
         }
         Ok(())

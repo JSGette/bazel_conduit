@@ -8,6 +8,7 @@ pub const BAZEL_COMMAND: &str = "bazel.command";
 pub const BAZEL_COMMAND_LINE: &str = "bazel.command_line";
 pub const BAZEL_PATTERNS: &str = "bazel.patterns";
 pub const BAZEL_EXIT_CODE: &str = "bazel.exit_code";
+pub const BAZEL_ACTION_MODE: &str = "bazel.action_mode";
 
 // Workspace status
 pub const BAZEL_WORKSPACE_USER: &str = "bazel.workspace.user";
@@ -31,6 +32,11 @@ pub const BAZEL_ACTION_MNEMONIC: &str = "bazel.action.mnemonic";
 pub const BAZEL_ACTION_EXIT_CODE: &str = "bazel.action.exit_code";
 pub const BAZEL_ACTION_PRIMARY_OUTPUT: &str = "bazel.action.primary_output";
 pub const BAZEL_ACTION_SUCCESS: &str = "bazel.action.success";
+pub const BAZEL_ACTION_COMMAND_LINE: &str = "bazel.action.command_line";
+pub const BAZEL_ACTION_STDOUT: &str = "bazel.action.stdout";
+pub const BAZEL_ACTION_STDERR: &str = "bazel.action.stderr";
+pub const BAZEL_ACTION_LABEL: &str = "bazel.action.label";
+pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
 
 // Fetch span
 pub const BAZEL_FETCH_URL: &str = "bazel.fetch.url";

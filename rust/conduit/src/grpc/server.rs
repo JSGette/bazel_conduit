@@ -341,6 +341,7 @@ fn add_payload_to_json(
     map: &mut serde_json::Map<String, serde_json::Value>,
     payload: &crate::build_event_stream::build_event::Payload,
 ) {
+    use crate::build_event_stream;
     use crate::build_event_stream::build_event::Payload;
     use crate::build_event_stream::file::File as FileContent;
 
@@ -431,12 +432,37 @@ fn add_payload_to_json(
             );
         }
         Payload::Action(a) => {
+            // Extract stdout/stderr/primary_output file URIs.
+            let file_uri = |f: &crate::build_event_stream::File| -> Option<String> {
+                f.file.as_ref().and_then(|c| match c {
+                    FileContent::Uri(u) => Some(u.clone()),
+                    _ => None,
+                })
+            };
+            let stdout_uri = a.stdout.as_ref().and_then(file_uri);
+            let stderr_uri = a.stderr.as_ref().and_then(file_uri);
+            let primary_output_uri = a.primary_output.as_ref().and_then(file_uri);
+
+            // Convert proto Timestamps to nanos-since-epoch.
+            let start_time_nanos = a.start_time.as_ref().map(|ts| {
+                ts.seconds * 1_000_000_000 + ts.nanos as i64
+            });
+            let end_time_nanos = a.end_time.as_ref().map(|ts| {
+                ts.seconds * 1_000_000_000 + ts.nanos as i64
+            });
+
             map.insert(
                 "action".to_string(),
                 serde_json::json!({
                     "success": a.success,
                     "type": a.r#type,
                     "exitCode": a.exit_code,
+                    "commandLine": a.command_line,
+                    "stdout": stdout_uri,
+                    "stderr": stderr_uri,
+                    "primaryOutput": primary_output_uri,
+                    "startTimeNanos": start_time_nanos,
+                    "endTimeNanos": end_time_nanos,
                 }),
             );
         }
@@ -453,9 +479,15 @@ fn add_payload_to_json(
                     serde_json::json!({"name": f.name, "uri": uri})
                 })
                 .collect();
+            // Transitive NamedSet references (NamedSetOfFiles.file_sets).
+            let child_set_ids: Vec<serde_json::Value> = ns
+                .file_sets
+                .iter()
+                .map(|fs| serde_json::json!({"id": fs.id}))
+                .collect();
             map.insert(
                 "namedSetOfFiles".to_string(),
-                serde_json::json!({"files": files}),
+                serde_json::json!({"files": files, "fileSets": child_set_ids}),
             );
         }
         Payload::Finished(f) => {
@@ -529,6 +561,31 @@ fn add_payload_to_json(
                 "buildMetadata".to_string(),
                 serde_json::json!({
                     "metadata": bm.metadata,
+                }),
+            );
+        }
+        Payload::Aborted(a) => {
+            let reason = match a.reason() {
+                build_event_stream::aborted::AbortReason::Unknown => "UNKNOWN",
+                build_event_stream::aborted::AbortReason::UserInterrupted => "USER_INTERRUPTED",
+                build_event_stream::aborted::AbortReason::NoAnalyze => "NO_ANALYZE",
+                build_event_stream::aborted::AbortReason::NoBuild => "NO_BUILD",
+                build_event_stream::aborted::AbortReason::TimeOut => "TIME_OUT",
+                build_event_stream::aborted::AbortReason::RemoteEnvironmentFailure => {
+                    "REMOTE_ENVIRONMENT_FAILURE"
+                }
+                build_event_stream::aborted::AbortReason::Internal => "INTERNAL",
+                build_event_stream::aborted::AbortReason::LoadingFailure => "LOADING_FAILURE",
+                build_event_stream::aborted::AbortReason::AnalysisFailure => "ANALYSIS_FAILURE",
+                build_event_stream::aborted::AbortReason::Skipped => "SKIPPED",
+                build_event_stream::aborted::AbortReason::Incomplete => "INCOMPLETE",
+                build_event_stream::aborted::AbortReason::OutOfMemory => "OUT_OF_MEMORY",
+            };
+            map.insert(
+                "aborted".to_string(),
+                serde_json::json!({
+                    "reason": reason,
+                    "description": a.description,
                 }),
             );
         }

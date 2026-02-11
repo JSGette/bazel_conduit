@@ -3,23 +3,33 @@
 //! Manages the lifecycle of spans for a single Bazel build invocation.
 //! Spans are created / updated / ended as BEP events flow through the router.
 //!
-//! Span hierarchy (lightweight mode):
+//! Span hierarchy:
 //! ```text
 //! bazel.invocation (root, BuildStarted → finish)
 //! ├── target {label} (TargetConfigured → TargetCompleted)
-//! │   ├── action {mnemonic} {label} (failed actions only)
+//! │   ├── action {mnemonic} {label} (lightweight: failed only / full: all)
 //! │   └── test {label} (testResult spans)
-//! └── fetches (single parent span grouping all fetch events)
-//!     └── fetch {url} (individual fetch spans)
+//! ├── fetches (single parent span grouping all fetch events)
+//! │   └── fetch {url} (individual fetch spans)
+//! └── skipped targets (parent span grouping all skipped/aborted targets)
+//!     └── target {label} (aborted by Bazel)
 //!
-//! Events on bazel.invocation:
-//!   - build.log (accumulated progress stderr/stdout)
+//! Correlated OTel log records:
+//!   - build.log (accumulated progress stderr/stdout, emitted as a Log
+//!     record correlated with the trace via trace_id/span_id — falls back
+//!     to a span event when no LoggerProvider is configured)
+//!
+//! Action processing modes:
+//!   - lightweight (default): only failed actions create spans
+//!   - full (--build_event_publish_all_actions): every action gets a span
+//!     with accurate start_time / end_time from the ActionExecuted event
 //! ```
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
 use tracing::{debug, info, warn};
@@ -81,6 +91,19 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Metadata captured at `TargetConfigured` time.
+///
+/// Span creation is **deferred** until `TargetCompleted` so the mapper can
+/// decide whether the target belongs under the root span or the "skipped"
+/// parent span.  If an action arrives before the target completes, the
+/// target span is lazily created under root (see
+/// [`OtelMapper::ensure_target_span`]).
+struct ConfiguredTarget {
+    kind: Option<String>,
+    tags: Vec<String>,
+    event_time_nanos: Option<i64>,
+}
+
 /// Holds data for a target whose `TargetCompleted` arrived before all
 /// referenced `NamedSet` events.  Resolved lazily in [`OtelMapper::on_named_set`]
 /// or force-resolved in [`OtelMapper::finish`].
@@ -91,6 +114,18 @@ struct PendingTargetCompletion {
     end_time_nanos: Option<i64>,
 }
 
+/// A single entry in the NamedSet cache.
+///
+/// `NamedSetOfFiles` in BEP can contain both direct `files` and references
+/// to other NamedSets (`file_sets`).  We store both so we can recursively
+/// resolve the transitive closure of files.
+struct NamedSetEntry {
+    /// Direct files in this set.
+    files: Vec<String>,
+    /// IDs of child NamedSets whose files also belong to this set.
+    child_set_ids: Vec<String>,
+}
+
 /// Maps BEP events to OpenTelemetry spans.
 pub struct OtelMapper {
     tracer: opentelemetry_sdk::trace::Tracer,
@@ -98,7 +133,13 @@ pub struct OtelMapper {
     /// Root span context (`bazel.invocation`).
     root_context: Option<Context>,
 
-    /// Open target spans, keyed by target label.
+    /// Targets whose `TargetConfigured` arrived but whose span has **not**
+    /// yet been created.  Span creation is deferred until `TargetCompleted`
+    /// so we can choose the correct parent (root vs. "skipped").
+    configured_targets: HashMap<String, ConfiguredTarget>,
+
+    /// Open target spans (created either lazily by an action or at
+    /// `TargetCompleted` time), keyed by target label.
     target_contexts: HashMap<String, Context>,
 
     /// Targets whose `TargetCompleted` arrived but whose `NamedSet` data
@@ -109,10 +150,20 @@ pub struct OtelMapper {
     /// Created lazily on first fetch event, ended in [`finish`].
     fetches_context: Option<Context>,
 
+    /// Single `skipped` parent span grouping all skipped/aborted targets.
+    /// Created lazily on first skipped target, ended in [`finish`].
+    skipped_context: Option<Context>,
+
     /// Accumulated stderr / stdout from all progress messages.
-    /// Flushed as a single `build.log` event on the root span in [`finish`].
+    /// Flushed as an OTel log record correlated with the trace in [`finish`].
+    /// Falls back to a span event if no logger is available.
     progress_stderr: String,
     progress_stdout: String,
+
+    /// Optional OTel logger for emitting build logs as log records.
+    /// When present, build.log is emitted as a correlated log record
+    /// instead of a span event — much friendlier for large build output.
+    logger: Option<opentelemetry_sdk::logs::Logger>,
 
     /// Cached exit code from BuildFinished (root span ends in [`finish`]).
     exit_code: Option<i32>,
@@ -120,9 +171,9 @@ pub struct OtelMapper {
     /// Cached finish timestamp from BuildFinished.
     finish_time_millis: Option<i64>,
 
-    /// Named set cache: set_id → file names.
-    /// Used to resolve output files when target spans are completed.
-    named_set_cache: HashMap<String, Vec<String>>,
+    /// Named set cache: set_id → entry with direct files + child set refs.
+    /// Used to resolve output files (transitively) when target spans complete.
+    named_set_cache: HashMap<String, NamedSetEntry>,
 
     /// Fetch events that arrived before the root span was created.
     /// Replayed once `on_build_started` fires.
@@ -131,15 +182,21 @@ pub struct OtelMapper {
 }
 
 impl OtelMapper {
-    pub fn new(tracer: opentelemetry_sdk::trace::Tracer) -> Self {
+    pub fn new(
+        tracer: opentelemetry_sdk::trace::Tracer,
+        logger: Option<opentelemetry_sdk::logs::Logger>,
+    ) -> Self {
         Self {
             tracer,
             root_context: None,
+            configured_targets: HashMap::new(),
             target_contexts: HashMap::new(),
             pending_completions: HashMap::new(),
             fetches_context: None,
+            skipped_context: None,
             progress_stderr: String::new(),
             progress_stdout: String::new(),
+            logger,
             exit_code: None,
             finish_time_millis: None,
             named_set_cache: HashMap::new(),
@@ -212,6 +269,14 @@ impl OtelMapper {
         }
     }
 
+    /// ActionMode → record the detected processing mode on the root span.
+    pub fn on_action_mode(&mut self, mode: crate::state::ActionProcessingMode) {
+        if let Some(cx) = &self.root_context {
+            cx.span()
+                .set_attribute(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
+        }
+    }
+
     /// WorkspaceStatus → add workspace attributes to root span.
     pub fn on_workspace_status(&mut self, items: &HashMap<String, String>) {
         if let Some(cx) = &self.root_context {
@@ -275,10 +340,12 @@ impl OtelMapper {
     // Target events
     // =====================================================================
 
-    /// TargetConfigured → create child span `target {label}`.
+    /// TargetConfigured → store metadata for deferred span creation.
     ///
-    /// If `event_time_nanos` is provided (gRPC mode), it is used as the
-    /// span's start time for accurate, sub-millisecond duration measurement.
+    /// The actual span is created later in [`on_target_completed`] (or
+    /// [`on_target_skipped`]) so we can choose the correct parent.
+    /// If an action arrives before the target completes, the span is
+    /// created lazily under root via [`ensure_target_span`].
     pub fn on_target_configured(
         &mut self,
         label: &str,
@@ -286,20 +353,41 @@ impl OtelMapper {
         tags: &[String],
         event_time_nanos: Option<i64>,
     ) {
-        let parent = match &self.root_context {
-            Some(cx) => cx,
-            None => {
-                warn!("TargetConfigured before BuildStarted for {label}");
-                return;
-            }
-        };
-
-        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
-        if let Some(k) = kind {
-            attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.to_string()));
+        if self.root_context.is_none() {
+            warn!("TargetConfigured before BuildStarted for {label}");
+            return;
         }
-        if !tags.is_empty() {
-            attrs.push(KeyValue::new(BAZEL_TARGET_TAGS, tags.join(", ")));
+
+        self.configured_targets.insert(
+            label.to_string(),
+            ConfiguredTarget {
+                kind: kind.map(String::from),
+                tags: tags.to_vec(),
+                event_time_nanos,
+            },
+        );
+
+        debug!("Stored configured target metadata for {label}");
+    }
+
+    /// Create a target span under a given parent context.
+    ///
+    /// Returns the newly created [`Context`] wrapping the span.
+    fn create_target_span(
+        &self,
+        label: &str,
+        configured: &ConfiguredTarget,
+        parent: &Context,
+    ) -> Context {
+        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        if let Some(k) = &configured.kind {
+            attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
+        }
+        if !configured.tags.is_empty() {
+            attrs.push(KeyValue::new(
+                BAZEL_TARGET_TAGS,
+                configured.tags.join(", "),
+            ));
         }
 
         let mut builder = self
@@ -308,26 +396,43 @@ impl OtelMapper {
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
 
-        if let Some(nanos) = event_time_nanos {
+        if let Some(nanos) = configured.event_time_nanos {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
         }
 
         let span = self.tracer.build_with_context(builder, parent);
-        let cx = Context::new().with_span(span);
-
-        debug!("Created target span for {label}");
-        self.target_contexts.insert(label.to_string(), cx);
+        Context::new().with_span(span)
     }
 
-    /// TargetCompleted → end target span with status, outputs, tags, and resolved files.
+    /// Ensure a target span exists in `target_contexts`, creating it
+    /// lazily (under root) if it only has `ConfiguredTarget` metadata so far.
+    ///
+    /// This is called by action handlers that need a parent target context
+    /// before `TargetCompleted` has been processed.
+    fn ensure_target_span(&mut self, label: &str) {
+        if self.target_contexts.contains_key(label) {
+            return;
+        }
+        if let Some(configured) = self.configured_targets.get(label) {
+            if let Some(root) = &self.root_context {
+                let cx = self.create_target_span(label, configured, root);
+                debug!("Lazily created target span for {label} (action needed parent)");
+                self.target_contexts.insert(label.to_string(), cx);
+            }
+        }
+    }
+
+    /// TargetCompleted → create (or reuse) the target span, set attributes,
+    /// resolve output files, and end the span.
+    ///
+    /// The span is created under **root** at this point because the target
+    /// actually completed (i.e. was not skipped).  If an action already
+    /// triggered lazy creation via [`ensure_target_span`], that span is reused.
     ///
     /// If all referenced `NamedSet` IDs are already in the cache the span is
     /// ended immediately.  Otherwise completion is deferred — the span stays
     /// open and is ended later when the missing `NamedSet` events arrive (see
     /// [`on_named_set`]) or at build end (see [`finish`]).
-    ///
-    /// If `event_time_nanos` is provided (gRPC mode), it is used as the
-    /// span's end time so the duration accurately reflects Bazel timestamps.
     pub fn on_target_completed(
         &mut self,
         label: &str,
@@ -336,61 +441,155 @@ impl OtelMapper {
         tags: &[String],
         event_time_nanos: Option<i64>,
     ) {
-        if let Some(cx) = self.target_contexts.remove(label) {
-            cx.span()
-                .set_attribute(KeyValue::new(BAZEL_TARGET_SUCCESS, success));
-
-            // Merge tags from TargetCompleted (may overlap with Configured).
-            if !tags.is_empty() {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_TARGET_TAGS, tags.join(", ")));
-            }
-
-            // Check whether all referenced file sets are in the cache.
-            let all_resolved = file_set_ids.is_empty()
-                || file_set_ids
-                    .iter()
-                    .all(|id| self.named_set_cache.contains_key(id));
-
-            if all_resolved {
-                // Resolve immediately.
-                Self::apply_file_sets_and_end(&self.named_set_cache, &cx, label, success, file_set_ids, event_time_nanos);
+        // Get or create the span under root.
+        let cx = if let Some(cx) = self.target_contexts.remove(label) {
+            // Span already exists (lazily created by an action).
+            cx
+        } else if let Some(configured) = self.configured_targets.remove(label) {
+            // First time — create under root.
+            if let Some(root) = &self.root_context {
+                let cx = self.create_target_span(label, &configured, root);
+                debug!("Created target span for {label} at completion time");
+                cx
             } else {
-                // Defer — keep the span open until the missing sets arrive.
-                debug!(
-                    "Deferring target completion for {label} (waiting for {} named sets)",
-                    file_set_ids.iter().filter(|id| !self.named_set_cache.contains_key(*id)).count()
-                );
-                self.pending_completions.insert(
-                    label.to_string(),
-                    PendingTargetCompletion {
-                        cx,
-                        success,
-                        file_set_ids: file_set_ids.to_vec(),
-                        end_time_nanos: event_time_nanos,
-                    },
-                );
+                warn!("TargetCompleted before BuildStarted for {label}");
+                return;
             }
         } else {
             warn!("TargetCompleted for unknown target {label}");
+            return;
+        };
+
+        cx.span()
+            .set_attribute(KeyValue::new(BAZEL_TARGET_SUCCESS, success));
+
+        // Merge tags from TargetCompleted (may overlap with Configured).
+        if !tags.is_empty() {
+            cx.span()
+                .set_attribute(KeyValue::new(BAZEL_TARGET_TAGS, tags.join(", ")));
+        }
+
+        // Check whether all referenced file sets (transitively) are cached.
+        let all_resolved = file_set_ids.is_empty()
+            || Self::all_sets_resolved(&self.named_set_cache, file_set_ids);
+
+        if all_resolved {
+            // Resolve immediately.
+            Self::apply_file_sets_and_end(
+                &self.named_set_cache,
+                &cx,
+                label,
+                success,
+                file_set_ids,
+                event_time_nanos,
+            );
+        } else {
+            // Defer — keep the span open until the missing sets arrive.
+            debug!("Deferring target completion for {label} (waiting for named sets)");
+            self.pending_completions.insert(
+                label.to_string(),
+                PendingTargetCompletion {
+                    cx,
+                    success,
+                    file_set_ids: file_set_ids.to_vec(),
+                    end_time_nanos: event_time_nanos,
+                },
+            );
         }
     }
 
+    /// TargetCompleted with `aborted` payload → create a brief span under
+    /// the "skipped" parent and end it immediately.
+    pub fn on_target_skipped(
+        &mut self,
+        label: &str,
+        reason: Option<&str>,
+        description: Option<&str>,
+        event_time_nanos: Option<i64>,
+    ) {
+        // Consume the configured metadata (if any).
+        let configured = self.configured_targets.remove(label);
+        // Also consume any lazily-created span (shouldn't exist for skipped,
+        // but clean up just in case).
+        let _existing = self.target_contexts.remove(label);
+
+        // Lazily create the "skipped" parent span.
+        if self.skipped_context.is_none() {
+            if let Some(root) = &self.root_context {
+                let builder = self
+                    .tracer
+                    .span_builder("skipped targets")
+                    .with_kind(SpanKind::Internal);
+                let span = self.tracer.build_with_context(builder, root);
+                self.skipped_context = Some(Context::new().with_span(span));
+                debug!("Created 'skipped targets' parent span");
+            }
+        }
+
+        let parent = match &self.skipped_context {
+            Some(cx) => cx,
+            None => return,
+        };
+
+        // Build the child span.
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_SUCCESS, false),
+        ];
+        if let Some(configured) = &configured {
+            if let Some(k) = &configured.kind {
+                attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
+            }
+        }
+        if let Some(r) = reason {
+            attrs.push(KeyValue::new("bazel.target.abort_reason", r.to_string()));
+        }
+        if let Some(d) = description {
+            attrs.push(KeyValue::new(
+                "bazel.target.abort_description",
+                d.to_string(),
+            ));
+        }
+
+        let mut builder = self
+            .tracer
+            .span_builder(format!("target {label}"))
+            .with_kind(SpanKind::Internal)
+            .with_attributes(attrs);
+
+        // Use configured start time if available.
+        if let Some(configured) = &configured {
+            if let Some(nanos) = configured.event_time_nanos {
+                builder = builder.with_start_time(nanos_to_system_time(nanos));
+            }
+        }
+
+        let span = self.tracer.build_with_context(builder, parent);
+        let cx = Context::new().with_span(span);
+
+        cx.span().set_status(Status::Unset);
+        if let Some(nanos) = event_time_nanos {
+            cx.span().end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            cx.span().end();
+        }
+
+        debug!("Created and ended skipped target span for {label}");
+    }
+
     /// Resolve file sets from cache and end the target span.
+    ///
+    /// File resolution is **recursive**: each NamedSet can reference child
+    /// NamedSets, so we traverse the tree to collect every leaf file.
     fn apply_file_sets_and_end(
-        cache: &HashMap<String, Vec<String>>,
+        cache: &HashMap<String, NamedSetEntry>,
         cx: &Context,
         label: &str,
         success: bool,
         file_set_ids: &[String],
         end_time_nanos: Option<i64>,
     ) {
-        let mut all_files: Vec<String> = Vec::new();
-        for set_id in file_set_ids {
-            if let Some(files) = cache.get(set_id) {
-                all_files.extend(files.iter().cloned());
-            }
-        }
+        let all_files = Self::resolve_files(cache, file_set_ids);
 
         if !all_files.is_empty() {
             cx.span().set_attribute(KeyValue::new(
@@ -431,26 +630,83 @@ impl OtelMapper {
         );
     }
 
+    // -----------------------------------------------------------------
+    // NamedSet transitive helpers
+    // -----------------------------------------------------------------
+
+    /// Check whether all NamedSets reachable from `set_ids` (transitively)
+    /// are present in the cache.
+    fn all_sets_resolved(
+        cache: &HashMap<String, NamedSetEntry>,
+        set_ids: &[String],
+    ) -> bool {
+        let mut stack: Vec<&str> = set_ids.iter().map(String::as_str).collect();
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            match cache.get(id) {
+                Some(entry) => {
+                    for child in &entry.child_set_ids {
+                        stack.push(child.as_str());
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Recursively collect all files reachable from the given NamedSet IDs.
+    fn resolve_files(
+        cache: &HashMap<String, NamedSetEntry>,
+        set_ids: &[String],
+    ) -> Vec<String> {
+        let mut files = Vec::new();
+        let mut stack: Vec<&str> = set_ids.iter().map(String::as_str).collect();
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if let Some(entry) = cache.get(id) {
+                files.extend(entry.files.iter().cloned());
+                for child in &entry.child_set_ids {
+                    stack.push(child.as_str());
+                }
+            }
+        }
+        files
+    }
+
     // =====================================================================
     // Named set cache
     // =====================================================================
 
     /// Cache a NamedSet so it can be resolved when targets complete.
     ///
-    /// After caching, any pending target completions that were waiting for
-    /// this set (and now have all their sets resolved) are finalized.
-    pub fn on_named_set(&mut self, set_id: &str, files: Vec<String>) {
-        self.named_set_cache.insert(set_id.to_string(), files);
+    /// A NamedSet can contain direct `files` AND references to other
+    /// NamedSets (`child_set_ids`).  Both are stored so that
+    /// [`resolve_files`] can recursively collect the transitive closure.
+    ///
+    /// After caching, any pending target completions whose **full**
+    /// transitive NamedSet tree is now cached are finalized.
+    pub fn on_named_set(&mut self, set_id: &str, files: Vec<String>, child_set_ids: &[String]) {
+        self.named_set_cache.insert(
+            set_id.to_string(),
+            NamedSetEntry {
+                files,
+                child_set_ids: child_set_ids.to_vec(),
+            },
+        );
 
         // Check if any pending target completions can now be resolved.
         let ready_labels: Vec<String> = self
             .pending_completions
             .iter()
             .filter(|(_, pending)| {
-                pending
-                    .file_set_ids
-                    .iter()
-                    .all(|id| self.named_set_cache.contains_key(id))
+                Self::all_sets_resolved(&self.named_set_cache, &pending.file_set_ids)
             })
             .map(|(label, _)| label.clone())
             .collect();
@@ -471,26 +727,50 @@ impl OtelMapper {
     }
 
     // =====================================================================
-    // Action events (lightweight: failed only)
+    // Action events
     // =====================================================================
 
-    /// Failed action → create + immediately end `action {mnemonic} {label}`.
-    pub fn on_action_failed(
+    /// ActionCompleted → create + immediately end `action {mnemonic} {label}`.
+    ///
+    /// In **lightweight** mode only failed actions reach this method.
+    /// In **full** mode every action (success or failure) is mapped.
+    ///
+    /// When `start_time_nanos` / `end_time_nanos` are available (from the
+    /// `ActionExecuted.start_time` / `end_time` proto fields) they are used
+    /// for accurate span timing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_action_completed(
         &mut self,
         label: Option<&str>,
         mnemonic: Option<&str>,
+        success: bool,
         exit_code: Option<i32>,
         primary_output: Option<&str>,
+        configuration: Option<&str>,
+        command_line: &[String],
+        stdout_path: Option<&str>,
+        stderr_path: Option<&str>,
+        start_time_nanos: Option<i64>,
+        end_time_nanos: Option<i64>,
     ) {
-        // Prefer the target span as parent; fall back to root.
+        // Lazily create the target span if it hasn't been created yet.
+        if let Some(l) = label {
+            self.ensure_target_span(l);
+        }
+
+        // Parent: target span → pending completion → root.
         let parent = label
-            .and_then(|l| self.target_contexts.get(l))
+            .and_then(|l| {
+                self.target_contexts
+                    .get(l)
+                    .or_else(|| self.pending_completions.get(l).map(|p| &p.cx))
+            })
             .or(self.root_context.as_ref());
 
         let parent = match parent {
             Some(cx) => cx.clone(),
             None => {
-                warn!("ActionFailed with no parent context");
+                warn!("ActionCompleted with no parent context");
                 return;
             }
         };
@@ -502,7 +782,7 @@ impl OtelMapper {
             _ => "action".to_string(),
         };
 
-        let mut attrs = vec![KeyValue::new(BAZEL_ACTION_SUCCESS, false)];
+        let mut attrs = vec![KeyValue::new(BAZEL_ACTION_SUCCESS, success)];
         if let Some(m) = mnemonic {
             attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, m.to_string()));
         }
@@ -516,22 +796,59 @@ impl OtelMapper {
             ));
         }
         if let Some(l) = label {
-            attrs.push(KeyValue::new(BAZEL_TARGET_LABEL, l.to_string()));
+            attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, l.to_string()));
+        }
+        if let Some(cfg) = configuration {
+            attrs.push(KeyValue::new(
+                BAZEL_ACTION_CONFIGURATION,
+                cfg.to_string(),
+            ));
+        }
+        if !command_line.is_empty() {
+            attrs.push(KeyValue::new(
+                BAZEL_ACTION_COMMAND_LINE,
+                command_line.join(" "),
+            ));
+        }
+        if let Some(p) = stdout_path {
+            attrs.push(KeyValue::new(BAZEL_ACTION_STDOUT, p.to_string()));
+        }
+        if let Some(p) = stderr_path {
+            attrs.push(KeyValue::new(BAZEL_ACTION_STDERR, p.to_string()));
         }
 
-        let builder = self
+        let mut builder = self
             .tracer
             .span_builder(span_name)
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
 
-        let mut span = self.tracer.build_with_context(builder, &parent);
-        span.set_status(Status::Error {
-            description: Cow::Borrowed("Action failed"),
-        });
-        span.end();
+        // Use action-level start_time if available (full mode).
+        if let Some(nanos) = start_time_nanos {
+            builder = builder.with_start_time(nanos_to_system_time(nanos));
+        }
 
-        debug!("Created failed action span for {:?}", label);
+        let mut span = self.tracer.build_with_context(builder, &parent);
+
+        if success {
+            span.set_status(Status::Ok);
+        } else {
+            span.set_status(Status::Error {
+                description: Cow::Borrowed("Action failed"),
+            });
+        }
+
+        // Use action-level end_time if available (full mode).
+        if let Some(nanos) = end_time_nanos {
+            span.end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            span.end();
+        }
+
+        debug!(
+            "Created action span (success={success}) for {:?}",
+            label
+        );
     }
 
     // =====================================================================
@@ -626,6 +943,9 @@ impl OtelMapper {
         cached: Option<bool>,
         strategy: Option<&str>,
     ) {
+        // Lazily create the target span if needed.
+        self.ensure_target_span(label);
+
         // Parent is the target span; fall back to root.
         let parent = self
             .target_contexts
@@ -814,7 +1134,7 @@ impl OtelMapper {
             }
         }
 
-        // End any remaining target spans (configured but never completed).
+        // End any remaining target spans (lazily created but never completed).
         let labels: Vec<String> = self.target_contexts.keys().cloned().collect();
         for label in labels {
             if let Some(cx) = self.target_contexts.remove(&label) {
@@ -824,24 +1144,75 @@ impl OtelMapper {
             }
         }
 
-        // Flush accumulated progress text as a single `build.log` event on root.
-        if let Some(cx) = &self.root_context {
-            let mut attrs = Vec::new();
-            if !self.progress_stderr.is_empty() {
-                attrs.push(KeyValue::new(
-                    BAZEL_PROGRESS_STDERR,
-                    std::mem::take(&mut self.progress_stderr),
-                ));
-            }
-            if !self.progress_stdout.is_empty() {
-                attrs.push(KeyValue::new(
-                    BAZEL_PROGRESS_STDOUT,
-                    std::mem::take(&mut self.progress_stdout),
-                ));
-            }
-            if !attrs.is_empty() {
-                cx.span().add_event("build.log", attrs);
-                debug!("Added build.log event to root span");
+        // Warn about configured targets that never got a completed/aborted event.
+        for label in self.configured_targets.keys() {
+            warn!("Target {label} was configured but never completed or skipped");
+        }
+        self.configured_targets.clear();
+
+        // End the `skipped targets` parent span.
+        if let Some(cx) = self.skipped_context.take() {
+            cx.span().set_status(Status::Unset);
+            cx.span().end();
+            debug!("Ended 'skipped targets' span");
+        }
+
+        // Flush accumulated progress text as an OTel log record correlated
+        // with the trace (much friendlier for large build output than a span
+        // event).  Falls back to a span event when no logger is available.
+        {
+            let stderr = std::mem::take(&mut self.progress_stderr);
+            let stdout = std::mem::take(&mut self.progress_stdout);
+            let has_content = !stderr.is_empty() || !stdout.is_empty();
+
+            if has_content {
+                if let (Some(logger), Some(cx)) = (&self.logger, &self.root_context) {
+                    let span_ref = cx.span();
+                    let span_cx = span_ref.span_context();
+
+                    let mut record = logger.create_log_record();
+                    record.set_trace_context(
+                        span_cx.trace_id(),
+                        span_cx.span_id(),
+                        Some(span_cx.trace_flags()),
+                    );
+                    record.set_severity_number(Severity::Info);
+                    record.set_severity_text("INFO");
+                    record.set_event_name("build.log");
+
+                    // Body = stderr (primary Bazel output); stdout as attribute
+                    // when both are present.
+                    match (!stderr.is_empty(), !stdout.is_empty()) {
+                        (true, true) => {
+                            record.set_body(AnyValue::String(stderr.into()));
+                            record.add_attribute(
+                                BAZEL_PROGRESS_STDOUT,
+                                AnyValue::String(stdout.into()),
+                            );
+                        }
+                        (true, false) => {
+                            record.set_body(AnyValue::String(stderr.into()));
+                        }
+                        (false, true) => {
+                            record.set_body(AnyValue::String(stdout.into()));
+                        }
+                        (false, false) => unreachable!("has_content guard"),
+                    }
+
+                    logger.emit(record);
+                    debug!("Emitted build.log as OTel log record correlated with trace");
+                } else if let Some(cx) = &self.root_context {
+                    // Fallback: span event when no logger is available
+                    let mut attrs = Vec::new();
+                    if !stderr.is_empty() {
+                        attrs.push(KeyValue::new(BAZEL_PROGRESS_STDERR, stderr));
+                    }
+                    if !stdout.is_empty() {
+                        attrs.push(KeyValue::new(BAZEL_PROGRESS_STDOUT, stdout));
+                    }
+                    cx.span().add_event("build.log", attrs);
+                    debug!("Added build.log as span event (no logger available)");
+                }
             }
         }
 
