@@ -20,11 +20,14 @@ rust_library(
         "@crates//:opentelemetry",
         "@crates//:opentelemetry-otlp",
         "@crates//:opentelemetry_sdk",
+        "@crates//:prost",
+        "@crates//:prost-types",
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:thiserror",
         "@crates//:tokio",
         "@crates//:tokio-stream",
+        "@crates//:tonic",
         "@crates//:tracing",
         "@crates//:tracing-subscriber",
         "@crates//:uuid",
@@ -47,4 +50,21 @@ rust_binary(
 rust_test(
     name = "conduit_lib_test",
     crate = ":conduit_lib",
+)
+
+rust_test(
+    name = "decoder_tests",
+    srcs = ["tests/decoder_tests.rs"],
+    deps = [
+        ":conduit_lib",
+        "@crates//:serde_json",
+    ],
+)
+
+rust_test(
+    name = "action_mode_tests",
+    srcs = ["tests/action_mode_tests.rs"],
+    deps = [
+        ":conduit_lib",
+    ],
 )

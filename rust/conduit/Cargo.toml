@@ -6,6 +6,11 @@ rust-version = "1.93"
 description = "BEP to OpenTelemetry trace converter"
 
 [dependencies]
+# Proto / gRPC
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.12"
+
 # OTel
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
@@ -31,5 +36,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
+
+# Prost toolchain plugins (only needed for Bazel proto gen)
+protoc-gen-prost = "0.4"
+protoc-gen-tonic = "0.4"
 
 [build-dependencies]

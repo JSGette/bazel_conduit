@@ -1,4 +1,4 @@
-// Copyright 2015 Google LLC
+// Copyright 2025 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ syntax = "proto3";
 package google.devtools.build.v1;
 
 import "proto/google/devtools/build/v1/build_events.proto";
-import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 
@@ -27,12 +26,7 @@ option java_package = "com.google.devtools.build.v1";
 
 // A service for publishing BuildEvents.
 service PublishBuildEvent {
-  // Publish a build event stating the new state of a build (typically from the
-  // build queue). The BuildEnqueued event must be published before all other
-  // events for the same build ID.
-  //
-  // The backend will return a STREAM_FINALIZED error on subsequent
-  // attempts to update the build or publish other events for this build ID.
+  // Publish a build event stating the new state of a build.
   rpc PublishLifecycleEvent(PublishLifecycleEventRequest)
       returns (google.protobuf.Empty) {}
 
@@ -44,8 +38,7 @@ service PublishBuildEvent {
 
 // Publishes 'lifecycle events' that update the high-level state of a build:
 // - BuildEnqueued: When a build is scheduled.
-// - InvocationAttemptStarted: When work for a build starts; there can be
-//     multiple attempts.
+// - InvocationAttemptStarted: When work for a build starts.
 // - InvocationAttemptFinished: When work for a build finishes.
 // - BuildFinished: When a build is finished.
 message PublishLifecycleEventRequest {
@@ -57,28 +50,28 @@ message PublishLifecycleEventRequest {
     INTERACTIVE = 1;
   }
 
+  // The interactivity of this build.
+  ServiceLevel service_level = 1;
+
   // The lifecycle build event.
-  OrderedBuildEvent build_event = 1;
+  OrderedBuildEvent build_event = 2;
 
   // If the next event for this build or invocation should wait for a
   // previous publishing call to finish, the client should set this to be the
-  // same value of that previous call's stream_timeout. The build system
-  // should wait at least as long as the timeout before giving up.
-  google.protobuf.Duration stream_timeout = 2;
+  // same value of that previous call's stream_timeout.
+  google.protobuf.Duration stream_timeout = 3;
 
   // Additional information about the build request.
-  repeated string notification_keywords = 3;
+  repeated string notification_keywords = 4;
 
   // Name of the project being built.
   string project_id = 6;
 
-  // For lifecycle events, the service level is used to indicate if this is
-  // an INTERACTIVE or NONINTERACTIVE build.
-  ServiceLevel service_level = 5;
+  // Whether to require a previously received matching parent lifecycle event.
+  bool check_preceding_lifecycle_events_present = 7;
 }
 
-// States which event has been committed. Any failure to commit will cause
-// RPC errors, hence not recorded by this proto.
+// States which event has been committed.
 message PublishBuildToolEventStreamResponse {
   // The stream that contains this event.
   StreamId stream_id = 1;

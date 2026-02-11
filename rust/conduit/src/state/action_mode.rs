@@ -37,22 +37,3 @@ impl std::fmt::Display for ActionProcessingMode {
         write!(f, "{}", self.description())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lightweight_mode() {
-        let mode = ActionProcessingMode::Lightweight;
-        assert!(mode.should_create_span(false)); // Failed action -> create span
-        assert!(!mode.should_create_span(true)); // Successful action -> skip
-    }
-
-    #[test]
-    fn test_full_mode() {
-        let mode = ActionProcessingMode::Full;
-        assert!(mode.should_create_span(false)); // Failed action -> create span
-        assert!(mode.should_create_span(true)); // Successful action -> create span
-    }
-}

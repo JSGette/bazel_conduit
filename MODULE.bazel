@@ -53,4 +53,20 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
+
+# Generate protoc plugin binaries from crate dependencies
+crate.annotation(
+    crate = "protoc-gen-prost",
+    gen_binaries = ["protoc-gen-prost"],
+)
+crate.annotation(
+    crate = "protoc-gen-tonic",
+    gen_binaries = ["protoc-gen-tonic"],
+)
+
 use_repo(crate, "crates")
+
+# =============================================================================
+# Prost toolchain (using crates from rules_rs for version consistency)
+# =============================================================================
+register_toolchains("//toolchain:prost_toolchain")
