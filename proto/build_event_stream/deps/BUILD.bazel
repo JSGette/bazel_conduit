@@ -1,5 +1,5 @@
-load("@rules_go//proto:def.bzl", "go_proto_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library")
 
 # Combined proto library for all dependencies
 proto_library(
@@ -14,59 +14,9 @@ proto_library(
     ],
 )
 
-# Individual go_proto_library targets for each proto file
-go_proto_library(
-    name = "action_cache_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/action_cache",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "analysis_cache_service_metadata_status_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/analysis_cache_service_metadata_status",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "command_line_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/command_line",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "failure_details_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/failure_details",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "invocation_policy_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/invocation_policy",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "option_filters_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/option_filters",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "package_load_metrics_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/package_load_metrics",
-    proto = ":deps_proto",
-    visibility = ["//visibility:public"],
-)
-
-go_proto_library(
-    name = "strategy_policy_proto",
-    importpath = "github.com/JSGette/bazel_conduit/proto/build_event_stream/deps/strategy_policy",
+# Rust prost library for deps
+rust_prost_library(
+    name = "deps_rust_proto",
     proto = ":deps_proto",
     visibility = ["//visibility:public"],
 )

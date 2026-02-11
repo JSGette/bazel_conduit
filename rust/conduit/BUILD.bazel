@@ -1,0 +1,44 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Export Cargo files for rules_rs
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+rust_library(
+    name = "conduit_lib",
+    srcs = ["src/lib.rs"],
+    deps = [
+        "//proto/build_event_stream:build_event_stream_rust_proto",
+        "@crates//:clap",
+        "@crates//:dashmap",
+        "@crates//:opentelemetry",
+        "@crates//:opentelemetry-otlp",
+        "@crates//:opentelemetry_sdk",
+        "@crates//:prost",
+        "@crates//:prost-types",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+        "@crates//:tokio",
+        "@crates//:tonic",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+        "@crates//:uuid",
+    ],
+)
+
+rust_binary(
+    name = "conduit",
+    srcs = ["src/main.rs"],
+    deps = [
+        ":conduit_lib",
+        "@crates//:clap",
+        "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+    ],
+)
