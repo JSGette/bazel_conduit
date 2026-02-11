@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -10,7 +10,7 @@ exports_files([
 
 rust_library(
     name = "conduit_lib",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
     deps = [
         "//proto/build_event_stream:build_event_stream_rust_proto",
         "@crates//:clap",
@@ -36,9 +36,15 @@ rust_binary(
     srcs = ["src/main.rs"],
     deps = [
         ":conduit_lib",
+        "@crates//:anyhow",
         "@crates//:clap",
         "@crates//:tokio",
         "@crates//:tracing",
         "@crates//:tracing-subscriber",
     ],
+)
+
+rust_test(
+    name = "conduit_lib_test",
+    crate = ":conduit_lib",
 )
