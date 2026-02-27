@@ -86,6 +86,7 @@ impl EventRouter {
             // Test events
             "testResult" => self.handle_test_result(event),
             "testSummary" => self.handle_test_summary(event),
+            "targetSummary" => self.handle_target_summary(event),
 
             // Progress events (may have stderr/stdout content)
             "progress" => self.handle_progress(event),
@@ -118,6 +119,11 @@ impl EventRouter {
             let uuid = started.get("uuid").and_then(|v| v.as_str());
             let command = started.get("command").and_then(|v| v.as_str());
             let start_time_millis = started.get("startTimeMillis").and_then(|v| v.as_i64());
+            let start_time_nanos = started
+                .get("startTimeNanos")
+                .and_then(|v| v.as_i64())
+                .or_else(|| start_time_millis.map(|ms| ms * 1_000_000));
+            let event_time_nanos = event.event_time_nanos;
 
             info!(
                 uuid = uuid,
@@ -135,12 +141,12 @@ impl EventRouter {
                 self.state.set_start_time_millis(millis);
             }
 
-            // OTel: create root span
             if let Some(mapper) = &mut self.mapper {
                 mapper.on_build_started(
                     uuid.unwrap_or("unknown"),
                     command.unwrap_or("unknown"),
-                    start_time_millis,
+                    start_time_nanos,
+                    event_time_nanos,
                 );
             }
         }
@@ -295,6 +301,10 @@ impl EventRouter {
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
             let finish_time_millis = payload.get("finishTimeMillis").and_then(|v| v.as_i64());
+            let finish_time_nanos = payload
+                .get("finishTimeNanos")
+                .and_then(|v| v.as_i64())
+                .or_else(|| finish_time_millis.map(|ms| ms * 1_000_000));
 
             info!(
                 exit_code,
@@ -309,9 +319,8 @@ impl EventRouter {
             }
             self.state.mark_finished();
 
-            // OTel: record exit code (root span ends in finish())
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_build_finished(exit_code, finish_time_millis);
+                mapper.on_build_finished(exit_code, finish_time_nanos);
             }
         }
         Ok(())
@@ -729,6 +738,13 @@ impl EventRouter {
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
 
+            let start_time_nanos = payload
+                .and_then(|p| p.get("testAttemptStartNanos"))
+                .and_then(|v| v.as_i64());
+            let duration_nanos = payload
+                .and_then(|p| p.get("testAttemptDurationNanos"))
+                .and_then(|v| v.as_i64());
+
             debug!(
                 label,
                 status,
@@ -737,9 +753,48 @@ impl EventRouter {
                 "Test result"
             );
 
-            // OTel: create test result span
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_test_result(label, status, attempt, run, shard, cached, strategy);
+                mapper.on_test_result(
+                    label,
+                    status,
+                    attempt,
+                    run,
+                    shard,
+                    cached,
+                    strategy,
+                    start_time_nanos,
+                    duration_nanos,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_target_summary(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        let label = event
+            .id
+            .get("targetSummary")
+            .and_then(|ts| ts.get("label"))
+            .and_then(|v| v.as_str());
+
+        if let Some(label) = label {
+            let payload = event.get_payload("targetSummary");
+            let overall_build_success = payload
+                .and_then(|p| p.get("overallBuildSuccess"))
+                .and_then(|v| v.as_bool());
+            let overall_test_status = payload
+                .and_then(|p| p.get("overallTestStatus"))
+                .and_then(|v| v.as_str());
+
+            debug!(
+                label,
+                overall_build_success,
+                overall_test_status,
+                "Target summary"
+            );
+
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_target_summary(label, overall_build_success, overall_test_status);
             }
         }
         Ok(())

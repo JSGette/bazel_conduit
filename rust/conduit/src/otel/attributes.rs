@@ -55,6 +55,28 @@ pub const BAZEL_TEST_TOTAL_RUN_COUNT: &str = "bazel.test.total_run_count";
 // Build metrics
 pub const BAZEL_METRICS_ACTIONS_CREATED: &str = "bazel.metrics.actions_created";
 pub const BAZEL_METRICS_ACTIONS_EXECUTED: &str = "bazel.metrics.actions_executed";
+pub const BAZEL_METRICS_WALL_TIME_MS: &str = "bazel.metrics.wall_time_ms";
+pub const BAZEL_METRICS_CPU_TIME_MS: &str = "bazel.metrics.cpu_time_ms";
+pub const BAZEL_METRICS_ANALYSIS_PHASE_MS: &str = "bazel.metrics.analysis_phase_ms";
+pub const BAZEL_METRICS_EXECUTION_PHASE_MS: &str = "bazel.metrics.execution_phase_ms";
+pub const BAZEL_METRICS_CRITICAL_PATH_MS: &str = "bazel.metrics.critical_path_ms";
+pub const BAZEL_METRICS_HEAP_POST_BUILD: &str = "bazel.metrics.heap_post_build";
+pub const BAZEL_METRICS_PEAK_HEAP_POST_GC: &str = "bazel.metrics.peak_heap_post_gc";
+pub const BAZEL_METRICS_TARGETS_CONFIGURED: &str = "bazel.metrics.targets_configured";
+pub const BAZEL_METRICS_PACKAGES_LOADED: &str = "bazel.metrics.packages_loaded";
+pub const BAZEL_METRICS_CACHE_HITS: &str = "bazel.metrics.cache_hits";
+pub const BAZEL_METRICS_CACHE_MISSES: &str = "bazel.metrics.cache_misses";
+pub const BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT: &str = "bazel.metrics.source_artifacts_count";
+pub const BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT: &str = "bazel.metrics.output_artifacts_count";
+pub const BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT: &str =
+    "bazel.metrics.action_cache_artifacts_count";
+pub const BAZEL_METRICS_BYTES_SENT: &str = "bazel.metrics.bytes_sent";
+pub const BAZEL_METRICS_BYTES_RECV: &str = "bazel.metrics.bytes_recv";
+pub const BAZEL_METRICS_ACTION_DATA: &str = "bazel.metrics.action_data";
+
+// Target summary (span event)
+pub const BAZEL_TARGET_OVERALL_BUILD_SUCCESS: &str = "bazel.target.overall_build_success";
+pub const BAZEL_TARGET_OVERALL_TEST_STATUS: &str = "bazel.target.overall_test_status";
 
 // Named set (span event)
 pub const BAZEL_NAMED_SET_ID: &str = "bazel.named_set.id";

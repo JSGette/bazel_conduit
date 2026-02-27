@@ -268,6 +268,133 @@ fn decode_any_to_bep_json(any: &Any) -> Result<BepJsonEvent, Box<dyn std::error:
     Ok(event)
 }
 
+/// Duration to milliseconds (for JSON). Accepts proto Duration (seconds + nanos).
+fn duration_to_ms(seconds: i64, nanos: i32) -> i64 {
+    seconds * 1000 + i64::from(nanos) / 1_000_000
+}
+
+/// Timestamp to nanos since epoch (seconds + nanos).
+fn timestamp_to_nanos(seconds: i64, nanos: i32) -> i64 {
+    seconds * 1_000_000_000 + i64::from(nanos)
+}
+
+/// Serialize BuildMetrics proto to JSON (full extraction for OTEL).
+fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_json::Value {
+    use serde_json::json;
+
+    let action_summary = m.action_summary.as_ref().map(|a| {
+        let action_data: Vec<serde_json::Value> = a
+            .action_data
+            .iter()
+            .map(|ad| {
+                json!({
+                    "mnemonic": ad.mnemonic,
+                    "actionsExecuted": ad.actions_executed,
+                    "firstStartedMs": ad.first_started_ms,
+                    "lastEndedMs": ad.last_ended_ms,
+                    "systemTimeNanos": ad.system_time.as_ref().map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos)),
+                    "userTimeNanos": ad.user_time.as_ref().map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos)),
+                    "actionsCreated": ad.actions_created,
+                })
+            })
+            .collect();
+        let runner_count: Vec<serde_json::Value> = a
+            .runner_count
+            .iter()
+            .map(|r| json!({"name": r.name, "count": r.count, "execKind": r.exec_kind}))
+            .collect();
+        let action_cache = a.action_cache_statistics.as_ref().map(|acs| {
+            let miss_details: Vec<serde_json::Value> = acs
+                .miss_details
+                .iter()
+                .map(|md| json!({"reason": md.reason, "count": md.count}))
+                .collect();
+            json!({
+                "hits": acs.hits,
+                "misses": acs.misses,
+                "saveTimeInMs": acs.save_time_in_ms,
+                "loadTimeInMs": acs.load_time_in_ms,
+                "missDetails": miss_details,
+            })
+        });
+        json!({
+            "actionsCreated": a.actions_created,
+            "actionsExecuted": a.actions_executed,
+            "actionData": action_data,
+            "runnerCount": runner_count,
+            "actionCacheStatistics": action_cache,
+        })
+    });
+
+    let timing = m.timing_metrics.as_ref().map(|t| {
+        json!({
+            "wallTimeInMs": t.wall_time_in_ms,
+            "cpuTimeInMs": t.cpu_time_in_ms,
+            "analysisPhaseTimeInMs": t.analysis_phase_time_in_ms,
+            "executionPhaseTimeInMs": t.execution_phase_time_in_ms,
+            "actionsExecutionStartInMs": t.actions_execution_start_in_ms,
+            "criticalPathMs": t.critical_path_time.as_ref().map(|d| duration_to_ms(d.seconds, d.nanos)),
+        })
+    });
+
+    let memory = m.memory_metrics.as_ref().map(|mm| {
+        let garbage: Vec<serde_json::Value> = mm
+            .garbage_metrics
+            .iter()
+            .map(|g| json!({"type": g.r#type, "garbageCollected": g.garbage_collected}))
+            .collect();
+        json!({
+            "usedHeapSizePostBuild": mm.used_heap_size_post_build,
+            "peakPostGcHeapSize": mm.peak_post_gc_heap_size,
+            "garbageMetrics": garbage,
+        })
+    });
+
+    let target = m.target_metrics.as_ref().map(|tm| {
+        json!({
+            "targetsConfigured": tm.targets_configured,
+        })
+    });
+
+    let packages = m.package_metrics.as_ref().map(|pm| {
+        json!({
+            "packagesLoaded": pm.packages_loaded,
+        })
+    });
+
+    let artifacts = m.artifact_metrics.as_ref().map(|am| {
+        let src = am.source_artifacts_read.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
+        let out = am.output_artifacts_seen.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
+        let cache = am.output_artifacts_from_action_cache.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
+        json!({
+            "sourceArtifactsRead": src,
+            "outputArtifactsSeen": out,
+            "outputArtifactsFromActionCache": cache,
+        })
+    });
+
+    let network = m.network_metrics.as_ref().and_then(|nm| {
+        nm.system_network_stats.as_ref().map(|sns| {
+            json!({
+                "bytesSent": sns.bytes_sent,
+                "bytesRecv": sns.bytes_recv,
+                "packetsSent": sns.packets_sent,
+                "packetsRecv": sns.packets_recv,
+            })
+        })
+    });
+
+    serde_json::json!({
+        "actionSummary": action_summary,
+        "timingMetrics": timing,
+        "memoryMetrics": memory,
+        "targetMetrics": target,
+        "packageMetrics": packages,
+        "artifactMetrics": artifacts,
+        "networkMetrics": network,
+    })
+}
+
 /// Convert a BuildEventId to JSON
 fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde_json::Value {
     use crate::build_event_stream::build_event_id::Id;
@@ -319,6 +446,9 @@ fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde
         }
         Id::BuildFinished(_) => serde_json::json!({"buildFinished": {}}),
         Id::BuildMetrics(_) => serde_json::json!({"buildMetrics": {}}),
+        Id::TargetSummary(t) => {
+            serde_json::json!({"targetSummary": {"label": t.label}})
+        }
         Id::Progress(p) => {
             serde_json::json!({"progress": {"opaqueCount": p.opaque_count}})
         }
@@ -347,12 +477,15 @@ fn add_payload_to_json(
 
     match payload {
         Payload::Started(s) => {
+            let start_time_nanos = s.start_time.as_ref()
+                .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
             map.insert(
                 "started".to_string(),
                 serde_json::json!({
                     "uuid": s.uuid,
                     "command": s.command,
                     "startTimeMillis": s.start_time_millis,
+                    "startTimeNanos": start_time_nanos,
                 }),
             );
         }
@@ -495,11 +628,14 @@ fn add_payload_to_json(
                 .exit_code
                 .as_ref()
                 .map(|ec| serde_json::json!({"code": ec.code}));
+            let finish_time_nanos = f.finish_time.as_ref()
+                .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
             map.insert(
                 "finished".to_string(),
                 serde_json::json!({
                     "exitCode": exit_code,
                     "finishTimeMillis": f.finish_time_millis,
+                    "finishTimeNanos": finish_time_nanos,
                 }),
             );
         }
@@ -513,15 +649,8 @@ fn add_payload_to_json(
             );
         }
         Payload::BuildMetrics(m) => {
-            map.insert(
-                "buildMetrics".to_string(),
-                serde_json::json!(m.action_summary.as_ref().map(|a| {
-                    serde_json::json!({
-                        "actionsCreated": a.actions_created,
-                        "actionsExecuted": a.actions_executed,
-                    })
-                })),
-            );
+            let build_metrics_json = build_metrics_to_json(m);
+            map.insert("buildMetrics".to_string(), build_metrics_json);
         }
         Payload::Fetch(f) => {
             map.insert(
@@ -532,11 +661,20 @@ fn add_payload_to_json(
             );
         }
         Payload::TestResult(tr) => {
+            let test_attempt_start_nanos = tr
+                .test_attempt_start
+                .as_ref()
+                .map(|ts| timestamp_to_nanos(ts.seconds, ts.nanos));
+            let test_attempt_duration_nanos = tr.test_attempt_duration.as_ref().map(|d| {
+                d.seconds * 1_000_000_000 + i64::from(d.nanos)
+            });
             map.insert(
                 "testResult".to_string(),
                 serde_json::json!({
                     "status": test_status_to_str(tr.status),
                     "cachedLocally": tr.cached_locally,
+                    "testAttemptStartNanos": test_attempt_start_nanos,
+                    "testAttemptDurationNanos": test_attempt_duration_nanos,
                     "executionInfo": tr.execution_info.as_ref().map(|ei| {
                         serde_json::json!({
                             "strategy": ei.strategy,
@@ -553,6 +691,15 @@ fn add_payload_to_json(
                 serde_json::json!({
                     "overallStatus": test_status_to_str(ts.overall_status),
                     "totalRunCount": ts.total_run_count,
+                }),
+            );
+        }
+        Payload::TargetSummary(ts) => {
+            map.insert(
+                "targetSummary".to_string(),
+                serde_json::json!({
+                    "overallBuildSuccess": ts.overall_build_success,
+                    "overallTestStatus": test_status_to_str(ts.overall_test_status),
                 }),
             );
         }
