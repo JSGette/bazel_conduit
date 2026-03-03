@@ -255,7 +255,6 @@ impl OtelMapper {
         if let Some(nanos) = sanitized_start {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
         }
-
         let span = self.tracer.build_with_context(builder, &parent_cx);
         let cx = Context::new().with_span(span);
 
@@ -885,7 +884,6 @@ impl OtelMapper {
     /// `ActionExecuted.start_time` / `end_time` proto fields) they are used
     /// for accurate span timing.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn on_action_completed(
         &mut self,
         label: Option<&str>,
@@ -899,20 +897,11 @@ impl OtelMapper {
         stderr_path: Option<&str>,
         start_time_nanos: Option<i64>,
         end_time_nanos: Option<i64>,
-        runner: Option<&str>,
-        cache_hit: Option<bool>,
-        remotable: Option<bool>,
-        remote_cacheable: Option<bool>,
-        inputs: &[String],
-        listed_outputs: &[String],
-        actual_outputs: &[String],
     ) {
-        // Lazily create the target span if it hasn't been created yet.
         if let Some(l) = label {
             self.ensure_target_span(l);
         }
 
-        // Parent: target span → pending completion → root.
         let parent = label
             .and_then(|l| {
                 self.target_contexts
@@ -970,35 +959,6 @@ impl OtelMapper {
         if let Some(p) = stderr_path {
             attrs.push(KeyValue::new(BAZEL_ACTION_STDERR, p.to_string()));
         }
-        if let Some(r) = runner {
-            attrs.push(KeyValue::new(BAZEL_ACTION_RUNNER, r.to_string()));
-        }
-        if let Some(hit) = cache_hit {
-            attrs.push(KeyValue::new(BAZEL_ACTION_CACHE_HIT, hit));
-        }
-        if let Some(r) = remotable {
-            attrs.push(KeyValue::new(BAZEL_ACTION_REMOTABLE, r));
-        }
-        if let Some(rc) = remote_cacheable {
-            attrs.push(KeyValue::new(BAZEL_ACTION_REMOTE_CACHEABLE, rc));
-        }
-        if !inputs.is_empty() {
-            attrs.push(KeyValue::new(BAZEL_ACTION_INPUT_COUNT, inputs.len() as i64));
-            attrs.push(KeyValue::new(BAZEL_ACTION_INPUTS, inputs.join("\n")));
-        }
-        if !actual_outputs.is_empty() {
-            attrs.push(KeyValue::new(
-                BAZEL_ACTION_OUTPUT_COUNT,
-                actual_outputs.len() as i64,
-            ));
-            attrs.push(KeyValue::new(BAZEL_ACTION_OUTPUTS, actual_outputs.join("\n")));
-        }
-        if !listed_outputs.is_empty() {
-            attrs.push(KeyValue::new(
-                BAZEL_ACTION_LISTED_OUTPUTS,
-                listed_outputs.join("\n"),
-            ));
-        }
 
         let mut builder = self
             .tracer
@@ -1006,7 +966,6 @@ impl OtelMapper {
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
 
-        // Use action-level start_time if available (full mode).
         if let Some(nanos) = start_time_nanos {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
         }
@@ -1021,7 +980,6 @@ impl OtelMapper {
             });
         }
 
-        // Use action-level end_time if available (full mode).
         if let Some(nanos) = end_time_nanos {
             span.end_with_timestamp(nanos_to_system_time(nanos));
         } else {
@@ -1343,10 +1301,10 @@ impl OtelMapper {
                 cx.span()
                     .set_attribute(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTED, executed));
             }
-            if let Some(action_data) = s.get("actionData") {
-                if let Ok(s) = serde_json::to_string(action_data) {
-                    cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_ACTION_DATA, s));
-                }
+            if let Some(action_data) = s.get("actionData").and_then(|v| v.as_array()) {
+                let summary = summarize_action_data(action_data);
+                cx.span()
+                    .set_attribute(KeyValue::new(BAZEL_METRICS_ACTION_DATA, summary));
             }
             if let Some(acs) = s.get("actionCacheStatistics").and_then(|v| v.as_object()) {
                 if let Some(hits) = acs.get("hits").and_then(|v| v.as_i64()) {
@@ -1600,4 +1558,27 @@ impl OtelMapper {
 
 fn nanos_to_system_time(nanos: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(nanos as u64)
+}
+
+/// Compact summary of actionData: "Mnemonic(count), ..." sorted by count desc.
+fn summarize_action_data(entries: &[serde_json::Value]) -> String {
+    let mut by_mnemonic: HashMap<&str, i64> = HashMap::new();
+    for entry in entries {
+        let mnemonic = entry
+            .get("mnemonic")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let count = entry
+            .get("actionsExecuted")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        *by_mnemonic.entry(mnemonic).or_default() += count;
+    }
+    let mut sorted: Vec<_> = by_mnemonic.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted
+        .iter()
+        .map(|(m, c)| format!("{m}({c})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

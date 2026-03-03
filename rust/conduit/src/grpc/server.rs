@@ -726,9 +726,6 @@ fn add_payload_to_json(
 
             let failure_msg = a.failure_detail.as_ref().map(|fd| &fd.message);
 
-            // Decode SpawnExec from strategy_details to get cache/runner/IO info.
-            let spawn_info = decode_strategy_details(&a.strategy_details);
-
             map.insert(
                 "action".to_string(),
                 serde_json::json!({
@@ -742,16 +739,6 @@ fn add_payload_to_json(
                     "startTimeNanos": start_time_nanos,
                     "endTimeNanos": end_time_nanos,
                     "failureDetail": failure_msg,
-                    "runner": spawn_info.runner,
-                    "cacheHit": spawn_info.cache_hit,
-                    "cacheable": spawn_info.cacheable,
-                    "remotable": spawn_info.remotable,
-                    "remoteCacheable": spawn_info.remote_cacheable,
-                    "inputs": spawn_info.inputs,
-                    "listedOutputs": spawn_info.listed_outputs,
-                    "actualOutputs": spawn_info.actual_outputs,
-                    "inputBytes": spawn_info.input_bytes,
-                    "inputFiles": spawn_info.input_files,
                 }),
             );
         }
@@ -976,70 +963,6 @@ fn add_payload_to_json(
             );
         }
     }
-}
-
-/// Extracted SpawnExec data from strategy_details.
-#[derive(Default)]
-struct SpawnInfo {
-    runner: Option<String>,
-    cache_hit: Option<bool>,
-    cacheable: Option<bool>,
-    remotable: Option<bool>,
-    remote_cacheable: Option<bool>,
-    inputs: Vec<serde_json::Value>,
-    listed_outputs: Vec<String>,
-    actual_outputs: Vec<serde_json::Value>,
-    input_bytes: Option<i64>,
-    input_files: Option<i64>,
-}
-
-const SPAWN_EXEC_TYPE_URL: &str = "type.googleapis.com/tools.protos.SpawnExec";
-
-/// Try to decode the first SpawnExec from repeated google.protobuf.Any.
-/// The `Any` type here comes from the build_event_stream proto (not prost_types).
-fn decode_strategy_details(
-    details: &[build_event_stream_proto::any_proto::google::protobuf::Any],
-) -> SpawnInfo {
-    for any in details {
-        if any.type_url != SPAWN_EXEC_TYPE_URL {
-            continue;
-        }
-        match prost::Message::decode(any.value.as_ref()) {
-            Ok(spawn) => {
-                let spawn: crate::spawn_proto::SpawnExec = spawn;
-                let inputs: Vec<serde_json::Value> = spawn
-                    .inputs
-                    .iter()
-                    .map(|f| serde_json::json!({"path": f.path, "isTool": f.is_tool}))
-                    .collect();
-                let actual_outputs: Vec<serde_json::Value> = spawn
-                    .actual_outputs
-                    .iter()
-                    .map(|f| serde_json::json!({"path": f.path}))
-                    .collect();
-                let (input_bytes, input_files) = spawn.metrics.as_ref().map_or(
-                    (None, None),
-                    |m| (Some(m.input_bytes), Some(m.input_files)),
-                );
-                return SpawnInfo {
-                    runner: Some(spawn.runner.clone()),
-                    cache_hit: Some(spawn.cache_hit),
-                    cacheable: Some(spawn.cacheable),
-                    remotable: Some(spawn.remotable),
-                    remote_cacheable: Some(spawn.remote_cacheable),
-                    inputs,
-                    listed_outputs: spawn.listed_outputs.clone(),
-                    actual_outputs,
-                    input_bytes,
-                    input_files,
-                };
-            }
-            Err(e) => {
-                warn!(?e, "Failed to decode SpawnExec from strategy_details");
-            }
-        }
-    }
-    SpawnInfo::default()
 }
 
 /// Convert a BEP TestStatus enum (i32) to a human-readable string.

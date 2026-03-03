@@ -655,35 +655,6 @@ impl EventRouter {
                 .and_then(|a| a.get("endTimeNanos"))
                 .and_then(|v| v.as_i64());
 
-            // SpawnExec fields (runner, cache, I/O)
-            let runner = payload
-                .and_then(|a| a.get("runner"))
-                .and_then(|v| v.as_str());
-            let cache_hit = payload
-                .and_then(|a| a.get("cacheHit"))
-                .and_then(|v| v.as_bool());
-            let remotable = payload
-                .and_then(|a| a.get("remotable"))
-                .and_then(|v| v.as_bool());
-            let remote_cacheable = payload
-                .and_then(|a| a.get("remoteCacheable"))
-                .and_then(|v| v.as_bool());
-            let inputs = payload
-                .and_then(|a| a.get("inputs"))
-                .and_then(|v| v.as_array());
-            let actual_outputs = payload
-                .and_then(|a| a.get("actualOutputs"))
-                .and_then(|v| v.as_array());
-            let listed_outputs: Vec<String> = payload
-                .and_then(|a| a.get("listedOutputs"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
             // Check if we should process this action based on mode
             let should_process = self.state.action_mode().should_create_span(success);
             if !should_process {
@@ -712,23 +683,7 @@ impl EventRouter {
                 exit_code,
             );
 
-            // OTel: create action span
             if let Some(mapper) = &mut self.mapper {
-                let input_paths: Vec<String> = inputs
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let output_paths: Vec<String> = actual_outputs
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
                 mapper.on_action_completed(
                     label,
                     mnemonic,
@@ -741,13 +696,6 @@ impl EventRouter {
                     stderr_path,
                     start_time_nanos,
                     end_time_nanos,
-                    runner,
-                    cache_hit,
-                    remotable,
-                    remote_cacheable,
-                    &input_paths,
-                    &listed_outputs,
-                    &output_paths,
                 );
             }
         }

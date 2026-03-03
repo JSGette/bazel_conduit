@@ -14,7 +14,6 @@ rust_library(
     deps = [
         "//proto/build_event_stream:build_event_stream_rust_proto",
         "//proto/google/devtools/build/v1:publish_build_event_rust_proto",
-        "//proto/spawn:spawn_rust_proto",
         "@crates//:anyhow",
         "@crates//:clap",
         "@crates//:dashmap",

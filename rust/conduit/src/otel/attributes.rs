@@ -37,16 +37,6 @@ pub const BAZEL_ACTION_STDOUT: &str = "bazel.action.stdout";
 pub const BAZEL_ACTION_STDERR: &str = "bazel.action.stderr";
 pub const BAZEL_ACTION_LABEL: &str = "bazel.action.label";
 pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
-pub const BAZEL_ACTION_RUNNER: &str = "bazel.action.runner";
-pub const BAZEL_ACTION_CACHE_HIT: &str = "bazel.action.cache_hit";
-pub const BAZEL_ACTION_REMOTABLE: &str = "bazel.action.remotable";
-pub const BAZEL_ACTION_REMOTE_CACHEABLE: &str = "bazel.action.remote_cacheable";
-pub const BAZEL_ACTION_INPUT_COUNT: &str = "bazel.action.input_count";
-pub const BAZEL_ACTION_INPUTS: &str = "bazel.action.inputs";
-pub const BAZEL_ACTION_OUTPUT_COUNT: &str = "bazel.action.output_count";
-pub const BAZEL_ACTION_OUTPUTS: &str = "bazel.action.outputs";
-pub const BAZEL_ACTION_LISTED_OUTPUTS: &str = "bazel.action.listed_outputs";
-
 // BuildStarted extended
 pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
 pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";

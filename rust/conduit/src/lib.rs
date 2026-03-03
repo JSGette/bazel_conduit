@@ -11,11 +11,6 @@ pub mod state;
 // Re-export BEP proto types
 pub use build_event_stream_proto::build_event_stream;
 
-// Re-export SpawnExec proto types (for decoding ActionExecuted.strategy_details)
-pub mod spawn_proto {
-    pub use spawn_proto::tools::protos::*;
-}
-
 // Re-export gRPC service types (PublishBuildEvent service, request/response types)
 pub mod bes_proto {
     pub use publish_build_event_proto::google::devtools::build::v1::*;
