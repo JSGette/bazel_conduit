@@ -37,10 +37,28 @@ pub const BAZEL_ACTION_STDOUT: &str = "bazel.action.stdout";
 pub const BAZEL_ACTION_STDERR: &str = "bazel.action.stderr";
 pub const BAZEL_ACTION_LABEL: &str = "bazel.action.label";
 pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
+pub const BAZEL_ACTION_RUNNER: &str = "bazel.action.runner";
+pub const BAZEL_ACTION_CACHE_HIT: &str = "bazel.action.cache_hit";
+pub const BAZEL_ACTION_REMOTABLE: &str = "bazel.action.remotable";
+pub const BAZEL_ACTION_REMOTE_CACHEABLE: &str = "bazel.action.remote_cacheable";
+pub const BAZEL_ACTION_INPUT_COUNT: &str = "bazel.action.input_count";
+pub const BAZEL_ACTION_INPUTS: &str = "bazel.action.inputs";
+pub const BAZEL_ACTION_OUTPUT_COUNT: &str = "bazel.action.output_count";
+pub const BAZEL_ACTION_OUTPUTS: &str = "bazel.action.outputs";
+pub const BAZEL_ACTION_LISTED_OUTPUTS: &str = "bazel.action.listed_outputs";
+
+// BuildStarted extended
+pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
+pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";
+pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
+pub const BAZEL_SERVER_PID: &str = "bazel.server_pid";
+pub const BAZEL_HOST: &str = "bazel.host";
+pub const BAZEL_USER: &str = "bazel.user";
 
 // Fetch span
 pub const BAZEL_FETCH_URL: &str = "bazel.fetch.url";
 pub const BAZEL_FETCH_SUCCESS: &str = "bazel.fetch.success";
+pub const BAZEL_FETCH_DOWNLOADER: &str = "bazel.fetch.downloader";
 
 // Test span
 pub const BAZEL_TEST_STATUS: &str = "bazel.test.status";
@@ -73,6 +91,24 @@ pub const BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT: &str =
 pub const BAZEL_METRICS_BYTES_SENT: &str = "bazel.metrics.bytes_sent";
 pub const BAZEL_METRICS_BYTES_RECV: &str = "bazel.metrics.bytes_recv";
 pub const BAZEL_METRICS_ACTION_DATA: &str = "bazel.metrics.action_data";
+
+pub const BAZEL_METRICS_ACTIONS_EXECUTION_START_MS: &str =
+    "bazel.metrics.actions_execution_start_ms";
+pub const BAZEL_METRICS_RUNNER_COUNT: &str = "bazel.metrics.runner_count";
+pub const BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT: &str =
+    "bazel.metrics.top_level_artifacts_count";
+pub const BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES: &str = "bazel.metrics.cumulative_num_analyses";
+pub const BAZEL_METRICS_CUMULATIVE_NUM_BUILDS: &str = "bazel.metrics.cumulative_num_builds";
+
+// Test extended
+pub const BAZEL_TEST_STATUS_DETAILS: &str = "bazel.test.status_details";
+pub const BAZEL_TEST_HOSTNAME: &str = "bazel.test.hostname";
+pub const BAZEL_TEST_CACHED_REMOTELY: &str = "bazel.test.cached_remotely";
+pub const BAZEL_TEST_EXIT_CODE: &str = "bazel.test.exit_code";
+pub const BAZEL_TEST_RUN_COUNT: &str = "bazel.test.run_count";
+pub const BAZEL_TEST_ATTEMPT_COUNT: &str = "bazel.test.attempt_count";
+pub const BAZEL_TEST_SHARD_COUNT: &str = "bazel.test.shard_count";
+pub const BAZEL_TEST_TOTAL_NUM_CACHED: &str = "bazel.test.total_num_cached";
 
 // Target summary (span event)
 pub const BAZEL_TARGET_OVERALL_BUILD_SUCCESS: &str = "bazel.target.overall_build_success";

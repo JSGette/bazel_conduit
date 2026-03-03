@@ -1,0 +1,85 @@
+// Subset of Bazel's src/main/protobuf/spawn.proto
+// Contains SpawnExec and its dependencies needed to decode
+// ActionExecuted.strategy_details from the Build Event Protocol.
+
+syntax = "proto3";
+
+package tools.protos;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_package = "com.google.devtools.build.lib.exec";
+option java_outer_classname = "Protos";
+
+message Digest {
+  string hash = 1;
+  int64 size_bytes = 2;
+  string hash_function_name = 3;
+}
+
+message File {
+  string path = 1;
+  string symlink_target_path = 4;
+  Digest digest = 2;
+  bool is_tool = 3;
+}
+
+message EnvironmentVariable {
+  string name = 1;
+  string value = 2;
+}
+
+message Platform {
+  message Property {
+    string name = 1;
+    string value = 2;
+  }
+  repeated Property properties = 1;
+}
+
+message SpawnMetrics {
+  google.protobuf.Duration total_time = 1;
+  google.protobuf.Duration parse_time = 2;
+  google.protobuf.Duration network_time = 3;
+  google.protobuf.Duration fetch_time = 4;
+  google.protobuf.Duration queue_time = 5;
+  google.protobuf.Duration setup_time = 6;
+  google.protobuf.Duration upload_time = 7;
+  google.protobuf.Duration execution_wall_time = 8;
+  google.protobuf.Duration process_outputs_time = 9;
+  google.protobuf.Duration retry_time = 10;
+  int64 input_bytes = 11;
+  int64 input_files = 12;
+  int64 memory_estimate_bytes = 13;
+  int64 input_bytes_limit = 14;
+  int64 input_files_limit = 15;
+  int64 output_bytes_limit = 16;
+  int64 output_files_limit = 17;
+  int64 memory_bytes_limit = 18;
+  google.protobuf.Duration time_limit = 19;
+  google.protobuf.Timestamp start_time = 20;
+}
+
+message SpawnExec {
+  repeated string command_args = 1;
+  repeated EnvironmentVariable environment_variables = 2;
+  Platform platform = 3;
+  repeated File inputs = 4;
+  repeated string listed_outputs = 5;
+  bool remotable = 6;
+  bool cacheable = 7;
+  int64 timeout_millis = 8;
+  string mnemonic = 10;
+  repeated File actual_outputs = 11;
+  string runner = 12;
+  bool cache_hit = 13;
+  string status = 14;
+  int32 exit_code = 15;
+  bool remote_cacheable = 16;
+  string target_label = 18;
+  Digest digest = 19;
+  SpawnMetrics metrics = 20;
+
+  reserved 9, 17;
+}

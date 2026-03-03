@@ -1,0 +1,18 @@
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library")
+
+proto_library(
+    name = "spawn_proto",
+    srcs = ["spawn.proto"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@protobuf//:duration_proto",
+        "@protobuf//:timestamp_proto",
+    ],
+)
+
+rust_prost_library(
+    name = "spawn_rust_proto",
+    proto = ":spawn_proto",
+    visibility = ["//visibility:public"],
+)

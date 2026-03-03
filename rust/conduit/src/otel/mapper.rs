@@ -177,8 +177,8 @@ pub struct OtelMapper {
 
     /// Fetch events that arrived before the root span was created.
     /// Replayed once `on_build_started` fires.
-    /// Tuple: (url, success, wallclock arrival time).
-    pending_fetches: Vec<(String, bool, SystemTime)>,
+    /// Tuple: (url, success, wallclock arrival time, downloader).
+    pending_fetches: Vec<(String, bool, SystemTime, Option<String>)>,
 }
 
 impl OtelMapper {
@@ -230,8 +230,29 @@ impl OtelMapper {
                 KeyValue::new(BAZEL_COMMAND, command.to_string()),
             ]);
 
+        // Sanity-check: if the BEP start time is more than 5 minutes
+        // from wall clock, it's probably stale (long-lived Bazel daemon).
+        // Fall back to wall clock to avoid multi-day trace durations.
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        let five_min_nanos: i64 = 5 * 60 * 1_000_000_000;
+
         let effective_start = event_time_nanos.or(start_time_nanos);
-        if let Some(nanos) = effective_start {
+        let sanitized_start = match effective_start {
+            Some(nanos) if (now_nanos - nanos).abs() > five_min_nanos => {
+                warn!(
+                    bep_start_nanos = nanos,
+                    wall_clock_nanos = now_nanos,
+                    drift_seconds = (now_nanos - nanos) / 1_000_000_000,
+                    "BEP start time deviates from wall clock by >5 min; using wall clock"
+                );
+                Some(now_nanos)
+            }
+            other => other,
+        };
+        if let Some(nanos) = sanitized_start {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
         }
 
@@ -245,9 +266,40 @@ impl OtelMapper {
         if !self.pending_fetches.is_empty() {
             let buffered: Vec<_> = std::mem::take(&mut self.pending_fetches);
             info!("Replaying {} buffered fetch events", buffered.len());
-            for (url, success, arrival) in buffered {
-                self.emit_fetch_span(&url, success, arrival);
+            for (url, success, arrival, downloader) in buffered {
+                self.emit_fetch_span(&url, success, arrival, downloader.as_deref());
             }
+        }
+    }
+
+    /// Extended BuildStarted fields → set attributes on root span.
+    pub fn on_build_started_extended(
+        &mut self,
+        workspace_dir: Option<&str>,
+        working_dir: Option<&str>,
+        build_tool_version: Option<&str>,
+        server_pid: Option<i64>,
+        host: Option<&str>,
+        user: Option<&str>,
+    ) {
+        let Some(cx) = &self.root_context else { return };
+        if let Some(v) = workspace_dir {
+            cx.span().set_attribute(KeyValue::new(BAZEL_WORKSPACE_DIR, v.to_string()));
+        }
+        if let Some(v) = working_dir {
+            cx.span().set_attribute(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
+        }
+        if let Some(v) = build_tool_version {
+            cx.span().set_attribute(KeyValue::new(BAZEL_BUILD_TOOL_VERSION, v.to_string()));
+        }
+        if let Some(v) = server_pid {
+            cx.span().set_attribute(KeyValue::new(BAZEL_SERVER_PID, v));
+        }
+        if let Some(v) = host {
+            cx.span().set_attribute(KeyValue::new(BAZEL_HOST, v.to_string()));
+        }
+        if let Some(v) = user {
+            cx.span().set_attribute(KeyValue::new(BAZEL_USER, v.to_string()));
         }
     }
 
@@ -314,6 +366,79 @@ impl OtelMapper {
                     .set_attribute(KeyValue::new(BAZEL_PATTERNS, patterns.join(", ")));
             }
         }
+    }
+
+    /// PatternSkipped → add skipped patterns as span event on root.
+    pub fn on_pattern_skipped(&mut self, patterns: &[String]) {
+        if let Some(cx) = &self.root_context {
+            if !patterns.is_empty() {
+                cx.span().add_event(
+                    "pattern_skipped",
+                    vec![KeyValue::new(BAZEL_PATTERNS, patterns.join(", "))],
+                );
+            }
+        }
+    }
+
+    /// UnconfiguredLabel / ConfiguredLabel with Aborted payload →
+    /// record as a span under the "skipped" parent (root-cause failure).
+    pub fn on_aborted_label(
+        &mut self,
+        label: &str,
+        reason: Option<&str>,
+        description: Option<&str>,
+        event_time_nanos: Option<i64>,
+    ) {
+        // Lazily create the "skipped" parent span.
+        if self.skipped_context.is_none() {
+            if let Some(root) = &self.root_context {
+                let builder = self
+                    .tracer
+                    .span_builder("skipped targets")
+                    .with_kind(SpanKind::Internal);
+                let span = self.tracer.build_with_context(builder, root);
+                self.skipped_context = Some(Context::new().with_span(span));
+            }
+        }
+
+        let parent = match &self.skipped_context {
+            Some(cx) => cx,
+            None => return,
+        };
+
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_SUCCESS, false),
+        ];
+        if let Some(r) = reason {
+            attrs.push(KeyValue::new("bazel.target.abort_reason", r.to_string()));
+        }
+        if let Some(d) = description {
+            attrs.push(KeyValue::new(
+                "bazel.target.abort_description",
+                d.to_string(),
+            ));
+        }
+
+        let builder = self
+            .tracer
+            .span_builder(format!("target {label}"))
+            .with_kind(SpanKind::Internal)
+            .with_attributes(attrs);
+
+        let mut span = self.tracer.build_with_context(builder, parent);
+        span.set_status(Status::Error {
+            description: std::borrow::Cow::Owned(
+                description.unwrap_or("aborted").to_string(),
+            ),
+        });
+        if let Some(nanos) = event_time_nanos {
+            span.end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            span.end();
+        }
+
+        debug!("Created aborted-label span for {label}");
     }
 
     // =====================================================================
@@ -760,6 +885,7 @@ impl OtelMapper {
     /// `ActionExecuted.start_time` / `end_time` proto fields) they are used
     /// for accurate span timing.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_action_completed(
         &mut self,
         label: Option<&str>,
@@ -773,6 +899,13 @@ impl OtelMapper {
         stderr_path: Option<&str>,
         start_time_nanos: Option<i64>,
         end_time_nanos: Option<i64>,
+        runner: Option<&str>,
+        cache_hit: Option<bool>,
+        remotable: Option<bool>,
+        remote_cacheable: Option<bool>,
+        inputs: &[String],
+        listed_outputs: &[String],
+        actual_outputs: &[String],
     ) {
         // Lazily create the target span if it hasn't been created yet.
         if let Some(l) = label {
@@ -837,6 +970,35 @@ impl OtelMapper {
         if let Some(p) = stderr_path {
             attrs.push(KeyValue::new(BAZEL_ACTION_STDERR, p.to_string()));
         }
+        if let Some(r) = runner {
+            attrs.push(KeyValue::new(BAZEL_ACTION_RUNNER, r.to_string()));
+        }
+        if let Some(hit) = cache_hit {
+            attrs.push(KeyValue::new(BAZEL_ACTION_CACHE_HIT, hit));
+        }
+        if let Some(r) = remotable {
+            attrs.push(KeyValue::new(BAZEL_ACTION_REMOTABLE, r));
+        }
+        if let Some(rc) = remote_cacheable {
+            attrs.push(KeyValue::new(BAZEL_ACTION_REMOTE_CACHEABLE, rc));
+        }
+        if !inputs.is_empty() {
+            attrs.push(KeyValue::new(BAZEL_ACTION_INPUT_COUNT, inputs.len() as i64));
+            attrs.push(KeyValue::new(BAZEL_ACTION_INPUTS, inputs.join("\n")));
+        }
+        if !actual_outputs.is_empty() {
+            attrs.push(KeyValue::new(
+                BAZEL_ACTION_OUTPUT_COUNT,
+                actual_outputs.len() as i64,
+            ));
+            attrs.push(KeyValue::new(BAZEL_ACTION_OUTPUTS, actual_outputs.join("\n")));
+        }
+        if !listed_outputs.is_empty() {
+            attrs.push(KeyValue::new(
+                BAZEL_ACTION_LISTED_OUTPUTS,
+                listed_outputs.join("\n"),
+            ));
+        }
 
         let mut builder = self
             .tracer
@@ -881,14 +1043,14 @@ impl OtelMapper {
     /// In gRPC mode, fetch events may arrive *before* the BuildStarted event
     /// (during Bazel module resolution).  These are buffered and replayed once
     /// the root span exists.
-    pub fn on_fetch(&mut self, url: &str, success: bool) {
+    pub fn on_fetch(&mut self, url: &str, success: bool, downloader: Option<&str>) {
         let arrival = SystemTime::now();
         if self.root_context.is_none() {
             debug!("Buffering fetch event (root span not yet created): {url}");
-            self.pending_fetches.push((url.to_string(), success, arrival));
+            self.pending_fetches.push((url.to_string(), success, arrival, downloader.map(String::from)));
             return;
         }
-        self.emit_fetch_span(url, success, arrival);
+        self.emit_fetch_span(url, success, arrival, downloader);
     }
 
     /// Ensure the `fetches` parent span exists (lazily created).
@@ -914,7 +1076,7 @@ impl OtelMapper {
     /// `arrival` is the wallclock time the fetch event was received.
     /// BEP `Fetch` carries no timing data, so we use the arrival time as the
     /// span start and end it 1 ms later to give Jaeger a visible duration.
-    fn emit_fetch_span(&mut self, url: &str, success: bool, arrival: SystemTime) {
+    fn emit_fetch_span(&mut self, url: &str, success: bool, arrival: SystemTime, downloader: Option<&str>) {
         self.ensure_fetches_span();
 
         let parent = match &self.fetches_context {
@@ -922,10 +1084,13 @@ impl OtelMapper {
             None => return,
         };
 
-        let attrs = vec![
+        let mut attrs = vec![
             KeyValue::new(BAZEL_FETCH_URL, url.to_string()),
             KeyValue::new(BAZEL_FETCH_SUCCESS, success),
         ];
+        if let Some(dl) = downloader {
+            attrs.push(KeyValue::new(BAZEL_FETCH_DOWNLOADER, dl.to_string()));
+        }
 
         let builder = self
             .tracer
@@ -1044,11 +1209,16 @@ impl OtelMapper {
     }
 
     /// TestSummary → span event on root (target span is already ended).
+    #[allow(clippy::too_many_arguments)]
     pub fn on_test_summary(
         &mut self,
         label: &str,
         overall_status: Option<&str>,
         total_run_count: Option<i32>,
+        run_count: Option<i32>,
+        attempt_count: Option<i32>,
+        shard_count: Option<i32>,
+        total_num_cached: Option<i32>,
     ) {
         if let Some(cx) = &self.root_context {
             let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
@@ -1057,6 +1227,18 @@ impl OtelMapper {
             }
             if let Some(c) = total_run_count {
                 attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_RUN_COUNT, c as i64));
+            }
+            if let Some(v) = run_count {
+                attrs.push(KeyValue::new(BAZEL_TEST_RUN_COUNT, v as i64));
+            }
+            if let Some(v) = attempt_count {
+                attrs.push(KeyValue::new(BAZEL_TEST_ATTEMPT_COUNT, v as i64));
+            }
+            if let Some(v) = shard_count {
+                attrs.push(KeyValue::new(BAZEL_TEST_SHARD_COUNT, v as i64));
+            }
+            if let Some(v) = total_num_cached {
+                attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_NUM_CACHED, v as i64));
             }
             cx.span().add_event("test_summary", attrs);
             debug!("Added test summary event for {label}");
@@ -1246,6 +1428,39 @@ impl OtelMapper {
             if let Some(v) = nm.get("bytesRecv").and_then(|v| v.as_u64()) {
                 cx.span()
                     .set_attribute(KeyValue::new(BAZEL_METRICS_BYTES_RECV, v as i64));
+            }
+        }
+
+        if let Some(v) = summary
+            .and_then(|s| s.as_object())
+            .and_then(|s| s.get("runnerCount"))
+        {
+            if let Ok(s) = serde_json::to_string(v) {
+                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_RUNNER_COUNT, s));
+            }
+        }
+
+        if let Some(t) = obj.get("timingMetrics").and_then(|v| v.as_object()) {
+            if let Some(v) = t.get("actionsExecutionStartInMs").and_then(|v| v.as_i64()) {
+                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTION_START_MS, v));
+            }
+        }
+
+        if let Some(cm) = obj.get("cumulativeMetrics").and_then(|v| v.as_object()) {
+            if let Some(v) = cm.get("numAnalyses").and_then(|v| v.as_i64()) {
+                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES, v));
+            }
+            if let Some(v) = cm.get("numBuilds").and_then(|v| v.as_i64()) {
+                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_BUILDS, v));
+            }
+        }
+
+        if let Some(am) = obj.get("artifactMetrics").and_then(|v| v.as_object()) {
+            if let Some(f) = am.get("topLevelArtifacts").and_then(|v| v.as_object()) {
+                if let Some(v) = f.get("count").and_then(|v| v.as_i64()) {
+                    cx.span()
+                        .set_attribute(KeyValue::new(BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT, v));
+                }
             }
         }
     }

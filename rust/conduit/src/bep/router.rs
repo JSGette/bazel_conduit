@@ -94,6 +94,19 @@ impl EventRouter {
             // Metadata
             "buildMetadata" => self.handle_build_metadata(event),
 
+            // Skipped patterns
+            "patternSkipped" => self.handle_pattern_skipped(event),
+
+            // Root-cause failure events (payload is always Aborted)
+            "unconfiguredLabel" => self.handle_aborted_label(event, "unconfiguredLabel"),
+            "configuredLabel" => self.handle_aborted_label(event, "configuredLabel"),
+
+            // Live test progress (test URI while running)
+            "testProgress" => Ok(()),
+
+            // ExecRequest for `bazel run`
+            "execRequest" => Ok(()),
+
             // Ignored events (no OTel value)
             "structuredCommandLine" => Ok(()), // Redundant with optionsParsed
             "convenienceSymlinksIdentified" => Ok(()), // Local filesystem detail
@@ -119,15 +132,20 @@ impl EventRouter {
             let uuid = started.get("uuid").and_then(|v| v.as_str());
             let command = started.get("command").and_then(|v| v.as_str());
             let start_time_millis = started.get("startTimeMillis").and_then(|v| v.as_i64());
+            // Prefer the proto Timestamp field; do NOT fall back to the
+            // deprecated start_time_millis — it can hold a stale Bazel-server
+            // start time on long-lived daemons, producing wildly wrong spans.
             let start_time_nanos = started
                 .get("startTimeNanos")
-                .and_then(|v| v.as_i64())
-                .or_else(|| start_time_millis.map(|ms| ms * 1_000_000));
+                .and_then(|v| v.as_i64());
             let event_time_nanos = event.event_time_nanos;
 
             info!(
                 uuid = uuid,
                 command = command,
+                start_time_nanos,
+                event_time_nanos,
+                start_time_millis,
                 "Build started"
             );
 
@@ -141,12 +159,28 @@ impl EventRouter {
                 self.state.set_start_time_millis(millis);
             }
 
+            // Extended fields from BuildStarted
+            let workspace_dir = started.get("workspaceDirectory").and_then(|v| v.as_str());
+            let working_dir = started.get("workingDirectory").and_then(|v| v.as_str());
+            let build_tool_version = started.get("buildToolVersion").and_then(|v| v.as_str());
+            let server_pid = started.get("serverPid").and_then(|v| v.as_i64());
+            let host = started.get("host").and_then(|v| v.as_str());
+            let user = started.get("user").and_then(|v| v.as_str());
+
             if let Some(mapper) = &mut self.mapper {
                 mapper.on_build_started(
                     uuid.unwrap_or("unknown"),
                     command.unwrap_or("unknown"),
                     start_time_nanos,
                     event_time_nanos,
+                );
+                mapper.on_build_started_extended(
+                    workspace_dir,
+                    working_dir,
+                    build_tool_version,
+                    server_pid,
+                    host,
+                    user,
                 );
             }
         }
@@ -621,6 +655,35 @@ impl EventRouter {
                 .and_then(|a| a.get("endTimeNanos"))
                 .and_then(|v| v.as_i64());
 
+            // SpawnExec fields (runner, cache, I/O)
+            let runner = payload
+                .and_then(|a| a.get("runner"))
+                .and_then(|v| v.as_str());
+            let cache_hit = payload
+                .and_then(|a| a.get("cacheHit"))
+                .and_then(|v| v.as_bool());
+            let remotable = payload
+                .and_then(|a| a.get("remotable"))
+                .and_then(|v| v.as_bool());
+            let remote_cacheable = payload
+                .and_then(|a| a.get("remoteCacheable"))
+                .and_then(|v| v.as_bool());
+            let inputs = payload
+                .and_then(|a| a.get("inputs"))
+                .and_then(|v| v.as_array());
+            let actual_outputs = payload
+                .and_then(|a| a.get("actualOutputs"))
+                .and_then(|v| v.as_array());
+            let listed_outputs: Vec<String> = payload
+                .and_then(|a| a.get("listedOutputs"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Check if we should process this action based on mode
             let should_process = self.state.action_mode().should_create_span(success);
             if !should_process {
@@ -651,6 +714,21 @@ impl EventRouter {
 
             // OTel: create action span
             if let Some(mapper) = &mut self.mapper {
+                let input_paths: Vec<String> = inputs
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let output_paths: Vec<String> = actual_outputs
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 mapper.on_action_completed(
                     label,
                     mnemonic,
@@ -663,6 +741,13 @@ impl EventRouter {
                     stderr_path,
                     start_time_nanos,
                     end_time_nanos,
+                    runner,
+                    cache_hit,
+                    remotable,
+                    remote_cacheable,
+                    &input_paths,
+                    &listed_outputs,
+                    &output_paths,
                 );
             }
         }
@@ -670,10 +755,12 @@ impl EventRouter {
     }
 
     fn handle_fetch(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let url = event
-            .id
-            .get("fetch")
+        let fetch_id = event.id.get("fetch");
+        let url = fetch_id
             .and_then(|f| f.get("url"))
+            .and_then(|v| v.as_str());
+        let downloader = fetch_id
+            .and_then(|f| f.get("downloader"))
             .and_then(|v| v.as_str());
 
         if let Some(url) = url {
@@ -683,11 +770,10 @@ impl EventRouter {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            debug!(url, success, "Fetch event");
+            debug!(url, success, downloader, "Fetch event");
 
-            // OTel: create fetch span
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_fetch(url, success);
+                mapper.on_fetch(url, success, downloader);
             }
         }
         Ok(())
@@ -817,6 +903,22 @@ impl EventRouter {
                 .and_then(|p| p.get("totalRunCount"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
+            let run_count = payload
+                .and_then(|p| p.get("runCount"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let attempt_count = payload
+                .and_then(|p| p.get("attemptCount"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let shard_count = payload
+                .and_then(|p| p.get("shardCount"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let total_num_cached = payload
+                .and_then(|p| p.get("totalNumCached"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
 
             debug!(
                 label,
@@ -825,9 +927,16 @@ impl EventRouter {
                 "Test summary"
             );
 
-            // OTel: add test summary as span event on root (target span is already ended)
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_test_summary(label, overall_status, total_run_count);
+                mapper.on_test_summary(
+                    label,
+                    overall_status,
+                    total_run_count,
+                    run_count,
+                    attempt_count,
+                    shard_count,
+                    total_num_cached,
+                );
             }
         }
         Ok(())
@@ -860,6 +969,63 @@ impl EventRouter {
     // =========================================================================
     // Metadata
     // =========================================================================
+
+    fn handle_pattern_skipped(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        let patterns: Vec<String> = event
+            .id
+            .get("patternSkipped")
+            .and_then(|p| p.get("pattern"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        debug!(patterns = ?patterns, "Pattern skipped");
+
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_pattern_skipped(&patterns);
+        }
+        Ok(())
+    }
+
+    /// Handle unconfiguredLabel / configuredLabel events whose payload is Aborted.
+    fn handle_aborted_label(
+        &mut self,
+        event: &BepJsonEvent,
+        id_key: &str,
+    ) -> Result<(), RouterError> {
+        let label = event
+            .id
+            .get(id_key)
+            .and_then(|o| o.get("label"))
+            .and_then(|v| v.as_str());
+
+        let aborted = event.payload.get("aborted");
+        let reason = aborted
+            .and_then(|a| a.get("reason"))
+            .and_then(|v| v.as_str());
+        let description = aborted
+            .and_then(|a| a.get("description"))
+            .and_then(|v| v.as_str());
+
+        debug!(
+            label,
+            reason,
+            description,
+            id_key,
+            "Aborted label"
+        );
+
+        if let Some(mapper) = &mut self.mapper {
+            if let Some(label) = label {
+                mapper.on_aborted_label(label, reason, description, event.event_time_nanos);
+            }
+        }
+        Ok(())
+    }
 
     fn handle_build_metadata(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         if let Some(payload) = event.get_payload("buildMetadata") {

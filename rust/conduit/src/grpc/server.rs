@@ -353,6 +353,8 @@ fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_j
     let target = m.target_metrics.as_ref().map(|tm| {
         json!({
             "targetsConfigured": tm.targets_configured,
+            "targetsConfiguredNotIncludingAspects": tm.targets_configured_not_including_aspects,
+            "targetsLoaded": tm.targets_loaded,
         })
     });
 
@@ -366,10 +368,12 @@ fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_j
         let src = am.source_artifacts_read.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
         let out = am.output_artifacts_seen.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
         let cache = am.output_artifacts_from_action_cache.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
+        let top = am.top_level_artifacts.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
         json!({
             "sourceArtifactsRead": src,
             "outputArtifactsSeen": out,
             "outputArtifactsFromActionCache": cache,
+            "topLevelArtifacts": top,
         })
     });
 
@@ -384,6 +388,70 @@ fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_j
         })
     });
 
+    let cumulative = m.cumulative_metrics.as_ref().map(|cm| {
+        json!({
+            "numAnalyses": cm.num_analyses,
+            "numBuilds": cm.num_builds,
+        })
+    });
+
+    let dynamic_exec = m.dynamic_execution_metrics.as_ref().map(|de| {
+        let race_stats: Vec<serde_json::Value> = de
+            .race_statistics
+            .iter()
+            .map(|rs| {
+                json!({
+                    "mnemonic": rs.mnemonic,
+                    "localWins": rs.local_wins,
+                    "remoteWins": rs.remote_wins,
+                })
+            })
+            .collect();
+        json!({ "raceStatistics": race_stats })
+    });
+
+    let workers: Vec<serde_json::Value> = m
+        .worker_metrics
+        .iter()
+        .map(|wm| {
+            let worker_ids: Vec<i64> = wm.worker_ids.iter().map(|&id| id as i64).collect();
+            json!({
+                "workerIds": worker_ids,
+                "mnemonic": wm.mnemonic,
+                "isMultiplex": wm.is_multiplex,
+                "isSandbox": wm.is_sandbox,
+                "isMeasurable": wm.is_measurable,
+            })
+        })
+        .collect();
+
+    let worker_pools: Vec<serde_json::Value> = m
+        .worker_pool_metrics
+        .iter()
+        .flat_map(|wpm| {
+            wpm.worker_pool_stats.iter().map(|wps| {
+                json!({
+                    "hash": wps.hash,
+                    "mnemonic": wps.mnemonic,
+                    "createdCount": wps.created_count,
+                    "aliveCount": wps.alive_count,
+                })
+            })
+        })
+        .collect();
+
+    let build_graph = m.build_graph_metrics.as_ref().map(|bg| {
+        json!({
+            "actionLookupValueCount": bg.action_lookup_value_count,
+            "actionCount": bg.action_count,
+            "inputFileConfiguredTargetCount": bg.input_file_configured_target_count,
+            "outputFileConfiguredTargetCount": bg.output_file_configured_target_count,
+            "otherConfiguredTargetCount": bg.other_configured_target_count,
+            "outputArtifactCount": bg.output_artifact_count,
+            "postInvocationSkyframeNodeCount": bg.post_invocation_skyframe_node_count,
+        })
+    });
+
     serde_json::json!({
         "actionSummary": action_summary,
         "timingMetrics": timing,
@@ -392,6 +460,11 @@ fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_j
         "packageMetrics": packages,
         "artifactMetrics": artifacts,
         "networkMetrics": network,
+        "cumulativeMetrics": cumulative,
+        "dynamicExecutionMetrics": dynamic_exec,
+        "workerMetrics": workers,
+        "workerPoolMetrics": worker_pools,
+        "buildGraphMetrics": build_graph,
     })
 }
 
@@ -419,41 +492,66 @@ fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde
             serde_json::json!({"patternSkipped": {"pattern": p.pattern}})
         }
         Id::TargetConfigured(t) => {
-            serde_json::json!({"targetConfigured": {"label": t.label}})
+            let mut obj = serde_json::json!({"label": t.label});
+            if !t.aspect.is_empty() {
+                obj["aspect"] = serde_json::json!(t.aspect);
+            }
+            serde_json::json!({"targetConfigured": obj})
         }
         Id::TargetCompleted(t) => {
-            serde_json::json!({"targetCompleted": {"label": t.label}})
+            let mut obj = serde_json::json!({"label": t.label});
+            if let Some(cfg) = &t.configuration {
+                obj["configuration"] = serde_json::json!({"id": cfg.id});
+            }
+            if !t.aspect.is_empty() {
+                obj["aspect"] = serde_json::json!(t.aspect);
+            }
+            serde_json::json!({"targetCompleted": obj})
         }
         Id::ActionCompleted(a) => {
-            serde_json::json!({"actionCompleted": {
+            let mut obj = serde_json::json!({
                 "label": a.label,
                 "primaryOutput": a.primary_output,
-            }})
+            });
+            if let Some(cfg) = &a.configuration {
+                obj["configuration"] = serde_json::json!({"id": cfg.id});
+            }
+            serde_json::json!({"actionCompleted": obj})
         }
         Id::NamedSet(n) => {
             serde_json::json!({"namedSet": {"id": n.id}})
         }
         Id::TestResult(t) => {
+            let cfg = t.configuration.as_ref().map(|c| &c.id);
             serde_json::json!({"testResult": {
                 "label": t.label,
                 "run": t.run,
                 "shard": t.shard,
                 "attempt": t.attempt,
+                "configuration": {"id": cfg},
             }})
         }
         Id::TestSummary(t) => {
-            serde_json::json!({"testSummary": {"label": t.label}})
+            let cfg = t.configuration.as_ref().map(|c| &c.id);
+            serde_json::json!({"testSummary": {"label": t.label, "configuration": {"id": cfg}}})
         }
         Id::BuildFinished(_) => serde_json::json!({"buildFinished": {}}),
         Id::BuildMetrics(_) => serde_json::json!({"buildMetrics": {}}),
         Id::TargetSummary(t) => {
-            serde_json::json!({"targetSummary": {"label": t.label}})
+            let cfg = t.configuration.as_ref().map(|c| &c.id);
+            serde_json::json!({"targetSummary": {"label": t.label, "configuration": {"id": cfg}}})
         }
         Id::Progress(p) => {
             serde_json::json!({"progress": {"opaqueCount": p.opaque_count}})
         }
         Id::Fetch(f) => {
-            serde_json::json!({"fetch": {"url": f.url}})
+            use crate::build_event_stream::build_event_id::fetch_id::Downloader;
+            let dl = match f.downloader() {
+                Downloader::Http => "HTTP",
+                Downloader::Grpc => "GRPC",
+                Downloader::Unknown => "UNKNOWN",
+            };
+            serde_json::json!({"fetch": {"url": f.url, "downloader": dl}})
         }
         Id::Workspace(_) => serde_json::json!({"workspaceInfo": {}}),
         Id::BuildToolLogs(_) => serde_json::json!({"buildToolLogs": {}}),
@@ -461,6 +559,25 @@ fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde
         Id::ConvenienceSymlinksIdentified(_) => {
             serde_json::json!({"convenienceSymlinksIdentified": {}})
         }
+        Id::UnconfiguredLabel(t) => {
+            serde_json::json!({"unconfiguredLabel": {"label": t.label}})
+        }
+        Id::ConfiguredLabel(t) => {
+            let cfg = t.configuration.as_ref().map(|c| &c.id);
+            serde_json::json!({"configuredLabel": {"label": t.label, "configuration": {"id": cfg}}})
+        }
+        Id::TestProgress(t) => {
+            let cfg = t.configuration.as_ref().map(|c| &c.id);
+            serde_json::json!({"testProgress": {
+                "label": t.label,
+                "configuration": {"id": cfg},
+                "run": t.run,
+                "shard": t.shard,
+                "attempt": t.attempt,
+                "opaqueCount": t.opaque_count,
+            }})
+        }
+        Id::ExecRequest(_) => serde_json::json!({"execRequest": {}}),
         _ => serde_json::json!({}),
     }
 }
@@ -486,6 +603,13 @@ fn add_payload_to_json(
                     "command": s.command,
                     "startTimeMillis": s.start_time_millis,
                     "startTimeNanos": start_time_nanos,
+                    "workspaceDirectory": s.workspace_directory,
+                    "workingDirectory": s.working_directory,
+                    "serverPid": s.server_pid,
+                    "host": s.host,
+                    "user": s.user,
+                    "buildToolVersion": s.build_tool_version,
+                    "optionsDescription": s.options_description,
                 }),
             );
         }
@@ -502,8 +626,10 @@ fn add_payload_to_json(
                 "optionsParsed".to_string(),
                 serde_json::json!({
                     "startupOptions": o.startup_options,
+                    "explicitStartupOptions": o.explicit_startup_options,
                     "cmdLine": o.cmd_line,
                     "explicitCmdLine": o.explicit_cmd_line,
+                    "toolTag": o.tool_tag,
                 }),
             );
         }
@@ -524,6 +650,8 @@ fn add_payload_to_json(
                 serde_json::json!({
                     "mnemonic": c.mnemonic,
                     "platformName": c.platform_name,
+                    "cpu": c.cpu,
+                    "isTool": c.is_tool,
                 }),
             );
         }
@@ -531,11 +659,19 @@ fn add_payload_to_json(
             map.insert("expanded".to_string(), serde_json::json!({}));
         }
         Payload::Configured(c) => {
+            let test_size = match c.test_size {
+                1 => "SMALL",
+                2 => "MEDIUM",
+                3 => "LARGE",
+                4 => "ENORMOUS",
+                _ => "",
+            };
             map.insert(
                 "configured".to_string(),
                 serde_json::json!({
                     "targetKind": c.target_kind,
                     "tag": c.tag,
+                    "testSize": test_size,
                 }),
             );
         }
@@ -555,12 +691,16 @@ fn add_payload_to_json(
                     })
                 })
                 .collect();
+            let failure_msg = c.failure_detail.as_ref().map(|fd| &fd.message);
+            let test_timeout_ms = c.test_timeout.as_ref().map(|d| duration_to_ms(d.seconds, d.nanos));
             map.insert(
                 "completed".to_string(),
                 serde_json::json!({
                     "success": c.success,
                     "outputGroup": output_groups,
                     "tag": c.tag,
+                    "failureDetail": failure_msg,
+                    "testTimeoutMs": test_timeout_ms,
                 }),
             );
         }
@@ -584,6 +724,11 @@ fn add_payload_to_json(
                 ts.seconds * 1_000_000_000 + ts.nanos as i64
             });
 
+            let failure_msg = a.failure_detail.as_ref().map(|fd| &fd.message);
+
+            // Decode SpawnExec from strategy_details to get cache/runner/IO info.
+            let spawn_info = decode_strategy_details(&a.strategy_details);
+
             map.insert(
                 "action".to_string(),
                 serde_json::json!({
@@ -596,6 +741,17 @@ fn add_payload_to_json(
                     "primaryOutput": primary_output_uri,
                     "startTimeNanos": start_time_nanos,
                     "endTimeNanos": end_time_nanos,
+                    "failureDetail": failure_msg,
+                    "runner": spawn_info.runner,
+                    "cacheHit": spawn_info.cache_hit,
+                    "cacheable": spawn_info.cacheable,
+                    "remotable": spawn_info.remotable,
+                    "remoteCacheable": spawn_info.remote_cacheable,
+                    "inputs": spawn_info.inputs,
+                    "listedOutputs": spawn_info.listed_outputs,
+                    "actualOutputs": spawn_info.actual_outputs,
+                    "inputBytes": spawn_info.input_bytes,
+                    "inputFiles": spawn_info.input_files,
                 }),
             );
         }
@@ -627,15 +783,17 @@ fn add_payload_to_json(
             let exit_code = f
                 .exit_code
                 .as_ref()
-                .map(|ec| serde_json::json!({"code": ec.code}));
+                .map(|ec| serde_json::json!({"code": ec.code, "name": ec.name}));
             let finish_time_nanos = f.finish_time.as_ref()
                 .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
+            let failure_msg = f.failure_detail.as_ref().map(|fd| &fd.message);
             map.insert(
                 "finished".to_string(),
                 serde_json::json!({
                     "exitCode": exit_code,
                     "finishTimeMillis": f.finish_time_millis,
                     "finishTimeNanos": finish_time_nanos,
+                    "failureDetail": failure_msg,
                 }),
             );
         }
@@ -672,25 +830,41 @@ fn add_payload_to_json(
                 "testResult".to_string(),
                 serde_json::json!({
                     "status": test_status_to_str(tr.status),
+                    "statusDetails": tr.status_details,
                     "cachedLocally": tr.cached_locally,
                     "testAttemptStartNanos": test_attempt_start_nanos,
                     "testAttemptDurationNanos": test_attempt_duration_nanos,
+                    "warning": tr.warning,
                     "executionInfo": tr.execution_info.as_ref().map(|ei| {
                         serde_json::json!({
                             "strategy": ei.strategy,
                             "cachedRemotely": ei.cached_remotely,
                             "exitCode": ei.exit_code,
+                            "hostname": ei.hostname,
                         })
                     }),
                 }),
             );
         }
         Payload::TestSummary(ts) => {
+            let first_start_nanos = ts.first_start_time.as_ref()
+                .map(|t| timestamp_to_nanos(t.seconds, t.nanos));
+            let last_stop_nanos = ts.last_stop_time.as_ref()
+                .map(|t| timestamp_to_nanos(t.seconds, t.nanos));
+            let total_run_duration_ms = ts.total_run_duration.as_ref()
+                .map(|d| duration_to_ms(d.seconds, d.nanos));
             map.insert(
                 "testSummary".to_string(),
                 serde_json::json!({
                     "overallStatus": test_status_to_str(ts.overall_status),
                     "totalRunCount": ts.total_run_count,
+                    "runCount": ts.run_count,
+                    "attemptCount": ts.attempt_count,
+                    "shardCount": ts.shard_count,
+                    "totalNumCached": ts.total_num_cached,
+                    "firstStartTimeNanos": first_start_nanos,
+                    "lastStopTimeNanos": last_stop_nanos,
+                    "totalRunDurationMs": total_run_duration_ms,
                 }),
             );
         }
@@ -736,11 +910,136 @@ fn add_payload_to_json(
                 }),
             );
         }
-        _ => {
-            // Other payload types we don't process yet
-            trace!("Unhandled payload type in proto-to-JSON conversion");
+        Payload::StructuredCommandLine(_) => {
+            // Redundant with optionsParsed; intentionally not converted.
+        }
+        Payload::TestProgress(tp) => {
+            map.insert(
+                "testProgress".to_string(),
+                serde_json::json!({"uri": tp.uri}),
+            );
+        }
+        Payload::WorkspaceInfo(wc) => {
+            map.insert(
+                "workspaceInfo".to_string(),
+                serde_json::json!({"localExecRoot": wc.local_exec_root}),
+            );
+        }
+        Payload::BuildToolLogs(btl) => {
+            let logs: Vec<serde_json::Value> = btl
+                .log
+                .iter()
+                .map(|f| {
+                    let uri = f.file.as_ref().and_then(|c| match c {
+                        FileContent::Uri(u) => Some(u.as_str()),
+                        _ => None,
+                    });
+                    serde_json::json!({"name": f.name, "uri": uri})
+                })
+                .collect();
+            map.insert(
+                "buildToolLogs".to_string(),
+                serde_json::json!({"log": logs}),
+            );
+        }
+        Payload::ConvenienceSymlinksIdentified(cs) => {
+            let symlinks: Vec<serde_json::Value> = cs
+                .convenience_symlinks
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "path": s.path,
+                        "action": s.action,
+                        "target": s.target,
+                    })
+                })
+                .collect();
+            map.insert(
+                "convenienceSymlinksIdentified".to_string(),
+                serde_json::json!({"convenienceSymlinks": symlinks}),
+            );
+        }
+        Payload::ExecRequest(er) => {
+            let argv: Vec<String> = er
+                .argv
+                .iter()
+                .filter_map(|b| String::from_utf8(b.clone()).ok())
+                .collect();
+            let wd = String::from_utf8(er.working_directory.clone()).unwrap_or_default();
+            map.insert(
+                "execRequest".to_string(),
+                serde_json::json!({
+                    "workingDirectory": wd,
+                    "argv": argv,
+                    "shouldExec": er.should_exec,
+                }),
+            );
         }
     }
+}
+
+/// Extracted SpawnExec data from strategy_details.
+#[derive(Default)]
+struct SpawnInfo {
+    runner: Option<String>,
+    cache_hit: Option<bool>,
+    cacheable: Option<bool>,
+    remotable: Option<bool>,
+    remote_cacheable: Option<bool>,
+    inputs: Vec<serde_json::Value>,
+    listed_outputs: Vec<String>,
+    actual_outputs: Vec<serde_json::Value>,
+    input_bytes: Option<i64>,
+    input_files: Option<i64>,
+}
+
+const SPAWN_EXEC_TYPE_URL: &str = "type.googleapis.com/tools.protos.SpawnExec";
+
+/// Try to decode the first SpawnExec from repeated google.protobuf.Any.
+/// The `Any` type here comes from the build_event_stream proto (not prost_types).
+fn decode_strategy_details(
+    details: &[build_event_stream_proto::any_proto::google::protobuf::Any],
+) -> SpawnInfo {
+    for any in details {
+        if any.type_url != SPAWN_EXEC_TYPE_URL {
+            continue;
+        }
+        match prost::Message::decode(any.value.as_ref()) {
+            Ok(spawn) => {
+                let spawn: crate::spawn_proto::SpawnExec = spawn;
+                let inputs: Vec<serde_json::Value> = spawn
+                    .inputs
+                    .iter()
+                    .map(|f| serde_json::json!({"path": f.path, "isTool": f.is_tool}))
+                    .collect();
+                let actual_outputs: Vec<serde_json::Value> = spawn
+                    .actual_outputs
+                    .iter()
+                    .map(|f| serde_json::json!({"path": f.path}))
+                    .collect();
+                let (input_bytes, input_files) = spawn.metrics.as_ref().map_or(
+                    (None, None),
+                    |m| (Some(m.input_bytes), Some(m.input_files)),
+                );
+                return SpawnInfo {
+                    runner: Some(spawn.runner.clone()),
+                    cache_hit: Some(spawn.cache_hit),
+                    cacheable: Some(spawn.cacheable),
+                    remotable: Some(spawn.remotable),
+                    remote_cacheable: Some(spawn.remote_cacheable),
+                    inputs,
+                    listed_outputs: spawn.listed_outputs.clone(),
+                    actual_outputs,
+                    input_bytes,
+                    input_files,
+                };
+            }
+            Err(e) => {
+                warn!(?e, "Failed to decode SpawnExec from strategy_details");
+            }
+        }
+    }
+    SpawnInfo::default()
 }
 
 /// Convert a BEP TestStatus enum (i32) to a human-readable string.
