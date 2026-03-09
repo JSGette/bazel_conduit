@@ -27,6 +27,42 @@ pub struct ActionState {
     pub exit_code: Option<i32>,
 }
 
+/// Action data buffered until target completion so target span timing can use
+/// earliest action start and latest action end.
+#[derive(Debug, Clone)]
+pub struct BufferedAction {
+    pub label: Option<String>,
+    pub mnemonic: Option<String>,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub primary_output: Option<String>,
+    pub configuration: Option<String>,
+    pub command_line: Vec<String>,
+    pub stdout_uri: Option<String>,
+    pub stderr_uri: Option<String>,
+    pub start_nanos: Option<i64>,
+    pub end_nanos: Option<i64>,
+}
+
+/// Per-target min/max action timings and buffered actions for OTEL replay.
+#[derive(Debug, Default)]
+pub struct TargetActionBuffer {
+    pub earliest_start_nanos: Option<i64>,
+    pub latest_end_nanos: Option<i64>,
+    pub actions: Vec<BufferedAction>,
+}
+
+impl TargetActionBuffer {
+    fn update_timing(&mut self, start_nanos: i64, end_nanos: i64) {
+        self.earliest_start_nanos = Some(
+            self.earliest_start_nanos
+                .map_or(start_nanos, |x| x.min(start_nanos)),
+        );
+        self.latest_end_nanos =
+            Some(self.latest_end_nanos.map_or(end_nanos, |x| x.max(end_nanos)));
+    }
+}
+
 /// Configuration state
 #[derive(Debug, Clone)]
 pub struct ConfigurationState {
@@ -67,6 +103,9 @@ pub struct BuildState {
     // Actions (failed in lightweight mode, all in full mode)
     actions: Vec<ActionState>,
 
+    // Per-target action timing and buffered actions (for OTEL target span timing)
+    target_action_buffers: DashMap<String, TargetActionBuffer>,
+
     // Build metrics (stored as JSON for now)
     build_metrics: Option<serde_json::Value>,
 }
@@ -90,6 +129,7 @@ impl BuildState {
             targets: DashMap::new(),
             named_sets: DashMap::new(),
             actions: Vec::new(),
+            target_action_buffers: DashMap::new(),
             build_metrics: None,
         }
     }
@@ -214,10 +254,6 @@ impl BuildState {
         );
     }
 
-    pub fn get_configuration(&self, id: &str) -> Option<ConfigurationState> {
-        self.configurations.get(id).map(|r| r.value().clone())
-    }
-
     // =========================================================================
     // Targets
     // =========================================================================
@@ -255,10 +291,6 @@ impl BuildState {
         }
     }
 
-    pub fn get_target(&self, label: &str) -> Option<TargetState> {
-        self.targets.get(label).map(|r| r.value().clone())
-    }
-
     pub fn targets(&self) -> Vec<TargetState> {
         self.targets.iter().map(|r| r.value().clone()).collect()
     }
@@ -277,15 +309,6 @@ impl BuildState {
 
     pub fn get_named_set(&self, id: &str) -> Option<Vec<String>> {
         self.named_sets.get(id).map(|r| r.value().clone())
-    }
-
-    /// Resolve file set IDs to actual file names
-    pub fn resolve_output_files(&self, file_set_ids: &[String]) -> Vec<String> {
-        file_set_ids
-            .iter()
-            .filter_map(|id| self.get_named_set(id))
-            .flatten()
-            .collect()
     }
 
     // =========================================================================
@@ -313,12 +336,59 @@ impl BuildState {
         &self.actions
     }
 
-    pub fn failed_actions(&self) -> Vec<&ActionState> {
-        self.actions.iter().filter(|a| !a.success).collect()
-    }
-
     pub fn actions_count(&self) -> usize {
         self.actions.len()
+    }
+
+    /// Buffer action for OTEL and update per-target earliest/latest timings.
+    /// Used so the target span can be created at completion with start =
+    /// min(action starts) and end = max(action ends).
+    pub fn record_and_buffer_action(
+        &self,
+        label: String,
+        mnemonic: Option<String>,
+        primary_output: Option<String>,
+        success: bool,
+        exit_code: Option<i32>,
+        configuration: Option<String>,
+        command_line: Vec<String>,
+        stdout_uri: Option<String>,
+        stderr_uri: Option<String>,
+        start_nanos: Option<i64>,
+        end_nanos: Option<i64>,
+    ) {
+        let mut buf = self.target_action_buffers.entry(label.clone()).or_default();
+        buf.actions.push(BufferedAction {
+            label: Some(label),
+            mnemonic,
+            success,
+            exit_code,
+            primary_output,
+            configuration,
+            command_line,
+            stdout_uri,
+            stderr_uri,
+            start_nanos,
+            end_nanos,
+        });
+        if let (Some(s), Some(e)) = (start_nanos, end_nanos) {
+            buf.update_timing(s, e);
+        }
+    }
+
+    /// Remove and return the action buffer for a target, if any.
+    /// Returns (earliest_start_nanos, latest_end_nanos, buffered_actions).
+    pub fn take_target_action_buffer(
+        &self,
+        label: &str,
+    ) -> Option<(Option<i64>, Option<i64>, Vec<BufferedAction>)> {
+        self.target_action_buffers.remove(label).map(|(_, buf)| {
+            (
+                buf.earliest_start_nanos,
+                buf.latest_end_nanos,
+                buf.actions,
+            )
+        })
     }
 
     // =========================================================================

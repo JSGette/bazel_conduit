@@ -3,6 +3,9 @@
 //! Routes BEP events to appropriate handlers based on event type.
 
 use super::decoder::BepJsonEvent;
+use crate::build_event_stream::build_event::Payload as BepPayload;
+use crate::build_event_stream::build_event_id::Id as BepId;
+use crate::build_event_stream::BuildEvent;
 use crate::otel::OtelMapper;
 use crate::state::{ActionProcessingMode, BuildState};
 use thiserror::Error;
@@ -118,6 +121,464 @@ impl EventRouter {
                 debug!(event_type = other, "Ignoring unknown event type");
                 Ok(())
             }
+        }
+    }
+
+    /// Route a BEP BuildEvent from the gRPC path (no JSON round-trip).
+    pub fn route_build_event(
+        &mut self,
+        event: &BuildEvent,
+        event_time_nanos: Option<i64>,
+    ) -> Result<(), RouterError> {
+        let id = match event.id.as_ref().and_then(|i| i.id.as_ref()) {
+            Some(id) => id,
+            None => return Err(RouterError::MissingEventId),
+        };
+
+        trace!("Routing BEP event (proto)");
+
+        match id {
+            BepId::Started(_) => {
+                if let Some(BepPayload::Started(s)) = &event.payload {
+                    let start_time_nanos = s
+                        .start_time
+                        .as_ref()
+                        .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
+                    if !s.uuid.is_empty() {
+                        self.state.set_invocation_id(s.uuid.clone());
+                    }
+                    if !s.command.is_empty() {
+                        self.state.set_command(s.command.clone());
+                    }
+                    #[allow(deprecated)]
+                    if s.start_time_millis != 0 {
+                        self.state.set_start_time_millis(s.start_time_millis);
+                    }
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_build_started(
+                            if s.uuid.is_empty() { "unknown" } else { &s.uuid },
+                            if s.command.is_empty() { "unknown" } else { &s.command },
+                            start_time_nanos,
+                            event_time_nanos,
+                        );
+                        mapper.on_build_started_extended(
+                            Some(s.workspace_directory.as_str()),
+                            Some(s.working_directory.as_str()),
+                            Some(s.build_tool_version.as_str()),
+                            if s.server_pid != 0 {
+                                Some(s.server_pid)
+                            } else {
+                                None
+                            },
+                            Some(s.host.as_str()),
+                            Some(s.user.as_str()),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::UnstructuredCommandLine(_) => {
+                if let Some(BepPayload::UnstructuredCommandLine(u)) = &event.payload {
+                    let args: Vec<String> = u.args.clone();
+                    if !args.is_empty() {
+                        self.state.set_command_args(args.clone());
+                        if let Some(mapper) = &mut self.mapper {
+                            mapper.on_command_line(&args);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BepId::OptionsParsed(_) => {
+                if let Some(BepPayload::OptionsParsed(o)) = &event.payload {
+                    let all_options: Vec<&str> = o
+                        .cmd_line
+                        .iter()
+                        .chain(&o.explicit_cmd_line)
+                        .map(String::as_str)
+                        .collect();
+                    let has_all_actions = all_options
+                        .iter()
+                        .any(|opt| opt.contains("build_event_publish_all_actions"));
+                    self.state.set_action_mode(if has_all_actions {
+                        ActionProcessingMode::Full
+                    } else {
+                        ActionProcessingMode::Lightweight
+                    });
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_action_mode(self.state.action_mode());
+                    }
+                    self.state.set_startup_options(o.startup_options.clone());
+                    let explicit = o.explicit_cmd_line.clone();
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_options_parsed(&o.startup_options, &explicit);
+                    }
+                }
+                Ok(())
+            }
+            BepId::WorkspaceStatus(_) => {
+                if let Some(BepPayload::WorkspaceStatus(ws)) = &event.payload {
+                    let mut items = std::collections::HashMap::new();
+                    for i in &ws.item {
+                        if !i.key.is_empty() {
+                            items.insert(i.key.clone(), i.value.clone());
+                            self.state.add_workspace_status(i.key.clone(), i.value.clone());
+                        }
+                    }
+                    if !items.is_empty() {
+                        if let Some(mapper) = &mut self.mapper {
+                            mapper.on_workspace_status(&items);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            BepId::Configuration(c) => {
+                if let Some(BepPayload::Configuration(cfg)) = &event.payload {
+                    let id = c.id.clone();
+                    self.state.add_configuration(
+                        id.clone(),
+                        Some(cfg.mnemonic.clone()),
+                        Some(cfg.platform_name.clone()),
+                    );
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_configuration(
+                            &id,
+                            Some(cfg.mnemonic.as_str()),
+                            Some(cfg.platform_name.as_str()),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::BuildFinished(_) => {
+                if let Some(BepPayload::Finished(f)) = &event.payload {
+                    let exit_code = f.exit_code.as_ref().map(|ec| ec.code);
+                    let finish_time_nanos = f
+                        .finish_time
+                        .as_ref()
+                        .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos))
+                        .or_else(|| {
+                            if f.finish_time_millis != 0 {
+                                Some(f.finish_time_millis * 1_000_000)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(code) = exit_code {
+                        self.state.set_exit_code(code);
+                    }
+                    #[allow(deprecated)]
+                    if f.finish_time_millis != 0 {
+                        self.state.set_end_time_millis(f.finish_time_millis);
+                    }
+                    self.state.mark_finished();
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_build_finished(exit_code, finish_time_nanos);
+                    }
+                }
+                Ok(())
+            }
+            BepId::BuildMetrics(_) => {
+                if let Some(BepPayload::BuildMetrics(m)) = &event.payload {
+                    let json = crate::grpc::server::build_metrics_to_json(m);
+                    self.state.set_build_metrics(json.clone());
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_build_metrics(&json);
+                    }
+                }
+                Ok(())
+            }
+            BepId::Pattern(p) => {
+                if let Some(BepPayload::Expanded(_)) = &event.payload {
+                    let patterns = p.pattern.clone();
+                    self.state.set_patterns(patterns.clone());
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_pattern(&patterns);
+                    }
+                }
+                Ok(())
+            }
+            BepId::TargetConfigured(t) => {
+                if let Some(BepPayload::Configured(c)) = &event.payload {
+                    let label = t.label.clone();
+                    let kind = c.target_kind.clone();
+                    let tags = c.tag.clone();
+                    self.state.start_target(label.clone(), Some(kind.clone()), None);
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_target_configured(
+                            &label,
+                            Some(kind.as_str()),
+                            &tags,
+                            event_time_nanos,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::TargetCompleted(t) => {
+                let label = t.label.clone();
+                if let Some(BepPayload::Aborted(a)) = &event.payload {
+                    let reason = crate::grpc::server::aborted_reason_to_str(a.reason());
+                    self.state.complete_target(label.clone(), false, Vec::new(), None);
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_target_skipped(
+                            &label,
+                            Some(reason),
+                            Some(a.description.as_str()),
+                            event_time_nanos,
+                        );
+                    }
+                    return Ok(());
+                }
+                if let Some(BepPayload::Completed(c)) = &event.payload {
+                    let file_sets: Vec<String> = c
+                        .output_group
+                        .iter()
+                        .flat_map(|og| og.file_sets.iter())
+                        .map(|fs| fs.id.clone())
+                        .collect();
+                    let tags = c.tag.clone();
+                    self.state.complete_target(
+                        label.clone(),
+                        c.success,
+                        file_sets.clone(),
+                        None,
+                    );
+                    if let Some(mapper) = &mut self.mapper {
+                        let (earliest, latest, buffered) = self
+                            .state
+                            .take_target_action_buffer(&label)
+                            .unwrap_or((None, None, vec![]));
+                        mapper.on_target_completed(
+                            &label,
+                            c.success,
+                            &file_sets,
+                            &tags,
+                            event_time_nanos,
+                            earliest,
+                            latest,
+                            &buffered,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::NamedSet(n) => {
+                if let Some(BepPayload::NamedSetOfFiles(ns)) = &event.payload {
+                    let id = n.id.clone();
+                    let files: Vec<String> = ns
+                        .files
+                        .iter()
+                        .filter_map(|f| {
+                            crate::grpc::server::bep_file_uri(f)
+                                .or_else(|| if f.name.is_empty() { None } else { Some(f.name.clone()) })
+                        })
+                        .collect();
+                    let child_set_ids: Vec<String> =
+                        ns.file_sets.iter().map(|fs| fs.id.clone()).collect();
+                    self.state.cache_named_set(id.clone(), files.clone());
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_named_set(&id, files, &child_set_ids);
+                    }
+                }
+                Ok(())
+            }
+            BepId::ActionCompleted(a) => {
+                if let Some(BepPayload::Action(act)) = &event.payload {
+                    let label = a.label.clone();
+                    let primary_output = a.primary_output.clone();
+                    let configuration = a
+                        .configuration
+                        .as_ref()
+                        .map(|c| c.id.clone());
+                    let should_process = self
+                        .state
+                        .action_mode()
+                        .should_create_span(act.success);
+                    if !should_process {
+                        return Ok(());
+                    }
+                    self.state.record_action(
+                        Some(label.clone()),
+                        Some(act.r#type.clone()),
+                        Some(primary_output.clone()),
+                        act.success,
+                        Some(act.exit_code),
+                    );
+                    if self.mapper.is_some() {
+                        let stdout_uri = act
+                            .stdout
+                            .as_ref()
+                            .and_then(crate::grpc::server::bep_file_uri);
+                        let stderr_uri = act
+                            .stderr
+                            .as_ref()
+                            .and_then(crate::grpc::server::bep_file_uri);
+                        let start_nanos = act.start_time.as_ref().map(|ts| {
+                            ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
+                        });
+                        let end_nanos = act.end_time.as_ref().map(|ts| {
+                            ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
+                        });
+                        self.state.record_and_buffer_action(
+                            label,
+                            Some(act.r#type.clone()),
+                            Some(primary_output),
+                            act.success,
+                            Some(act.exit_code),
+                            configuration,
+                            act.command_line.clone(),
+                            stdout_uri,
+                            stderr_uri,
+                            start_nanos,
+                            end_nanos,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::Fetch(f) => {
+                if let Some(BepPayload::Fetch(p)) = &event.payload {
+                    let url = f.url.clone();
+                    let downloader = match f.downloader() {
+                        crate::build_event_stream::build_event_id::fetch_id::Downloader::Http => {
+                            "HTTP"
+                        }
+                        crate::build_event_stream::build_event_id::fetch_id::Downloader::Grpc => {
+                            "GRPC"
+                        }
+                        _ => "UNKNOWN",
+                    };
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_fetch(&url, p.success, Some(downloader));
+                    }
+                }
+                Ok(())
+            }
+            BepId::Progress(_) => {
+                if let Some(BepPayload::Progress(pr)) = &event.payload {
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_progress(
+                            Some(pr.stderr.as_str()),
+                            Some(pr.stdout.as_str()),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::BuildMetadata(_) => {
+                if let Some(BepPayload::BuildMetadata(bm)) = &event.payload {
+                    let json = crate::grpc::server::build_metadata_to_json(bm);
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_build_metadata(&json);
+                    }
+                }
+                Ok(())
+            }
+            BepId::PatternSkipped(ps) => {
+                let patterns = ps.pattern.clone();
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_pattern_skipped(&patterns);
+                }
+                Ok(())
+            }
+            BepId::UnconfiguredLabel(t) => {
+                let label = t.label.clone();
+                if let Some(BepPayload::Aborted(a)) = &event.payload {
+                    let reason = crate::grpc::server::aborted_reason_to_str(a.reason());
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_target_skipped(
+                            &label,
+                            Some(reason),
+                            Some(a.description.as_str()),
+                            event_time_nanos,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::ConfiguredLabel(t) => {
+                let label = t.label.clone();
+                if let Some(BepPayload::Aborted(a)) = &event.payload {
+                    let reason = crate::grpc::server::aborted_reason_to_str(a.reason());
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_target_skipped(
+                            &label,
+                            Some(reason),
+                            Some(a.description.as_str()),
+                            event_time_nanos,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::TestResult(tr) => {
+                if let Some(BepPayload::TestResult(pr)) = &event.payload {
+                    let label = tr.label.clone();
+                    let strategy: Option<&str> = pr
+                        .execution_info
+                        .as_ref()
+                        .map(|ei| ei.strategy.as_str());
+                    let start_time_nanos = pr.test_attempt_start.as_ref()
+                        .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
+                    let duration_nanos = pr.test_attempt_duration.as_ref()
+                        .map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos));
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_test_result(
+                            &label,
+                            Some(crate::grpc::server::test_status_to_str(pr.status)),
+                            Some(tr.attempt),
+                            Some(tr.run),
+                            Some(tr.shard),
+                            Some(pr.cached_locally),
+                            strategy,
+                            start_time_nanos,
+                            duration_nanos,
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::TestSummary(ts) => {
+                if let Some(BepPayload::TestSummary(ps)) = &event.payload {
+                    let label = ts.label.clone();
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_test_summary(
+                            &label,
+                            Some(crate::grpc::server::test_status_to_str(ps.overall_status)),
+                            Some(ps.total_run_count),
+                            Some(ps.run_count),
+                            Some(ps.attempt_count),
+                            Some(ps.shard_count),
+                            Some(ps.total_num_cached),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::TargetSummary(ts) => {
+                if let Some(BepPayload::TargetSummary(ps)) = &event.payload {
+                    let label = ts.label.clone();
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_target_summary(
+                            &label,
+                            Some(ps.overall_build_success),
+                            Some(crate::grpc::server::test_status_to_str(
+                                ps.overall_test_status,
+                            )),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BepId::StructuredCommandLine(_)
+            | BepId::TestProgress(_)
+            | BepId::ExecRequest(_)
+            | BepId::Workspace(_)
+            | BepId::BuildToolLogs(_)
+            | BepId::ConvenienceSymlinksIdentified(_)
+            | BepId::Unknown(_) => Ok(()),
         }
     }
 
@@ -543,14 +1004,21 @@ impl EventRouter {
                 None,
             );
 
-            // OTel: end target span with resolved file sets + BES event_time
+            // OTel: end target span with resolved file sets + action-based timing when available
             if let Some(mapper) = &mut self.mapper {
+                let (earliest, latest, buffered) = self
+                    .state
+                    .take_target_action_buffer(label)
+                    .unwrap_or((None, None, vec![]));
                 mapper.on_target_completed(
                     label,
                     success,
                     &file_sets,
                     &tags,
                     event.event_time_nanos,
+                    earliest,
+                    latest,
+                    &buffered,
                 );
             }
         }
