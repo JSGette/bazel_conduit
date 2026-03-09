@@ -81,7 +81,8 @@ pub struct BepJsonEvent {
     #[serde(default)]
     pub id: serde_json::Value,
 
-    /// Child event IDs
+    /// Child event IDs. Present for NDJSON compatibility; not read by the router.
+    #[allow(dead_code)]
     #[serde(default)]
     pub children: Vec<serde_json::Value>,
 
@@ -119,16 +120,5 @@ impl BepJsonEvent {
     /// Get the event payload for a specific event type
     pub fn get_payload(&self, event_type: &str) -> Option<&serde_json::Value> {
         self.payload.get(event_type)
-    }
-
-    /// Get the raw event as a JSON value (for compatibility)
-    pub fn as_json(&self) -> serde_json::Value {
-        let mut map = self.payload.clone();
-        map.insert("id".to_string(), self.id.clone());
-        map.insert("children".to_string(), serde_json::json!(self.children));
-        if self.last_message {
-            map.insert("lastMessage".to_string(), serde_json::Value::Bool(true));
-        }
-        serde_json::Value::Object(map)
     }
 }

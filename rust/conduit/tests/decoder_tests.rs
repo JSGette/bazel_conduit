@@ -61,16 +61,6 @@ fn test_get_payload() {
 }
 
 #[test]
-fn test_as_json_roundtrip() {
-    let json = r#"{"id":{"started":{}},"started":{"uuid":"abc"}}"#;
-    let event: BepJsonEvent = serde_json::from_str(json).unwrap();
-    let reconstructed = event.as_json();
-
-    assert!(reconstructed.get("id").is_some());
-    assert!(reconstructed.get("started").is_some());
-}
-
-#[test]
 fn test_children_parsing() {
     let json = r#"{"id":{"started":{}},"children":[{"progress":{"opaqueCount":0}},{"pattern":{"pattern":["//..."]}}],"started":{"uuid":"abc"}}"#;
     let event: BepJsonEvent = serde_json::from_str(json).unwrap();

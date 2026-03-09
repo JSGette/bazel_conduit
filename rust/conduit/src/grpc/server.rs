@@ -112,9 +112,13 @@ impl PublishBuildEvent for BesServer {
                         );
 
                         // Extract the BazelEvent Any payload from the BES BuildEvent
-                        if let Some(json_event) = extract_bep_event(&req) {
+                        if let Some((build_event, event_time_nanos)) =
+                            crate::grpc::server::decode_bep_event_from_request(&req)
+                        {
                             let mut router = router.lock().await;
-                            if let Err(e) = router.route(&json_event) {
+                            if let Err(e) =
+                                router.route_build_event(&build_event, event_time_nanos)
+                            {
                                 warn!(error = %e, "Failed to route BEP event");
                             }
                         }
@@ -167,12 +171,14 @@ impl PublishBuildEvent for BesServer {
 ///       -> event: build_events.BuildEvent (BES-level)
 ///         -> event: BazelEvent(google.protobuf.Any)
 ///           -> value: serialized build_event_stream.BuildEvent (BEP)
-fn extract_bep_event(req: &PublishBuildToolEventStreamRequest) -> Option<BepJsonEvent> {
+/// Decode a BEP BuildEvent from the request (gRPC path). Returns the proto
+/// and BES-level event time for direct routing without JSON round-trip.
+pub(crate) fn decode_bep_event_from_request(
+    req: &PublishBuildToolEventStreamRequest,
+) -> Option<(crate::build_event_stream::BuildEvent, Option<i64>)> {
     let ordered = req.ordered_build_event.as_ref()?;
     let bes_event = ordered.event.as_ref()?;
 
-    // Extract the BES-level event_time (nanoseconds since epoch)
-    // to preserve sub-millisecond precision for span timing.
     let event_time_nanos = bes_event
         .event_time
         .as_ref()
@@ -181,20 +187,26 @@ fn extract_bep_event(req: &PublishBuildToolEventStreamRequest) -> Option<BepJson
     let event = bes_event.event.as_ref()?;
 
     match event {
-        BesEvent::BazelEvent(any) => match decode_any_to_bep_json(any) {
-            Ok(mut json_event) => {
-                json_event.event_time_nanos = event_time_nanos;
-                Some(json_event)
+        BesEvent::BazelEvent(any) => {
+            if !any.type_url.contains("BuildEvent")
+                && !any.type_url.contains("build_event_stream")
+            {
+                debug!(type_url = %any.type_url, "Unexpected type_url");
+                return None;
             }
-            Err(e) => {
-                debug!(
-                    type_url = %any.type_url,
-                    error = %e,
-                    "Could not decode BazelEvent Any payload"
-                );
-                None
+            use prost::Message;
+            match crate::build_event_stream::BuildEvent::decode(any.value.as_ref()) {
+                Ok(build_event) => Some((build_event, event_time_nanos)),
+                Err(e) => {
+                    debug!(
+                        type_url = %any.type_url,
+                        error = %e,
+                        "Could not decode BuildEvent"
+                    );
+                    None
+                }
             }
-        },
+        }
         BesEvent::ConsoleOutput(co) => {
             trace!("Console output event (ignored)");
             let _ = co;
@@ -279,7 +291,9 @@ fn timestamp_to_nanos(seconds: i64, nanos: i32) -> i64 {
 }
 
 /// Serialize BuildMetrics proto to JSON (full extraction for OTEL).
-fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_json::Value {
+pub(crate) fn build_metrics_to_json(
+    m: &crate::build_event_stream::BuildMetrics,
+) -> serde_json::Value {
     use serde_json::json;
 
     let action_summary = m.action_summary.as_ref().map(|a| {
@@ -468,6 +482,12 @@ fn build_metrics_to_json(m: &crate::build_event_stream::BuildMetrics) -> serde_j
     })
 }
 
+pub(crate) fn build_metadata_to_json(
+    bm: &crate::build_event_stream::BuildMetadata,
+) -> serde_json::Value {
+    serde_json::json!({ "metadata": bm.metadata })
+}
+
 /// Convert a BuildEventId to JSON
 fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde_json::Value {
     use crate::build_event_stream::build_event_id::Id;
@@ -582,15 +602,22 @@ fn build_event_id_to_json(id: &crate::build_event_stream::BuildEventId) -> serde
     }
 }
 
+/// Extract URI from a BEP File oneof, if present.
+pub(crate) fn bep_file_uri(f: &crate::build_event_stream::File) -> Option<String> {
+    use crate::build_event_stream::file::File as FileContent;
+    f.file.as_ref().and_then(|c| match c {
+        FileContent::Uri(u) => Some(u.clone()),
+        _ => None,
+    })
+}
+
 /// Convert the payload oneof to JSON fields
 #[allow(deprecated)] // start_time_millis and finish_time_millis are deprecated
 fn add_payload_to_json(
     map: &mut serde_json::Map<String, serde_json::Value>,
     payload: &crate::build_event_stream::build_event::Payload,
 ) {
-    use crate::build_event_stream;
     use crate::build_event_stream::build_event::Payload;
-    use crate::build_event_stream::file::File as FileContent;
 
     match payload {
         Payload::Started(s) => {
@@ -705,16 +732,9 @@ fn add_payload_to_json(
             );
         }
         Payload::Action(a) => {
-            // Extract stdout/stderr/primary_output file URIs.
-            let file_uri = |f: &crate::build_event_stream::File| -> Option<String> {
-                f.file.as_ref().and_then(|c| match c {
-                    FileContent::Uri(u) => Some(u.clone()),
-                    _ => None,
-                })
-            };
-            let stdout_uri = a.stdout.as_ref().and_then(file_uri);
-            let stderr_uri = a.stderr.as_ref().and_then(file_uri);
-            let primary_output_uri = a.primary_output.as_ref().and_then(file_uri);
+            let stdout_uri = a.stdout.as_ref().and_then(bep_file_uri);
+            let stderr_uri = a.stderr.as_ref().and_then(bep_file_uri);
+            let primary_output_uri = a.primary_output.as_ref().and_then(bep_file_uri);
 
             // Convert proto Timestamps to nanos-since-epoch.
             let start_time_nanos = a.start_time.as_ref().map(|ts| {
@@ -746,14 +766,7 @@ fn add_payload_to_json(
             let files: Vec<serde_json::Value> = ns
                 .files
                 .iter()
-                .map(|f| {
-                    // Extract URI from the file oneof
-                    let uri = f.file.as_ref().and_then(|content| match content {
-                        FileContent::Uri(u) => Some(u.as_str()),
-                        _ => None,
-                    });
-                    serde_json::json!({"name": f.name, "uri": uri})
-                })
+                .map(|f| serde_json::json!({"name": f.name, "uri": bep_file_uri(f)}))
                 .collect();
             // Transitive NamedSet references (NamedSetOfFiles.file_sets).
             let child_set_ids: Vec<serde_json::Value> = ns
@@ -873,22 +886,7 @@ fn add_payload_to_json(
             );
         }
         Payload::Aborted(a) => {
-            let reason = match a.reason() {
-                build_event_stream::aborted::AbortReason::Unknown => "UNKNOWN",
-                build_event_stream::aborted::AbortReason::UserInterrupted => "USER_INTERRUPTED",
-                build_event_stream::aborted::AbortReason::NoAnalyze => "NO_ANALYZE",
-                build_event_stream::aborted::AbortReason::NoBuild => "NO_BUILD",
-                build_event_stream::aborted::AbortReason::TimeOut => "TIME_OUT",
-                build_event_stream::aborted::AbortReason::RemoteEnvironmentFailure => {
-                    "REMOTE_ENVIRONMENT_FAILURE"
-                }
-                build_event_stream::aborted::AbortReason::Internal => "INTERNAL",
-                build_event_stream::aborted::AbortReason::LoadingFailure => "LOADING_FAILURE",
-                build_event_stream::aborted::AbortReason::AnalysisFailure => "ANALYSIS_FAILURE",
-                build_event_stream::aborted::AbortReason::Skipped => "SKIPPED",
-                build_event_stream::aborted::AbortReason::Incomplete => "INCOMPLETE",
-                build_event_stream::aborted::AbortReason::OutOfMemory => "OUT_OF_MEMORY",
-            };
+            let reason = aborted_reason_to_str(a.reason());
             map.insert(
                 "aborted".to_string(),
                 serde_json::json!({
@@ -916,13 +914,7 @@ fn add_payload_to_json(
             let logs: Vec<serde_json::Value> = btl
                 .log
                 .iter()
-                .map(|f| {
-                    let uri = f.file.as_ref().and_then(|c| match c {
-                        FileContent::Uri(u) => Some(u.as_str()),
-                        _ => None,
-                    });
-                    serde_json::json!({"name": f.name, "uri": uri})
-                })
+                .map(|f| serde_json::json!({"name": f.name, "uri": bep_file_uri(f)}))
                 .collect();
             map.insert(
                 "buildToolLogs".to_string(),
@@ -950,9 +942,9 @@ fn add_payload_to_json(
             let argv: Vec<String> = er
                 .argv
                 .iter()
-                .filter_map(|b| String::from_utf8(b.clone()).ok())
+                .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect();
-            let wd = String::from_utf8(er.working_directory.clone()).unwrap_or_default();
+            let wd = String::from_utf8_lossy(&er.working_directory).into_owned();
             map.insert(
                 "execRequest".to_string(),
                 serde_json::json!({
@@ -965,8 +957,29 @@ fn add_payload_to_json(
     }
 }
 
+/// Convert a BEP AbortReason enum to a human-readable string.
+pub(crate) fn aborted_reason_to_str(
+    reason: crate::build_event_stream::aborted::AbortReason,
+) -> &'static str {
+    use crate::build_event_stream::aborted::AbortReason;
+    match reason {
+        AbortReason::Unknown => "UNKNOWN",
+        AbortReason::UserInterrupted => "USER_INTERRUPTED",
+        AbortReason::NoAnalyze => "NO_ANALYZE",
+        AbortReason::NoBuild => "NO_BUILD",
+        AbortReason::TimeOut => "TIME_OUT",
+        AbortReason::RemoteEnvironmentFailure => "REMOTE_ENVIRONMENT_FAILURE",
+        AbortReason::Internal => "INTERNAL",
+        AbortReason::LoadingFailure => "LOADING_FAILURE",
+        AbortReason::AnalysisFailure => "ANALYSIS_FAILURE",
+        AbortReason::Skipped => "SKIPPED",
+        AbortReason::Incomplete => "INCOMPLETE",
+        AbortReason::OutOfMemory => "OUT_OF_MEMORY",
+    }
+}
+
 /// Convert a BEP TestStatus enum (i32) to a human-readable string.
-fn test_status_to_str(status: i32) -> &'static str {
+pub(crate) fn test_status_to_str(status: i32) -> &'static str {
     match status {
         0 => "NO_STATUS",
         1 => "PASSED",

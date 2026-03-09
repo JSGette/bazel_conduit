@@ -91,10 +91,6 @@ pub const BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES: &str = "bazel.metrics.cumulativ
 pub const BAZEL_METRICS_CUMULATIVE_NUM_BUILDS: &str = "bazel.metrics.cumulative_num_builds";
 
 // Test extended
-pub const BAZEL_TEST_STATUS_DETAILS: &str = "bazel.test.status_details";
-pub const BAZEL_TEST_HOSTNAME: &str = "bazel.test.hostname";
-pub const BAZEL_TEST_CACHED_REMOTELY: &str = "bazel.test.cached_remotely";
-pub const BAZEL_TEST_EXIT_CODE: &str = "bazel.test.exit_code";
 pub const BAZEL_TEST_RUN_COUNT: &str = "bazel.test.run_count";
 pub const BAZEL_TEST_ATTEMPT_COUNT: &str = "bazel.test.attempt_count";
 pub const BAZEL_TEST_SHARD_COUNT: &str = "bazel.test.shard_count";
