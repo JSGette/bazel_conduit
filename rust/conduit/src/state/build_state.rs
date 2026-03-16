@@ -36,6 +36,7 @@ pub struct BufferedAction {
     pub mnemonic: Option<String>,
     pub success: bool,
     pub exit_code: Option<i32>,
+    pub exit_code_name: Option<String>,
     pub primary_output: Option<String>,
     pub configuration: Option<String>,
     pub command_line: Vec<String>,
@@ -43,6 +44,10 @@ pub struct BufferedAction {
     pub stderr_uri: Option<String>,
     pub start_nanos: Option<i64>,
     pub end_nanos: Option<i64>,
+    pub cached: Option<bool>,
+    pub hostname: Option<String>,
+    pub cached_remotely: Option<bool>,
+    pub runner: Option<String>,
 }
 
 /// Per-target min/max action timings and buffered actions for OTEL replay.
@@ -356,6 +361,7 @@ impl BuildState {
     /// Buffer action for OTEL and update per-target earliest/latest timings.
     /// Used so the target span can be created at completion with start =
     /// min(action starts) and end = max(action ends).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_and_buffer_action(
         &self,
         label: String,
@@ -363,12 +369,17 @@ impl BuildState {
         primary_output: Option<String>,
         success: bool,
         exit_code: Option<i32>,
+        exit_code_name: Option<String>,
         configuration: Option<String>,
         command_line: Vec<String>,
         stdout_uri: Option<String>,
         stderr_uri: Option<String>,
         start_nanos: Option<i64>,
         end_nanos: Option<i64>,
+        cached: Option<bool>,
+        hostname: Option<String>,
+        cached_remotely: Option<bool>,
+        runner: Option<String>,
     ) {
         let mut buf = self.target_action_buffers.entry(label.clone()).or_default();
         buf.actions.push(BufferedAction {
@@ -376,6 +387,7 @@ impl BuildState {
             mnemonic,
             success,
             exit_code,
+            exit_code_name,
             primary_output,
             configuration,
             command_line,
@@ -383,6 +395,10 @@ impl BuildState {
             stderr_uri,
             start_nanos,
             end_nanos,
+            cached,
+            hostname,
+            cached_remotely,
+            runner,
         });
         if let (Some(s), Some(e)) = (start_nanos, end_nanos) {
             buf.update_timing(s, e);

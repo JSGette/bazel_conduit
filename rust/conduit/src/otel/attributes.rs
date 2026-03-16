@@ -10,6 +10,7 @@ pub const BAZEL_PATTERNS: &str = "bazel.patterns";
 pub const BAZEL_EXIT_CODE: &str = "bazel.exit_code";
 pub const BAZEL_EXIT_CODE_NAME: &str = "bazel.exit_code_name";
 pub const BAZEL_ACTION_MODE: &str = "bazel.action_mode";
+pub const BAZEL_CRITICAL_PATH_LOG_URI: &str = "bazel.critical_path_log_uri";
 pub const BAZEL_STARTUP_OPTIONS: &str = "bazel.startup_options";
 pub const BAZEL_EXPLICIT_CMD_LINE: &str = "bazel.explicit_cmd_line";
 pub const BAZEL_TOOL_TAG: &str = "bazel.tool_tag";
@@ -37,11 +38,17 @@ pub const BAZEL_TARGET_ABORT_REASON: &str = "bazel.target.abort_reason";
 pub const BAZEL_TARGET_ABORT_DESCRIPTION: &str = "bazel.target.abort_description";
 pub const BAZEL_TARGET_CACHED: &str = "bazel.target.cached";
 pub const BAZEL_TARGET_TRIVIAL: &str = "bazel.target.trivial";
+pub const BAZEL_TARGET_SYNTHETIC: &str = "bazel.target.synthetic";
 pub const BAZEL_TARGET_TEST_SIZE: &str = "bazel.target.test_size";
 
 // Action span
 pub const BAZEL_ACTION_MNEMONIC: &str = "bazel.action.mnemonic";
 pub const BAZEL_ACTION_EXIT_CODE: &str = "bazel.action.exit_code";
+pub const BAZEL_ACTION_EXIT_CODE_NAME: &str = "bazel.action.exit_code_name";
+pub const BAZEL_ACTION_CACHED: &str = "bazel.action.cached";
+pub const BAZEL_ACTION_HOSTNAME: &str = "bazel.action.hostname";
+pub const BAZEL_ACTION_CACHED_REMOTELY: &str = "bazel.action.cached_remotely";
+pub const BAZEL_ACTION_RUNNER: &str = "bazel.action.runner";
 pub const BAZEL_ACTION_PRIMARY_OUTPUT: &str = "bazel.action.primary_output";
 pub const BAZEL_ACTION_SUCCESS: &str = "bazel.action.success";
 pub const BAZEL_ACTION_COMMAND_LINE: &str = "bazel.action.command_line";
@@ -83,13 +90,11 @@ pub const BAZEL_SPAWN_MEMORY_ESTIMATE_BYTES: &str = "bazel.spawn.memory_estimate
 pub const BAZEL_SPAWN_PARSE_TIME_MS: &str = "bazel.spawn.parse_time_ms";
 pub const BAZEL_SPAWN_DIGEST_SIZE_BYTES: &str = "bazel.spawn.digest_size_bytes";
 
-// BuildStarted extended
+// BuildStarted extended (use BAZEL_WORKSPACE_HOST/USER for host/user to avoid duplication)
 pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
 pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";
 pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
 pub const BAZEL_SERVER_PID: &str = "bazel.server_pid";
-pub const BAZEL_HOST: &str = "bazel.host";
-pub const BAZEL_USER: &str = "bazel.user";
 
 // Fetch span
 pub const BAZEL_FETCH_URL: &str = "bazel.fetch.url";

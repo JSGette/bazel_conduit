@@ -325,6 +325,14 @@ pub struct OtelMapper {
     /// Cached finish timestamp (nanos since epoch) from BuildFinished.
     finish_time_nanos: Option<i64>,
 
+    /// Root span start (nanos since epoch) used when creating the span.
+    /// Used with BuildMetrics wallTimeInMs to derive correct end for cached builds.
+    root_span_start_nanos: Option<i64>,
+
+    /// Root span end derived from start + wallTimeInMs when BuildMetrics provides it.
+    /// Takes precedence over finish_time_nanos so duration matches Bazel's wall time.
+    root_span_end_from_wall_nanos: Option<i64>,
+
     /// Named set cache: set_id → entry with direct files + child set refs.
     /// Used to resolve output files (transitively) when target spans complete.
     named_set_cache: HashMap<String, NamedSetEntry>,
@@ -375,6 +383,8 @@ impl OtelMapper {
             logger,
             exit_code: None,
             finish_time_nanos: None,
+            root_span_start_nanos: None,
+            root_span_end_from_wall_nanos: None,
             named_set_cache: HashMap::new(),
             pending_fetches: Vec::new(),
             pending_test_results: Vec::new(),
@@ -437,6 +447,7 @@ impl OtelMapper {
         };
         if let Some(nanos) = sanitized_start {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
+            self.root_span_start_nanos = Some(nanos);
         }
         let span = self.tracer.build_with_context(builder, &parent_cx);
         let cx = Context::new().with_span(span);
@@ -502,10 +513,12 @@ impl OtelMapper {
             cx.span().set_attribute(KeyValue::new(BAZEL_SERVER_PID, v));
         }
         if let Some(v) = host {
-            cx.span().set_attribute(KeyValue::new(BAZEL_HOST, v.to_string()));
+            cx.span()
+                .set_attribute(KeyValue::new(BAZEL_WORKSPACE_HOST, v.to_string()));
         }
         if let Some(v) = user {
-            cx.span().set_attribute(KeyValue::new(BAZEL_USER, v.to_string()));
+            cx.span()
+                .set_attribute(KeyValue::new(BAZEL_WORKSPACE_USER, v.to_string()));
         }
     }
 
@@ -562,8 +575,8 @@ impl OtelMapper {
         if let Some(cx) = &self.root_context {
             for (key, value) in items {
                 let attr_key = match key.as_str() {
-                    "BUILD_USER" => BAZEL_USER.to_string(),
-                    "BUILD_HOST" => BAZEL_HOST.to_string(),
+                    "BUILD_USER" => BAZEL_WORKSPACE_USER.to_string(),
+                    "BUILD_HOST" => BAZEL_WORKSPACE_HOST.to_string(),
                     _ => format!("bazel.workspace.{}", key.to_lowercase()),
                 };
                 cx.span()
@@ -864,7 +877,7 @@ impl OtelMapper {
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
             KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
-            KeyValue::new("bazel.target.synthetic", true),
+            KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
         ];
         let mut builder = self
             .tracer
@@ -918,9 +931,25 @@ impl OtelMapper {
         cx.span()
             .set_attribute(KeyValue::new(BAZEL_TARGET_SUCCESS, success));
 
+        let is_cached = !self.target_has_non_cached_action.get(label).copied().unwrap_or(false);
+        cx.span()
+            .set_attribute(KeyValue::new(BAZEL_TARGET_CACHED, is_cached));
+
         if !tags.is_empty() {
             cx.span()
                 .set_attribute(KeyValue::new(BAZEL_TARGET_TAGS, tags.join(", ")));
+        }
+
+        // Sub-ms target with no actions → mark trivial (e.g. alias, no-op).
+        if buffered_actions.is_empty() {
+            let duration_nanos = match (earliest_action_start_nanos, effective_end) {
+                (Some(s), Some(e)) if e > s => e - s,
+                _ => 0,
+            };
+            if duration_nanos < 1_000_000 {
+                cx.span()
+                    .set_attribute(KeyValue::new(BAZEL_TARGET_TRIVIAL, true));
+            }
         }
 
         let status = if success {
@@ -941,6 +970,7 @@ impl OtelMapper {
                     act.mnemonic.as_deref(),
                     act.success,
                     act.exit_code,
+                    act.exit_code_name.as_deref(),
                     act.primary_output.as_deref(),
                     act.configuration.as_deref(),
                     &act.command_line,
@@ -948,6 +978,10 @@ impl OtelMapper {
                     act.stderr_uri.as_deref(),
                     act.start_nanos,
                     act.end_nanos,
+                    act.cached,
+                    act.hostname.as_deref(),
+                    act.cached_remotely,
+                    act.runner.as_deref(),
                 );
             }
             self.target_contexts.remove(label);
@@ -1215,6 +1249,7 @@ impl OtelMapper {
         mnemonic: Option<&str>,
         success: bool,
         exit_code: Option<i32>,
+        exit_code_name: Option<&str>,
         primary_output: Option<&str>,
         configuration: Option<&str>,
         command_line: &[String],
@@ -1222,6 +1257,10 @@ impl OtelMapper {
         stderr_path: Option<&str>,
         start_time_nanos: Option<i64>,
         end_time_nanos: Option<i64>,
+        cached: Option<bool>,
+        hostname: Option<&str>,
+        cached_remotely: Option<bool>,
+        runner: Option<&str>,
     ) {
         if let Some(l) = label {
             self.ensure_target_span(l, start_time_nanos);
@@ -1246,6 +1285,9 @@ impl OtelMapper {
         // Track action for cached-target detection.
         if let Some(l) = label {
             *self.target_action_counts.entry(l.to_string()).or_insert(0) += 1;
+            if cached == Some(false) {
+                self.target_has_non_cached_action.insert(l.to_string(), true);
+            }
         }
 
         let span_name = match (label, mnemonic) {
@@ -1261,6 +1303,21 @@ impl OtelMapper {
         }
         if let Some(code) = exit_code {
             attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE, code as i64));
+        }
+        if let Some(name) = exit_code_name.filter(|s| !s.is_empty()) {
+            attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE_NAME, name.to_string()));
+        }
+        if let Some(c) = cached {
+            attrs.push(KeyValue::new(BAZEL_ACTION_CACHED, c));
+        }
+        if let Some(h) = hostname.filter(|s| !s.is_empty()) {
+            attrs.push(KeyValue::new(BAZEL_ACTION_HOSTNAME, h.to_string()));
+        }
+        if let Some(cr) = cached_remotely {
+            attrs.push(KeyValue::new(BAZEL_ACTION_CACHED_REMOTELY, cr));
+        }
+        if let Some(r) = runner.filter(|s| !s.is_empty()) {
+            attrs.push(KeyValue::new(BAZEL_ACTION_RUNNER, r.to_string()));
         }
         if let Some(output) = primary_output {
             attrs.push(KeyValue::new(
@@ -1717,6 +1774,11 @@ impl OtelMapper {
         if let Some(t) = obj.get("timingMetrics").and_then(|v| v.as_object()) {
             if let Some(v) = t.get("wallTimeInMs").and_then(|v| v.as_i64()) {
                 cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_WALL_TIME_MS, v));
+                // Use wall time for root span end so duration is correct (e.g. fully cached builds).
+                if let Some(start) = self.root_span_start_nanos {
+                    self.root_span_end_from_wall_nanos =
+                        Some(start + v.saturating_mul(1_000_000));
+                }
             }
             if let Some(v) = t.get("cpuTimeInMs").and_then(|v| v.as_i64()) {
                 cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CPU_TIME_MS, v));
@@ -1831,7 +1893,7 @@ impl OtelMapper {
     // Build tool logs (critical path)
     // =====================================================================
 
-    /// BuildToolLogs → extract critical path info and emit as span event.
+    /// BuildToolLogs → extract critical path info, set root attribute for URI, emit span event.
     pub fn on_build_tool_logs(&mut self, logs: &serde_json::Value) {
         let Some(cx) = &self.root_context else { return };
         if let Some(entries) = logs.get("log").and_then(|v| v.as_array()) {
@@ -1839,6 +1901,12 @@ impl OtelMapper {
                 let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if name == "critical path" || name.contains("critical") {
                     let uri = entry.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                    if !uri.is_empty() {
+                        cx.span().set_attribute(KeyValue::new(
+                            BAZEL_CRITICAL_PATH_LOG_URI,
+                            uri.to_string(),
+                        ));
+                    }
                     cx.span().add_event(
                         "build_tool_log",
                         vec![
@@ -1886,6 +1954,8 @@ impl OtelMapper {
         self.progress_stdout.clear();
         self.exit_code = None;
         self.finish_time_nanos = None;
+        self.root_span_start_nanos = None;
+        self.root_span_end_from_wall_nanos = None;
         self.named_set_cache.clear();
         self.pending_fetches.clear();
         self.pending_test_results.clear();
@@ -1913,7 +1983,7 @@ impl OtelMapper {
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
             KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
-            KeyValue::new("bazel.target.synthetic", true),
+            KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
         ];
         let mut builder = self
             .tracer
@@ -1935,6 +2005,7 @@ impl OtelMapper {
                 act.mnemonic.as_deref(),
                 act.success,
                 act.exit_code,
+                act.exit_code_name.as_deref(),
                 act.primary_output.as_deref(),
                 act.configuration.as_deref(),
                 &act.command_line,
@@ -1942,6 +2013,10 @@ impl OtelMapper {
                 act.stderr_uri.as_deref(),
                 act.start_nanos,
                 act.end_nanos,
+                act.cached,
+                act.hostname.as_deref(),
+                act.cached_remotely,
+                act.runner.as_deref(),
             );
         }
         let cx = self.target_contexts.remove(label).unwrap_or(cx);
@@ -2107,7 +2182,8 @@ impl OtelMapper {
             };
             cx.span().set_status(status);
 
-            if let Some(nanos) = self.finish_time_nanos {
+            let end_nanos = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
+            if let Some(nanos) = end_nanos {
                 cx.span().end_with_timestamp(nanos_to_system_time(nanos));
             } else {
                 cx.span().end();

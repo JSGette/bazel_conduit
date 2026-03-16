@@ -6,8 +6,13 @@ use super::decoder::BepJsonEvent;
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
-use crate::otel::OtelMapper;
+use crate::build_event_stream::ActionExecuted;
+use crate::otel::{build_invocation_resource, init_tracer_provider_with_resource, ExportConfig, OtelMapper};
 use crate::state::{ActionProcessingMode, BuildState};
+use opentelemetry::logs::LoggerProvider as _;
+use opentelemetry::trace::TracerProvider;
+use prost::Message;
+use spawn_proto::tools::protos::SpawnExec;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, info, trace};
@@ -39,6 +44,10 @@ pub enum RouterError {
 pub struct EventRouter {
     state: BuildState,
     mapper: Option<OtelMapper>,
+    /// When set, tracer and mapper are created on first Started with invocation resource.
+    export_config: Option<ExportConfig>,
+    logger_provider: Option<opentelemetry_sdk::logs::LoggerProvider>,
+    tracer_provider: Option<opentelemetry_sdk::trace::TracerProvider>,
 }
 
 impl EventRouter {
@@ -47,13 +56,53 @@ impl EventRouter {
         Self {
             state: BuildState::new(),
             mapper: None,
+            export_config: None,
+            logger_provider: None,
+            tracer_provider: None,
         }
     }
 
-    /// Attach an OTel mapper for span generation.
+    /// Use OTel export with invocation-scoped Resource (mapper created on first Started).
+    pub fn with_export(
+        mut self,
+        config: ExportConfig,
+        logger_provider: opentelemetry_sdk::logs::LoggerProvider,
+    ) -> Self {
+        self.export_config = Some(config);
+        self.logger_provider = Some(logger_provider);
+        self
+    }
+
+    /// Attach an OTel mapper for span generation (legacy; use with_export for Resource attributes).
     pub fn with_mapper(mut self, mapper: OtelMapper) -> Self {
         self.mapper = Some(mapper);
         self
+    }
+
+    /// Create tracer and mapper on first Started so Resource has invocation_id, command, etc.
+    fn ensure_mapper_for_started(
+        &mut self,
+        invocation_id: &str,
+        command: &str,
+        workspace_dir: Option<&str>,
+    ) {
+        if self.mapper.is_some() {
+            return;
+        }
+        let Some(config) = self.export_config.as_ref() else {
+            return;
+        };
+        let resource = build_invocation_resource(invocation_id, command, workspace_dir);
+        let Ok(Some(provider)) = init_tracer_provider_with_resource(config, resource) else {
+            return;
+        };
+        let logger = self
+            .logger_provider
+            .as_ref()
+            .map(|lp| lp.logger("conduit"));
+        let mapper = OtelMapper::new(provider.tracer("conduit"), logger);
+        self.tracer_provider = Some(provider);
+        self.mapper = Some(mapper);
     }
 
     /// Get a reference to the build state
@@ -77,6 +126,20 @@ impl EventRouter {
         }
     }
 
+    /// Shutdown tracer and logger providers (call after finish when using with_export).
+    pub fn shutdown_providers(&mut self) -> anyhow::Result<()> {
+        self.finish();
+        if let Some(p) = self.tracer_provider.take() {
+            p.shutdown()?;
+        }
+        if let Some(lp) = self.logger_provider.take() {
+            lp.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+impl EventRouter {
     /// Route a BEP JSON event to the appropriate handler
     pub fn route(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         let event_type = event.event_type().ok_or(RouterError::MissingEventId)?;
@@ -168,6 +231,11 @@ impl EventRouter {
                     mapper.reset();
                 }
                 if let Some(BepPayload::Started(s)) = &event.payload {
+                    self.ensure_mapper_for_started(
+                        if s.uuid.is_empty() { "unknown" } else { &s.uuid },
+                        if s.command.is_empty() { "unknown" } else { &s.command },
+                        Some(s.workspace_directory.as_str()).filter(|d| !d.is_empty()),
+                    );
                     let start_time_nanos = s
                         .start_time
                         .as_ref()
@@ -470,18 +538,25 @@ impl EventRouter {
                         let end_nanos = act.end_time.as_ref().map(|ts| {
                             ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
                         });
+                        let (cached_from_spawn, runner_from_spawn) =
+                            extract_spawn_exec_from_action(act);
                         self.state.record_and_buffer_action(
                             label,
                             Some(act.r#type.clone()),
                             Some(primary_output),
                             act.success,
                             Some(act.exit_code),
+                            None,
                             configuration,
                             act.command_line.clone(),
                             stdout_uri,
                             stderr_uri,
                             start_nanos,
                             end_nanos,
+                            cached_from_spawn,
+                            None,
+                            None,
+                            runner_from_spawn,
                         );
                     }
                 }
@@ -679,6 +754,12 @@ impl EventRouter {
         if let Some(started) = payload {
             let uuid = started.get("uuid").and_then(|v| v.as_str());
             let command = started.get("command").and_then(|v| v.as_str());
+            let workspace_dir = started.get("workspaceDirectory").and_then(|v| v.as_str());
+            self.ensure_mapper_for_started(
+                uuid.unwrap_or("unknown"),
+                command.unwrap_or("unknown"),
+                workspace_dir,
+            );
             let start_time_millis = started.get("startTimeMillis").and_then(|v| v.as_i64());
             // Prefer the proto Timestamp field; do NOT fall back to the
             // deprecated start_time_millis — it can hold a stale Bazel-server
@@ -1261,12 +1342,19 @@ impl EventRouter {
                 exit_code,
             );
 
+            let exit_code_name = payload
+                .and_then(|a| a.get("failureDetail"))
+                .and_then(|f| f.get("message"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+
             if let Some(mapper) = &mut self.mapper {
                 mapper.on_action_completed(
                     label,
                     mnemonic,
                     success,
                     exit_code,
+                    exit_code_name,
                     primary_output,
                     configuration,
                     &command_line,
@@ -1274,6 +1362,10 @@ impl EventRouter {
                     stderr_path,
                     start_time_nanos,
                     end_time_nanos,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
             }
         }
@@ -1588,6 +1680,14 @@ impl Default for EventRouter {
     }
 }
 
+impl Drop for EventRouter {
+    fn drop(&mut self) {
+        self.finish();
+        let _ = self.tracer_provider.take().map(|p| p.shutdown());
+        let _ = self.logger_provider.take().map(|lp| lp.shutdown());
+    }
+}
+
 /// Check for --build_event_publish_all_actions with exact matching.
 /// Explicitly rejects --nobuild_event_publish_all_actions* and =false/=0 to avoid false positives.
 fn has_publish_all_actions_flag(options: &[&str]) -> bool {
@@ -1642,4 +1742,20 @@ fn bep_event_type_name(id: &crate::build_event_stream::build_event_id::Id) -> &'
         Id::ExecRequest(_) => "ExecRequest",
         Id::Unknown(_) => "Unknown",
     }
+}
+
+/// Extract SpawnExec from ActionExecuted.strategy_details (first successful decode).
+/// Returns (cached, runner) for use on action spans.
+fn extract_spawn_exec_from_action(act: &ActionExecuted) -> (Option<bool>, Option<String>) {
+    for any in &act.strategy_details {
+        if let Ok(exec) = SpawnExec::decode(any.value.as_ref()) {
+            let runner = if exec.runner.is_empty() {
+                None
+            } else {
+                Some(exec.runner.clone())
+            };
+            return (Some(exec.cache_hit), runner);
+        }
+    }
+    (None, None)
 }

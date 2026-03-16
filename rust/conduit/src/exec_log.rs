@@ -410,7 +410,7 @@ fn emit_unmatched_under_synthetic_targets(
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.clone()),
             KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
-            KeyValue::new("bazel.target.synthetic", true),
+            KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
         ];
 
         let mut builder = tracer

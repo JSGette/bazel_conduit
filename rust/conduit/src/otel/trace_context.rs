@@ -42,8 +42,64 @@ pub fn make_root_context(trace_id: TraceId) -> Context {
     Context::new().with_remote_span_context(sc)
 }
 
+/// Build Resource attributes for an invocation (invariant for the trace).
+/// Used when creating the TracerProvider so these appear on every span via Resource.
+pub fn build_invocation_resource(
+    invocation_id: &str,
+    command: &str,
+    workspace_dir: Option<&str>,
+) -> Vec<KeyValue> {
+    let mut attrs = vec![
+        KeyValue::new("service.name", "bazel"),
+        KeyValue::new("telemetry.sdk.name", "conduit"),
+        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("bazel.invocation_id", invocation_id.to_string()),
+        KeyValue::new("bazel.command", command.to_string()),
+    ];
+    if let Some(d) = workspace_dir.filter(|s| !s.is_empty()) {
+        attrs.push(KeyValue::new("bazel.workspace.directory", d.to_string()));
+    }
+    attrs
+}
+
+/// Initialise an OpenTelemetry [`TracerProvider`] with the given resource attributes.
+/// Use [`build_invocation_resource`] when creating the provider on first BuildStarted
+/// so invocation-scoped attributes are on the Resource.
+pub fn init_tracer_provider_with_resource(
+    config: &ExportConfig,
+    resource_attrs: Vec<KeyValue>,
+) -> anyhow::Result<Option<TracerProvider>> {
+    if matches!(config, ExportConfig::None) {
+        return Ok(None);
+    }
+    let resource = Resource::new(resource_attrs);
+    match config {
+        ExportConfig::None => Ok(None),
+        ExportConfig::Stdout => {
+            let exporter = opentelemetry_stdout::SpanExporter::default();
+            let provider = TracerProvider::builder()
+                .with_simple_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+        ExportConfig::Otlp { endpoint } => {
+            use opentelemetry_otlp::WithExportConfig;
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()?;
+            let provider = TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+    }
+}
+
 /// Initialise an OpenTelemetry [`TracerProvider`] according to the export
-/// configuration.
+/// configuration (default resource without invocation attributes).
 ///
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<TracerProvider>> {
