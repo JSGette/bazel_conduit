@@ -42,6 +42,54 @@ pub fn make_root_context(trace_id: TraceId) -> Context {
     Context::new().with_remote_span_context(sc)
 }
 
+fn default_resource() -> Resource {
+    Resource::new(vec![
+        KeyValue::new("service.name", "bazel"),
+        KeyValue::new("telemetry.sdk.name", "conduit"),
+        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
+    ])
+}
+
+fn build_tracer_provider(
+    config: &ExportConfig,
+    resource: Resource,
+) -> anyhow::Result<Option<TracerProvider>> {
+    match config {
+        ExportConfig::None => Ok(None),
+        ExportConfig::Stdout => {
+            let exporter = opentelemetry_stdout::SpanExporter::default();
+            let provider = TracerProvider::builder()
+                .with_simple_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+        ExportConfig::Otlp { endpoint } => {
+            use opentelemetry_otlp::WithExportConfig;
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()?;
+            let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
+                .with_max_queue_size(65536)
+                .with_max_export_batch_size(4096)
+                .build();
+            let batch_processor =
+                opentelemetry_sdk::trace::BatchSpanProcessor::builder(
+                    exporter,
+                    opentelemetry_sdk::runtime::Tokio,
+                )
+                .with_batch_config(batch_config)
+                .build();
+            let provider = TracerProvider::builder()
+                .with_span_processor(batch_processor)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+    }
+}
+
 /// Build Resource attributes for an invocation (invariant for the trace).
 /// Used when creating the TracerProvider so these appear on every span via Resource.
 pub fn build_invocation_resource(
@@ -62,76 +110,19 @@ pub fn build_invocation_resource(
     attrs
 }
 
-/// Initialise an OpenTelemetry [`TracerProvider`] with the given resource attributes.
-/// Use [`build_invocation_resource`] when creating the provider on first BuildStarted
-/// so invocation-scoped attributes are on the Resource.
+/// Initialise a [`TracerProvider`] with the given resource attributes.
 pub fn init_tracer_provider_with_resource(
     config: &ExportConfig,
     resource_attrs: Vec<KeyValue>,
 ) -> anyhow::Result<Option<TracerProvider>> {
-    if matches!(config, ExportConfig::None) {
-        return Ok(None);
-    }
-    let resource = Resource::new(resource_attrs);
-    match config {
-        ExportConfig::None => Ok(None),
-        ExportConfig::Stdout => {
-            let exporter = opentelemetry_stdout::SpanExporter::default();
-            let provider = TracerProvider::builder()
-                .with_simple_exporter(exporter)
-                .with_resource(resource)
-                .build();
-            Ok(Some(provider))
-        }
-        ExportConfig::Otlp { endpoint } => {
-            use opentelemetry_otlp::WithExportConfig;
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()?;
-            let provider = TracerProvider::builder()
-                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                .with_resource(resource)
-                .build();
-            Ok(Some(provider))
-        }
-    }
+    build_tracer_provider(config, Resource::new(resource_attrs))
 }
 
-/// Initialise an OpenTelemetry [`TracerProvider`] according to the export
-/// configuration (default resource without invocation attributes).
+/// Initialise a [`TracerProvider`] with the default resource (no invocation attributes).
 ///
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<TracerProvider>> {
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", "bazel"),
-        KeyValue::new("telemetry.sdk.name", "conduit"),
-        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
-    ]);
-
-    match config {
-        ExportConfig::None => Ok(None),
-        ExportConfig::Stdout => {
-            let exporter = opentelemetry_stdout::SpanExporter::default();
-            let provider = TracerProvider::builder()
-                .with_simple_exporter(exporter)
-                .with_resource(resource)
-                .build();
-            Ok(Some(provider))
-        }
-        ExportConfig::Otlp { endpoint } => {
-            use opentelemetry_otlp::WithExportConfig;
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()?;
-            let provider = TracerProvider::builder()
-                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                .with_resource(resource)
-                .build();
-            Ok(Some(provider))
-        }
-    }
+    build_tracer_provider(config, default_resource())
 }
 
 /// Initialise an OpenTelemetry [`LoggerProvider`] according to the export
@@ -139,12 +130,7 @@ pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<Trac
 ///
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_logger_provider(config: &ExportConfig) -> anyhow::Result<Option<LoggerProvider>> {
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", "bazel"),
-        KeyValue::new("telemetry.sdk.name", "conduit"),
-        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
-    ]);
-
+    let resource = default_resource();
     match config {
         ExportConfig::None => Ok(None),
         ExportConfig::Stdout => {
@@ -167,5 +153,54 @@ pub fn init_logger_provider(config: &ExportConfig) -> anyhow::Result<Option<Logg
                 .build();
             Ok(Some(provider))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_to_trace_id_deterministic() {
+        let id = uuid_to_trace_id("87c2c198-4f8e-403d-8068-62a5518167de");
+        let bytes = id.to_bytes();
+        assert_eq!(bytes[0], 0x87);
+        assert_eq!(bytes[1], 0xc2);
+        assert_ne!(bytes, [0u8; 16]);
+
+        let id2 = uuid_to_trace_id("87c2c198-4f8e-403d-8068-62a5518167de");
+        assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn uuid_to_trace_id_invalid_falls_back() {
+        let id = uuid_to_trace_id("not-a-uuid");
+        assert_ne!(id.to_bytes(), [0u8; 16]);
+    }
+
+    #[test]
+    fn build_invocation_resource_basic() {
+        let attrs = build_invocation_resource("abc-123", "build", None);
+        assert!(attrs.iter().any(|kv| kv.key.as_str() == "bazel.invocation_id"));
+        assert!(attrs.iter().any(|kv| kv.key.as_str() == "bazel.command"));
+        assert!(!attrs.iter().any(|kv| kv.key.as_str() == "bazel.workspace.directory"));
+    }
+
+    #[test]
+    fn build_invocation_resource_with_workspace() {
+        let attrs = build_invocation_resource("abc", "test", Some("/home/user/proj"));
+        assert!(attrs.iter().any(|kv| kv.key.as_str() == "bazel.workspace.directory"));
+    }
+
+    #[test]
+    fn init_tracer_provider_none_returns_none() {
+        let result = init_tracer_provider(&ExportConfig::None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn init_tracer_provider_with_resource_none_returns_none() {
+        let result = init_tracer_provider_with_resource(&ExportConfig::None, vec![]).unwrap();
+        assert!(result.is_none());
     }
 }

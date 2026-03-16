@@ -72,3 +72,12 @@ rust_test(
         ":conduit_lib",
     ],
 )
+
+rust_test(
+    name = "router_tests",
+    srcs = ["tests/router_tests.rs"],
+    deps = [
+        ":conduit_lib",
+        "@crates//:serde_json",
+    ],
+)

@@ -113,6 +113,64 @@ fn bytestream_uri_to_display(uri: &str) -> Cow<'_, str> {
     Cow::Borrowed(uri)
 }
 
+/// Arguments for [`OtelMapper::on_action_completed`].
+pub struct ActionCompletedEvent<'a> {
+    pub label: Option<&'a str>,
+    pub mnemonic: Option<&'a str>,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub exit_code_name: Option<&'a str>,
+    pub primary_output: Option<&'a str>,
+    pub configuration: Option<&'a str>,
+    pub command_line: &'a [String],
+    pub stdout_path: Option<&'a str>,
+    pub stderr_path: Option<&'a str>,
+    pub start_time_nanos: Option<i64>,
+    pub end_time_nanos: Option<i64>,
+    pub cached: Option<bool>,
+    pub hostname: Option<&'a str>,
+    pub cached_remotely: Option<bool>,
+    pub runner: Option<&'a str>,
+}
+
+impl<'a> ActionCompletedEvent<'a> {
+    pub fn from_buffered(act: &'a BufferedAction) -> Self {
+        Self {
+            label: act.label.as_deref(),
+            mnemonic: act.mnemonic.as_deref(),
+            success: act.success,
+            exit_code: act.exit_code,
+            exit_code_name: act.exit_code_name.as_deref(),
+            primary_output: act.primary_output.as_deref(),
+            configuration: act.configuration.as_deref(),
+            command_line: &act.command_line,
+            stdout_path: act.stdout_uri.as_deref(),
+            stderr_path: act.stderr_uri.as_deref(),
+            start_time_nanos: act.start_nanos,
+            end_time_nanos: act.end_nanos,
+            cached: act.cached,
+            hostname: act.hostname.as_deref(),
+            cached_remotely: act.cached_remotely,
+            runner: act.runner.as_deref(),
+        }
+    }
+}
+
+/// Arguments for [`OtelMapper::on_test_result`].
+pub struct TestResultEvent<'a> {
+    pub label: &'a str,
+    pub status: Option<&'a str>,
+    pub attempt: Option<i32>,
+    pub run: Option<i32>,
+    pub shard: Option<i32>,
+    pub cached: Option<bool>,
+    pub strategy: Option<&'a str>,
+    pub start_time_nanos: Option<i64>,
+    pub duration_nanos: Option<i64>,
+    pub hostname: Option<&'a str>,
+    pub cached_remotely: Option<bool>,
+}
+
 /// Key for caching action span context for exec log enrichment.
 /// Matches SpawnExec entries by target_label, mnemonic, and primary output.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -395,6 +453,76 @@ impl OtelMapper {
     }
 
     // =====================================================================
+    // Private helpers
+    // =====================================================================
+
+    /// Set an attribute on the root span (no-op if root span not yet created).
+    fn set_root_attr(&self, kv: KeyValue) {
+        if let Some(cx) = &self.root_context {
+            cx.span().set_attribute(kv);
+        }
+    }
+
+    /// Add an event to the root span (no-op if root span not yet created).
+    fn add_root_event(&self, name: &'static str, attrs: Vec<KeyValue>) {
+        if let Some(cx) = &self.root_context {
+            cx.span().add_event(name, attrs);
+        }
+    }
+
+    /// Build a child span with the given attributes, set its status, and end it.
+    /// Returns the finished span's `SpanContext` for cache/linking purposes.
+    fn build_and_end_child_span(
+        &self,
+        parent: &Context,
+        name: String,
+        kind: SpanKind,
+        attrs: Vec<KeyValue>,
+        status: Status,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> SpanContext {
+        let mut builder = self
+            .tracer
+            .span_builder(name)
+            .with_kind(kind)
+            .with_attributes(attrs);
+        if let Some(nanos) = start_time {
+            builder = builder.with_start_time(nanos_to_system_time(nanos));
+        }
+        let mut span = self.tracer.build_with_context(builder, parent);
+        let span_cx = span.span_context().clone();
+        span.set_status(status);
+        if let Some(nanos) = end_time {
+            span.end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            span.end();
+        }
+        span_cx
+    }
+
+    /// Lazily create a group span (e.g. "skipped targets", "fetches", "external deps")
+    /// under the root span. Returns the existing context if already created.
+    fn ensure_group_span(
+        slot: &mut Option<Context>,
+        root_context: &Option<Context>,
+        tracer: &opentelemetry_sdk::trace::Tracer,
+        name: &'static str,
+    ) {
+        if slot.is_some() {
+            return;
+        }
+        if let Some(root_cx) = root_context {
+            let builder = tracer
+                .span_builder(name)
+                .with_kind(SpanKind::Internal);
+            let span = tracer.build_with_context(builder, root_cx);
+            *slot = Some(Context::new().with_span(span));
+            debug!("Created '{name}' parent span");
+        }
+    }
+
+    // =====================================================================
     // Lifecycle events
     // =====================================================================
 
@@ -468,20 +596,20 @@ impl OtelMapper {
         if !self.pending_test_results.is_empty() {
             let buffered: Vec<_> = std::mem::take(&mut self.pending_test_results);
             info!("Replaying {} buffered test result events", buffered.len());
-            for b in buffered {
-                self.on_test_result(
-                    &b.label,
-                    b.status.as_deref(),
-                    b.attempt,
-                    b.run,
-                    b.shard,
-                    b.cached,
-                    b.strategy.as_deref(),
-                    b.start_time_nanos,
-                    b.duration_nanos,
-                    b.hostname.as_deref(),
-                    b.cached_remotely,
-                );
+            for b in &buffered {
+                self.on_test_result(&TestResultEvent {
+                    label: &b.label,
+                    status: b.status.as_deref(),
+                    attempt: b.attempt,
+                    run: b.run,
+                    shard: b.shard,
+                    cached: b.cached,
+                    strategy: b.strategy.as_deref(),
+                    start_time_nanos: b.start_time_nanos,
+                    duration_nanos: b.duration_nanos,
+                    hostname: b.hostname.as_deref(),
+                    cached_remotely: b.cached_remotely,
+                });
             }
         }
     }
@@ -496,29 +624,29 @@ impl OtelMapper {
         host: Option<&str>,
         user: Option<&str>,
     ) {
-        let Some(cx) = &self.root_context else { return };
+        if self.root_context.is_none() {
+            return;
+        }
         if let Some(v) = workspace_dir {
-            cx.span().set_attribute(KeyValue::new(BAZEL_WORKSPACE_DIR, v.to_string()));
+            self.set_root_attr(KeyValue::new(BAZEL_WORKSPACE_DIR, v.to_string()));
             if !v.is_empty() {
                 self.workspace_directory = Some(PathBuf::from(v));
             }
         }
         if let Some(v) = working_dir {
-            cx.span().set_attribute(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
+            self.set_root_attr(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
         }
         if let Some(v) = build_tool_version {
-            cx.span().set_attribute(KeyValue::new(BAZEL_BUILD_TOOL_VERSION, v.to_string()));
+            self.set_root_attr(KeyValue::new(BAZEL_BUILD_TOOL_VERSION, v.to_string()));
         }
         if let Some(v) = server_pid {
-            cx.span().set_attribute(KeyValue::new(BAZEL_SERVER_PID, v));
+            self.set_root_attr(KeyValue::new(BAZEL_SERVER_PID, v));
         }
         if let Some(v) = host {
-            cx.span()
-                .set_attribute(KeyValue::new(BAZEL_WORKSPACE_HOST, v.to_string()));
+            self.set_root_attr(KeyValue::new(BAZEL_WORKSPACE_HOST, v.to_string()));
         }
         if let Some(v) = user {
-            cx.span()
-                .set_attribute(KeyValue::new(BAZEL_WORKSPACE_USER, v.to_string()));
+            self.set_root_attr(KeyValue::new(BAZEL_WORKSPACE_USER, v.to_string()));
         }
     }
 
@@ -528,38 +656,24 @@ impl OtelMapper {
         startup_options: &[String],
         explicit_cmd_line: &[String],
     ) {
-        if let Some(cx) = &self.root_context {
-            if !startup_options.is_empty() {
-                cx.span().set_attribute(KeyValue::new(
-                    BAZEL_STARTUP_OPTIONS,
-                    startup_options.join(" "),
-                ));
-            }
-            if !explicit_cmd_line.is_empty() {
-                cx.span().set_attribute(KeyValue::new(
-                    BAZEL_EXPLICIT_CMD_LINE,
-                    explicit_cmd_line.join(" "),
-                ));
-            }
+        if !startup_options.is_empty() {
+            self.set_root_attr(KeyValue::new(BAZEL_STARTUP_OPTIONS, startup_options.join(" ")));
+        }
+        if !explicit_cmd_line.is_empty() {
+            self.set_root_attr(KeyValue::new(BAZEL_EXPLICIT_CMD_LINE, explicit_cmd_line.join(" ")));
         }
     }
 
     /// OptionsParsed → extract tool_tag if present.
     pub fn on_tool_tag(&mut self, tool_tag: &str) {
         if !tool_tag.is_empty() {
-            if let Some(cx) = &self.root_context {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_TOOL_TAG, tool_tag.to_string()));
-            }
+            self.set_root_attr(KeyValue::new(BAZEL_TOOL_TAG, tool_tag.to_string()));
         }
     }
 
     /// ActionMode → record the detected processing mode on the root span.
     pub fn on_action_mode(&mut self, mode: crate::state::ActionProcessingMode) {
-        if let Some(cx) = &self.root_context {
-            cx.span()
-                .set_attribute(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
-        }
+        self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
     }
 
     /// Execution log path detected (from --execution_log_binary_file=).
@@ -572,52 +686,41 @@ impl OtelMapper {
     /// BUILD_USER and BUILD_HOST are mapped to bazel.user/bazel.host directly
     /// (same semantic as the BuildStarted fields) to avoid duplication.
     pub fn on_workspace_status(&mut self, items: &HashMap<String, String>) {
-        if let Some(cx) = &self.root_context {
-            for (key, value) in items {
-                let attr_key = match key.as_str() {
-                    "BUILD_USER" => BAZEL_WORKSPACE_USER.to_string(),
-                    "BUILD_HOST" => BAZEL_WORKSPACE_HOST.to_string(),
-                    _ => format!("bazel.workspace.{}", key.to_lowercase()),
-                };
-                cx.span()
-                    .set_attribute(KeyValue::new(attr_key, value.clone()));
-            }
+        for (key, value) in items {
+            let attr_key = match key.as_str() {
+                "BUILD_USER" => BAZEL_WORKSPACE_USER.to_string(),
+                "BUILD_HOST" => BAZEL_WORKSPACE_HOST.to_string(),
+                _ => format!("bazel.workspace.{}", key.to_lowercase()),
+            };
+            self.set_root_attr(KeyValue::new(attr_key, value.clone()));
         }
     }
 
     /// UnstructuredCommandLine → add full command line as attribute.
     pub fn on_command_line(&mut self, args: &[String]) {
-        if let Some(cx) = &self.root_context {
-            if !args.is_empty() {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_COMMAND_LINE, args.join(" ")));
-            }
+        if !args.is_empty() {
+            self.set_root_attr(KeyValue::new(BAZEL_COMMAND_LINE, args.join(" ")));
         }
     }
 
     /// Pattern expanded → add build patterns as attribute and enrich root span name.
     pub fn on_pattern(&mut self, patterns: &[String]) {
-        if let Some(cx) = &self.root_context {
-            if !patterns.is_empty() {
-                self.cached_patterns = patterns.to_vec();
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_PATTERNS, patterns.join(", ")));
-                if let Some(cmd) = &self.cached_command {
-                    cx.span().update_name(format!("bazel {} {}", cmd, patterns.join(" ")));
-                }
+        if !patterns.is_empty() {
+            self.cached_patterns = patterns.to_vec();
+            self.set_root_attr(KeyValue::new(BAZEL_PATTERNS, patterns.join(", ")));
+            if let (Some(cmd), Some(cx)) = (&self.cached_command, &self.root_context) {
+                cx.span().update_name(format!("bazel {} {}", cmd, patterns.join(" ")));
             }
         }
     }
 
     /// PatternSkipped → add skipped patterns as span event on root.
     pub fn on_pattern_skipped(&mut self, patterns: &[String]) {
-        if let Some(cx) = &self.root_context {
-            if !patterns.is_empty() {
-                cx.span().add_event(
-                    "pattern_skipped",
-                    vec![KeyValue::new(BAZEL_PATTERNS, patterns.join(", "))],
-                );
-            }
+        if !patterns.is_empty() {
+            self.add_root_event(
+                "pattern_skipped",
+                vec![KeyValue::new(BAZEL_PATTERNS, patterns.join(", "))],
+            );
         }
     }
 
@@ -630,22 +733,14 @@ impl OtelMapper {
         description: Option<&str>,
         event_time_nanos: Option<i64>,
     ) {
-        // Lazily create the "skipped" parent span.
-        if self.skipped_context.is_none() {
-            if let Some(root) = &self.root_context {
-                let builder = self
-                    .tracer
-                    .span_builder("skipped targets")
-                    .with_kind(SpanKind::Internal);
-                let span = self.tracer.build_with_context(builder, root);
-                self.skipped_context = Some(Context::new().with_span(span));
-            }
-        }
+        Self::ensure_group_span(
+            &mut self.skipped_context,
+            &self.root_context,
+            &self.tracer,
+            "skipped targets",
+        );
 
-        let parent = match &self.skipped_context {
-            Some(cx) => cx,
-            None => return,
-        };
+        let Some(parent) = &self.skipped_context else { return };
 
         let short = shorten_label(label);
         let mut attrs = vec![
@@ -660,24 +755,17 @@ impl OtelMapper {
             attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_DESCRIPTION, d.to_string()));
         }
 
-        let builder = self
-            .tracer
-            .span_builder(format!("target {short}"))
-            .with_kind(SpanKind::Internal)
-            .with_attributes(attrs);
-
-        let mut span = self.tracer.build_with_context(builder, parent);
-        span.set_status(Status::Error {
-            description: std::borrow::Cow::Owned(
-                description.unwrap_or("aborted").to_string(),
-            ),
-        });
-        if let Some(nanos) = event_time_nanos {
-            span.end_with_timestamp(nanos_to_system_time(nanos));
-        } else {
-            span.end();
-        }
-
+        self.build_and_end_child_span(
+            parent,
+            format!("target {short}"),
+            SpanKind::Internal,
+            attrs,
+            Status::Error {
+                description: Cow::Owned(description.unwrap_or("aborted").to_string()),
+            },
+            None,
+            event_time_nanos,
+        );
         debug!("Created aborted-label span for {label}");
     }
 
@@ -696,17 +784,15 @@ impl OtelMapper {
             self.configurations
                 .insert(config_id.to_string(), m.to_string());
         }
-        if let Some(cx) = &self.root_context {
-            let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
-            if let Some(m) = mnemonic {
-                attrs.push(KeyValue::new(BAZEL_CONFIG_MNEMONIC, m.to_string()));
-            }
-            if let Some(p) = platform {
-                attrs.push(KeyValue::new(BAZEL_CONFIG_PLATFORM, p.to_string()));
-            }
-            cx.span().add_event("configuration", attrs);
-            debug!("Added configuration event: {config_id}");
+        let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
+        if let Some(m) = mnemonic {
+            attrs.push(KeyValue::new(BAZEL_CONFIG_MNEMONIC, m.to_string()));
         }
+        if let Some(p) = platform {
+            attrs.push(KeyValue::new(BAZEL_CONFIG_PLATFORM, p.to_string()));
+        }
+        self.add_root_event("configuration", attrs);
+        debug!("Added configuration event: {config_id}");
     }
 
     /// Configuration with cpu/is_tool → add to root span event.
@@ -716,18 +802,14 @@ impl OtelMapper {
         cpu: Option<&str>,
         is_tool: Option<bool>,
     ) {
-        if let Some(cx) = &self.root_context {
-            let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
-            if let Some(c) = cpu {
-                attrs.push(KeyValue::new(BAZEL_CONFIG_CPU, c.to_string()));
-            }
-            if let Some(t) = is_tool {
-                attrs.push(KeyValue::new(BAZEL_CONFIG_IS_TOOL, t));
-            }
-            if !attrs.is_empty() {
-                cx.span().add_event("configuration_detail", attrs);
-            }
+        let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
+        if let Some(c) = cpu {
+            attrs.push(KeyValue::new(BAZEL_CONFIG_CPU, c.to_string()));
         }
+        if let Some(t) = is_tool {
+            attrs.push(KeyValue::new(BAZEL_CONFIG_IS_TOOL, t));
+        }
+        self.add_root_event("configuration_detail", attrs);
     }
 
     // =====================================================================
@@ -851,18 +933,12 @@ impl OtelMapper {
 
     /// Lazily create the `external deps` parent span.
     fn ensure_external_deps_span(&mut self) {
-        if self.external_deps_context.is_some() {
-            return;
-        }
-        if let Some(root_cx) = &self.root_context {
-            let builder = self
-                .tracer
-                .span_builder("external deps")
-                .with_kind(SpanKind::Internal);
-            let span = self.tracer.build_with_context(builder, root_cx);
-            self.external_deps_context = Some(Context::new().with_span(span));
-            debug!("Created 'external deps' parent span");
-        }
+        Self::ensure_group_span(
+            &mut self.external_deps_context,
+            &self.root_context,
+            &self.tracer,
+            "external deps",
+        );
     }
 
     /// Create a target span with only the label (no kind/tags). Used when we see
@@ -965,24 +1041,7 @@ impl OtelMapper {
         if !buffered_actions.is_empty() {
             self.target_contexts.insert(label.to_string(), cx.clone());
             for act in buffered_actions {
-                self.on_action_completed(
-                    act.label.as_deref(),
-                    act.mnemonic.as_deref(),
-                    act.success,
-                    act.exit_code,
-                    act.exit_code_name.as_deref(),
-                    act.primary_output.as_deref(),
-                    act.configuration.as_deref(),
-                    &act.command_line,
-                    act.stdout_uri.as_deref(),
-                    act.stderr_uri.as_deref(),
-                    act.start_nanos,
-                    act.end_nanos,
-                    act.cached,
-                    act.hostname.as_deref(),
-                    act.cached_remotely,
-                    act.runner.as_deref(),
-                );
+                self.on_action_completed(&ActionCompletedEvent::from_buffered(act));
             }
             self.target_contexts.remove(label);
         }
@@ -1045,18 +1104,12 @@ impl OtelMapper {
             debug!("Ended pending output resolution span for {label} on skip");
         }
 
-        // Lazily create the "skipped" parent span.
-        if self.skipped_context.is_none() {
-            if let Some(root) = &self.root_context {
-                let builder = self
-                    .tracer
-                    .span_builder("skipped targets")
-                    .with_kind(SpanKind::Internal);
-                let span = self.tracer.build_with_context(builder, root);
-                self.skipped_context = Some(Context::new().with_span(span));
-                debug!("Created 'skipped targets' parent span");
-            }
-        }
+        Self::ensure_group_span(
+            &mut self.skipped_context,
+            &self.root_context,
+            &self.tracer,
+            "skipped targets",
+        );
 
         let parent = match &self.skipped_context {
             Some(cx) => cx,
@@ -1242,31 +1295,13 @@ impl OtelMapper {
     /// When `start_time_nanos` / `end_time_nanos` are available (from the
     /// `ActionExecuted.start_time` / `end_time` proto fields) they are used
     /// for accurate span timing.
-    #[allow(clippy::too_many_arguments)]
-    pub fn on_action_completed(
-        &mut self,
-        label: Option<&str>,
-        mnemonic: Option<&str>,
-        success: bool,
-        exit_code: Option<i32>,
-        exit_code_name: Option<&str>,
-        primary_output: Option<&str>,
-        configuration: Option<&str>,
-        command_line: &[String],
-        stdout_path: Option<&str>,
-        stderr_path: Option<&str>,
-        start_time_nanos: Option<i64>,
-        end_time_nanos: Option<i64>,
-        cached: Option<bool>,
-        hostname: Option<&str>,
-        cached_remotely: Option<bool>,
-        runner: Option<&str>,
-    ) {
-        if let Some(l) = label {
-            self.ensure_target_span(l, start_time_nanos);
+    pub fn on_action_completed(&mut self, ev: &ActionCompletedEvent<'_>) {
+        if let Some(l) = ev.label {
+            self.ensure_target_span(l, ev.start_time_nanos);
         }
 
-        let parent = label
+        let parent = ev
+            .label
             .and_then(|l| {
                 self.target_contexts
                     .get(l)
@@ -1283,59 +1318,58 @@ impl OtelMapper {
         };
 
         // Track action for cached-target detection.
-        if let Some(l) = label {
+        if let Some(l) = ev.label {
             *self.target_action_counts.entry(l.to_string()).or_insert(0) += 1;
-            if cached == Some(false) {
+            if ev.cached == Some(false) {
                 self.target_has_non_cached_action.insert(l.to_string(), true);
             }
         }
 
-        let span_name = match (label, mnemonic) {
+        let span_name = match (ev.label, ev.mnemonic) {
             (Some(l), Some(m)) => format!("action {m} {}", shorten_label(l)),
             (Some(l), None) => format!("action {}", shorten_label(l)),
             (None, Some(m)) => format!("action {m}"),
             _ => "action".to_string(),
         };
 
-        let mut attrs = vec![KeyValue::new(BAZEL_ACTION_SUCCESS, success)];
-        if let Some(m) = mnemonic {
+        let mut attrs = vec![KeyValue::new(BAZEL_ACTION_SUCCESS, ev.success)];
+        if let Some(m) = ev.mnemonic {
             attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, m.to_string()));
         }
-        if let Some(code) = exit_code {
+        if let Some(code) = ev.exit_code {
             attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE, code as i64));
         }
-        if let Some(name) = exit_code_name.filter(|s| !s.is_empty()) {
+        if let Some(name) = ev.exit_code_name.filter(|s| !s.is_empty()) {
             attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE_NAME, name.to_string()));
         }
-        if let Some(c) = cached {
+        if let Some(c) = ev.cached {
             attrs.push(KeyValue::new(BAZEL_ACTION_CACHED, c));
         }
-        if let Some(h) = hostname.filter(|s| !s.is_empty()) {
+        if let Some(h) = ev.hostname.filter(|s| !s.is_empty()) {
             attrs.push(KeyValue::new(BAZEL_ACTION_HOSTNAME, h.to_string()));
         }
-        if let Some(cr) = cached_remotely {
+        if let Some(cr) = ev.cached_remotely {
             attrs.push(KeyValue::new(BAZEL_ACTION_CACHED_REMOTELY, cr));
         }
-        if let Some(r) = runner.filter(|s| !s.is_empty()) {
+        if let Some(r) = ev.runner.filter(|s| !s.is_empty()) {
             attrs.push(KeyValue::new(BAZEL_ACTION_RUNNER, r.to_string()));
         }
-        if let Some(output) = primary_output {
-            attrs.push(KeyValue::new(
-                BAZEL_ACTION_PRIMARY_OUTPUT,
-                output.to_string(),
-            ));
+        if let Some(output) = ev.primary_output {
+            attrs.push(KeyValue::new(BAZEL_ACTION_PRIMARY_OUTPUT, output.to_string()));
         }
-        if let Some(l) = label {
+        if let Some(l) = ev.label {
             attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, l.to_string()));
             attrs.push(KeyValue::new(BAZEL_ACTION_LABEL_SHORT, shorten_label(l).to_string()));
         }
-        if let Some(cfg) = configuration {
-            let resolved = self.configurations.get(cfg).cloned();
-            let display_val = resolved.unwrap_or_else(|| cfg.to_string());
+        if let Some(cfg) = ev.configuration {
+            let display_val = self.configurations.get(cfg).map_or_else(
+                || cfg.to_string(),
+                |s| s.clone(),
+            );
             attrs.push(KeyValue::new(BAZEL_ACTION_CONFIGURATION, display_val));
         }
-        if !command_line.is_empty() {
-            let joined = command_line.join(" ");
+        if !ev.command_line.is_empty() {
+            let joined = ev.command_line.join(" ");
             let capped = if joined.len() > COMMAND_LINE_CAP_BYTES {
                 format!("{}...(truncated)", &joined[..COMMAND_LINE_CAP_BYTES])
             } else {
@@ -1343,47 +1377,35 @@ impl OtelMapper {
             };
             attrs.push(KeyValue::new(BAZEL_ACTION_COMMAND_LINE, capped));
         }
-        if let Some(p) = stdout_path {
+        if let Some(p) = ev.stdout_path {
             attrs.push(KeyValue::new(BAZEL_ACTION_STDOUT, p.to_string()));
         }
-        if let Some(p) = stderr_path {
+        if let Some(p) = ev.stderr_path {
             attrs.push(KeyValue::new(BAZEL_ACTION_STDERR, p.to_string()));
         }
 
-        let mut builder = self
-            .tracer
-            .span_builder(span_name)
-            .with_kind(SpanKind::Internal)
-            .with_attributes(attrs);
+        let status = if ev.success {
+            Status::Ok
+        } else {
+            Status::Error {
+                description: Cow::Borrowed("Action failed"),
+            }
+        };
 
-        if let Some(nanos) = start_time_nanos {
-            builder = builder.with_start_time(nanos_to_system_time(nanos));
-        }
+        let span_cx = self.build_and_end_child_span(
+            &parent,
+            span_name,
+            SpanKind::Internal,
+            attrs,
+            status,
+            ev.start_time_nanos,
+            ev.end_time_nanos,
+        );
 
-        let mut span = self.tracer.build_with_context(builder, &parent);
-
-        let span_cx = span.span_context().clone();
-        let key = ActionSpanKey::new(label, mnemonic, primary_output);
+        let key = ActionSpanKey::new(ev.label, ev.mnemonic, ev.primary_output);
         self.action_span_cache.insert(key, span_cx);
 
-        if success {
-            span.set_status(Status::Ok);
-        } else {
-            span.set_status(Status::Error {
-                description: Cow::Borrowed("Action failed"),
-            });
-        }
-
-        if let Some(nanos) = end_time_nanos {
-            span.end_with_timestamp(nanos_to_system_time(nanos));
-        } else {
-            span.end();
-        }
-
-        debug!(
-            "Created action span (success={success}) for {:?}",
-            label
-        );
+        debug!("Created action span (success={}) for {:?}", ev.success, ev.label);
     }
 
     // =====================================================================
@@ -1407,20 +1429,12 @@ impl OtelMapper {
 
     /// Ensure the `fetches` parent span exists (lazily created).
     fn ensure_fetches_span(&mut self) {
-        if self.fetches_context.is_some() {
-            return;
-        }
-        if let Some(root_cx) = &self.root_context {
-            let builder = self
-                .tracer
-                .span_builder("fetches")
-                .with_kind(SpanKind::Internal);
-
-            let span = self.tracer.build_with_context(builder, root_cx);
-            let cx = Context::new().with_span(span);
-            self.fetches_context = Some(cx);
-            debug!("Created fetches parent span");
-        }
+        Self::ensure_group_span(
+            &mut self.fetches_context,
+            &self.root_context,
+            &self.tracer,
+            "fetches",
+        );
     }
 
     /// Internal: create + end a fetch span under the `fetches` parent.
@@ -1471,126 +1485,103 @@ impl OtelMapper {
     // =====================================================================
 
     /// TestResult → child span under target span for a single test attempt.
-    /// When `start_time_nanos` / `duration_nanos` are present, span uses accurate timing.
+    /// When timing fields are present, span uses accurate timing.
     /// Buffers and replays if root span is not yet created (BES can send test events before Started).
-    pub fn on_test_result(
-        &mut self,
-        label: &str,
-        status: Option<&str>,
-        attempt: Option<i32>,
-        run: Option<i32>,
-        shard: Option<i32>,
-        cached: Option<bool>,
-        strategy: Option<&str>,
-        start_time_nanos: Option<i64>,
-        duration_nanos: Option<i64>,
-        hostname: Option<&str>,
-        cached_remotely: Option<bool>,
-    ) {
+    pub fn on_test_result(&mut self, ev: &TestResultEvent<'_>) {
         if self.root_context.is_none() {
             self.pending_test_results.push(BufferedTestResult {
-                label: label.to_string(),
-                status: status.map(String::from),
-                attempt,
-                run,
-                shard,
-                cached,
-                strategy: strategy.map(String::from),
-                start_time_nanos,
-                duration_nanos,
-                hostname: hostname.map(String::from),
-                cached_remotely,
+                label: ev.label.to_string(),
+                status: ev.status.map(String::from),
+                attempt: ev.attempt,
+                run: ev.run,
+                shard: ev.shard,
+                cached: ev.cached,
+                strategy: ev.strategy.map(String::from),
+                start_time_nanos: ev.start_time_nanos,
+                duration_nanos: ev.duration_nanos,
+                hostname: ev.hostname.map(String::from),
+                cached_remotely: ev.cached_remotely,
             });
-            debug!("Buffered test result (root not ready): {label}");
+            debug!("Buffered test result (root not ready): {}", ev.label);
             return;
         }
 
-        self.ensure_target_span(label, None);
+        self.ensure_target_span(ev.label, None);
 
         let parent = self
             .target_contexts
-            .get(label)
-            .or_else(|| self.pending_output_resolutions.get(label).map(|p| &p.parent_cx))
+            .get(ev.label)
+            .or_else(|| self.pending_output_resolutions.get(ev.label).map(|p| &p.parent_cx))
             .or(self.root_context.as_ref());
 
         let parent = match parent {
             Some(cx) => cx.clone(),
             None => {
-                warn!("TestResult with no parent context for {label}");
+                warn!("TestResult with no parent context for {}", ev.label);
                 return;
             }
         };
 
-        let span_name = match (attempt, run, shard) {
-            (Some(a), Some(r), Some(s)) => {
-                format!("test {label} attempt={a} run={r} shard={s}")
-            }
-            (Some(a), _, _) => format!("test {label} attempt={a}"),
-            _ => format!("test {label}"),
+        let span_name = match (ev.attempt, ev.run, ev.shard) {
+            (Some(a), Some(r), Some(s)) => format!("test {} attempt={a} run={r} shard={s}", ev.label),
+            (Some(a), _, _) => format!("test {} attempt={a}", ev.label),
+            _ => format!("test {}", ev.label),
         };
 
         let mut attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL, ev.label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(ev.label).to_string()),
         ];
-        if let Some(s) = status {
+        if let Some(s) = ev.status {
             attrs.push(KeyValue::new(BAZEL_TEST_STATUS, s.to_string()));
         }
-        if let Some(a) = attempt {
+        if let Some(a) = ev.attempt {
             attrs.push(KeyValue::new(BAZEL_TEST_ATTEMPT, a as i64));
         }
-        if let Some(r) = run {
+        if let Some(r) = ev.run {
             attrs.push(KeyValue::new(BAZEL_TEST_RUN, r as i64));
         }
-        if let Some(s) = shard {
+        if let Some(s) = ev.shard {
             attrs.push(KeyValue::new(BAZEL_TEST_SHARD, s as i64));
         }
-        if let Some(c) = cached {
+        if let Some(c) = ev.cached {
             attrs.push(KeyValue::new(BAZEL_TEST_CACHED, c));
         }
-        if let Some(st) = strategy {
+        if let Some(st) = ev.strategy {
             attrs.push(KeyValue::new(BAZEL_TEST_STRATEGY, st.to_string()));
         }
-        if let Some(h) = hostname {
-            if !h.is_empty() {
-                attrs.push(KeyValue::new(BAZEL_TEST_HOSTNAME, h.to_string()));
-            }
+        if let Some(h) = ev.hostname.filter(|s| !s.is_empty()) {
+            attrs.push(KeyValue::new(BAZEL_TEST_HOSTNAME, h.to_string()));
         }
-        if let Some(cr) = cached_remotely {
+        if let Some(cr) = ev.cached_remotely {
             attrs.push(KeyValue::new(BAZEL_TEST_CACHED_REMOTELY, cr));
         }
 
-        let mut builder = self
-            .tracer
-            .span_builder(span_name)
-            .with_kind(SpanKind::Internal)
-            .with_attributes(attrs);
-
-        if let Some(nanos) = start_time_nanos {
-            builder = builder.with_start_time(nanos_to_system_time(nanos));
-        }
-
-        let mut span = self.tracer.build_with_context(builder, &parent);
-
-        let is_pass = status.map(|s| s == "PASSED").unwrap_or(false);
-        if is_pass {
-            span.set_status(Status::Ok);
+        let is_pass = ev.status.map(|s| s == "PASSED").unwrap_or(false);
+        let status = if is_pass {
+            Status::Ok
         } else {
-            span.set_status(Status::Error {
-                description: Cow::Owned(format!(
-                    "test {}",
-                    status.unwrap_or("UNKNOWN")
-                )),
-            });
-        }
+            Status::Error {
+                description: Cow::Owned(format!("test {}", ev.status.unwrap_or("UNKNOWN"))),
+            }
+        };
 
-        if let (Some(start), Some(dur)) = (start_time_nanos, duration_nanos) {
-            span.end_with_timestamp(nanos_to_system_time(start + dur));
-        } else {
-            span.end();
-        }
+        let end_nanos = match (ev.start_time_nanos, ev.duration_nanos) {
+            (Some(start), Some(dur)) => Some(start + dur),
+            _ => None,
+        };
 
-        info!(label, status = ?status, "Created test result span");
+        self.build_and_end_child_span(
+            &parent,
+            span_name,
+            SpanKind::Internal,
+            attrs,
+            status,
+            ev.start_time_nanos,
+            end_nanos,
+        );
+
+        info!(label = ev.label, status = ?ev.status, "Created test result span");
     }
 
     /// TestSummary → span event on root (target span is already ended).
@@ -1605,32 +1596,30 @@ impl OtelMapper {
         shard_count: Option<i32>,
         total_num_cached: Option<i32>,
     ) {
-        if let Some(cx) = &self.root_context {
-            let mut attrs = vec![
-                KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-                KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
-            ];
-            if let Some(s) = overall_status {
-                attrs.push(KeyValue::new(BAZEL_TEST_OVERALL_STATUS, s.to_string()));
-            }
-            if let Some(c) = total_run_count {
-                attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_RUN_COUNT, c as i64));
-            }
-            if let Some(v) = run_count {
-                attrs.push(KeyValue::new(BAZEL_TEST_RUN_COUNT, v as i64));
-            }
-            if let Some(v) = attempt_count {
-                attrs.push(KeyValue::new(BAZEL_TEST_ATTEMPT_COUNT, v as i64));
-            }
-            if let Some(v) = shard_count {
-                attrs.push(KeyValue::new(BAZEL_TEST_SHARD_COUNT, v as i64));
-            }
-            if let Some(v) = total_num_cached {
-                attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_NUM_CACHED, v as i64));
-            }
-            cx.span().add_event("test_summary", attrs);
-            debug!("Added test summary event for {label}");
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
+        ];
+        if let Some(s) = overall_status {
+            attrs.push(KeyValue::new(BAZEL_TEST_OVERALL_STATUS, s.to_string()));
         }
+        if let Some(c) = total_run_count {
+            attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_RUN_COUNT, c as i64));
+        }
+        if let Some(v) = run_count {
+            attrs.push(KeyValue::new(BAZEL_TEST_RUN_COUNT, v as i64));
+        }
+        if let Some(v) = attempt_count {
+            attrs.push(KeyValue::new(BAZEL_TEST_ATTEMPT_COUNT, v as i64));
+        }
+        if let Some(v) = shard_count {
+            attrs.push(KeyValue::new(BAZEL_TEST_SHARD_COUNT, v as i64));
+        }
+        if let Some(v) = total_num_cached {
+            attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_NUM_CACHED, v as i64));
+        }
+        self.add_root_event("test_summary", attrs);
+        debug!("Added test summary event for {label}");
     }
 
     /// TargetSummary → span event on root with overall build/test status for the target.
@@ -1640,20 +1629,18 @@ impl OtelMapper {
         overall_build_success: Option<bool>,
         overall_test_status: Option<&str>,
     ) {
-        if let Some(cx) = &self.root_context {
-            let mut attrs = vec![
-                KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-                KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
-            ];
-            if let Some(s) = overall_build_success {
-                attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_BUILD_SUCCESS, s));
-            }
-            if let Some(s) = overall_test_status {
-                attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_TEST_STATUS, s.to_string()));
-            }
-            cx.span().add_event("target_summary", attrs);
-            debug!("Added target summary event for {label}");
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
+        ];
+        if let Some(s) = overall_build_success {
+            attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_BUILD_SUCCESS, s));
         }
+        if let Some(s) = overall_test_status {
+            attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_TEST_STATUS, s.to_string()));
+        }
+        self.add_root_event("target_summary", attrs);
+        debug!("Added target summary event for {label}");
     }
 
     // =====================================================================
@@ -1684,14 +1671,13 @@ impl OtelMapper {
 
     /// BuildMetadata → add as attributes on root span.
     pub fn on_build_metadata(&mut self, metadata: &serde_json::Value) {
-        if let Some(cx) = &self.root_context {
-            if let Some(entries) = metadata.get("metadata").and_then(|m| m.as_object()) {
-                for (key, value) in entries {
-                    if let Some(v) = value.as_str() {
-                        let attr_key = format!("bazel.metadata.{key}");
-                        cx.span()
-                            .set_attribute(KeyValue::new(attr_key, v.to_string()));
-                    }
+        if let Some(entries) = metadata.get("metadata").and_then(|m| m.as_object()) {
+            for (key, value) in entries {
+                if let Some(v) = value.as_str() {
+                    self.set_root_attr(KeyValue::new(
+                        format!("bazel.metadata.{key}"),
+                        v.to_string(),
+                    ));
                 }
             }
         }
@@ -1711,181 +1697,155 @@ impl OtelMapper {
         self.exit_code = exit_code;
         self.finish_time_nanos = finish_time_nanos;
 
-        if let Some(cx) = &self.root_context {
-            if let Some(code) = exit_code {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_EXIT_CODE, code as i64));
-            }
-            if let Some(name) = exit_code_name {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_EXIT_CODE_NAME, name.to_string()));
-            }
+        if let Some(code) = exit_code {
+            self.set_root_attr(KeyValue::new(BAZEL_EXIT_CODE, code as i64));
+        }
+        if let Some(name) = exit_code_name {
+            self.set_root_attr(KeyValue::new(BAZEL_EXIT_CODE_NAME, name.to_string()));
         }
     }
 
     /// BuildMetrics → add metrics attributes to root span.
     /// Supports both legacy flat payload (actionsCreated/actionsExecuted) and full nested payload.
     pub fn on_build_metrics(&mut self, metrics: &serde_json::Value) {
-        let Some(cx) = &self.root_context else {
+        if self.root_context.is_none() {
+            return;
+        }
+        let Some(obj) = metrics.as_object() else {
             return;
         };
-        let obj = match metrics.as_object() {
-            Some(o) => o,
-            None => return,
-        };
 
-        // ActionSummary: top-level (legacy) or under "actionSummary"
         let summary = obj.get("actionSummary").or(Some(metrics));
-        if let Some(s) = summary.and_then(|v| v.as_object()) {
-            if let Some(created) = s.get("actionsCreated").and_then(|v| v.as_i64()) {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_METRICS_ACTIONS_CREATED, created));
-            }
-            if let Some(executed) = s.get("actionsExecuted").and_then(|v| v.as_i64()) {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTED, executed));
-            }
-            if let Some(action_data) = s.get("actionData").and_then(|v| v.as_array()) {
-                for entry in action_data {
-                    let mnemonic = entry
-                        .get("mnemonic")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let count = entry
-                        .get("actionsExecuted")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    cx.span().set_attribute(KeyValue::new(
-                        format!("bazel.metrics.actions.{mnemonic}"),
-                        count,
-                    ));
-                }
-            }
-            if let Some(acs) = s.get("actionCacheStatistics").and_then(|v| v.as_object()) {
-                if let Some(hits) = acs.get("hits").and_then(|v| v.as_i64()) {
-                    cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CACHE_HITS, hits));
-                }
-                if let Some(misses) = acs.get("misses").and_then(|v| v.as_i64()) {
-                    cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CACHE_MISSES, misses));
-                }
+        self.apply_action_summary_attrs(summary);
+        self.apply_timing_metrics_attrs(obj);
+        self.apply_memory_metrics_attrs(obj);
+        self.apply_target_package_metrics_attrs(obj);
+        self.apply_artifact_metrics_attrs(obj);
+        self.apply_network_metrics_attrs(obj);
+        self.apply_runner_count_attrs(summary);
+        self.apply_cumulative_metrics_attrs(obj);
+    }
+
+    fn apply_action_summary_attrs(&self, summary: Option<&serde_json::Value>) {
+        let Some(s) = summary.and_then(|v| v.as_object()) else { return };
+        if let Some(v) = s.get("actionsCreated").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_ACTIONS_CREATED, v));
+        }
+        if let Some(v) = s.get("actionsExecuted").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTED, v));
+        }
+        if let Some(action_data) = s.get("actionData").and_then(|v| v.as_array()) {
+            for entry in action_data {
+                let mnemonic = entry.get("mnemonic").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let count = entry.get("actionsExecuted").and_then(|v| v.as_i64()).unwrap_or(0);
+                self.set_root_attr(KeyValue::new(format!("bazel.metrics.actions.{mnemonic}"), count));
             }
         }
-
-        if let Some(t) = obj.get("timingMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = t.get("wallTimeInMs").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_WALL_TIME_MS, v));
-                // Use wall time for root span end so duration is correct (e.g. fully cached builds).
-                if let Some(start) = self.root_span_start_nanos {
-                    self.root_span_end_from_wall_nanos =
-                        Some(start + v.saturating_mul(1_000_000));
-                }
+        if let Some(acs) = s.get("actionCacheStatistics").and_then(|v| v.as_object()) {
+            if let Some(v) = acs.get("hits").and_then(|v| v.as_i64()) {
+                self.set_root_attr(KeyValue::new(BAZEL_METRICS_CACHE_HITS, v));
             }
-            if let Some(v) = t.get("cpuTimeInMs").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CPU_TIME_MS, v));
-            }
-            if let Some(v) = t.get("analysisPhaseTimeInMs").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_ANALYSIS_PHASE_MS, v));
-            }
-            if let Some(v) = t.get("executionPhaseTimeInMs").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_EXECUTION_PHASE_MS, v));
-            }
-            if let Some(v) = t.get("criticalPathMs").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CRITICAL_PATH_MS, v));
+            if let Some(v) = acs.get("misses").and_then(|v| v.as_i64()) {
+                self.set_root_attr(KeyValue::new(BAZEL_METRICS_CACHE_MISSES, v));
             }
         }
+    }
 
-        if let Some(m) = obj.get("memoryMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = m.get("usedHeapSizePostBuild").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_HEAP_POST_BUILD, v));
-            }
-            if let Some(v) = m.get("peakPostGcHeapSize").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_PEAK_HEAP_POST_GC, v));
+    fn apply_timing_metrics_attrs(&mut self, obj: &serde_json::Map<String, serde_json::Value>) {
+        let Some(t) = obj.get("timingMetrics").and_then(|v| v.as_object()) else { return };
+        if let Some(v) = t.get("wallTimeInMs").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_WALL_TIME_MS, v));
+            // Derive root span end from start + wall time for correct duration on cached builds.
+            if let Some(start) = self.root_span_start_nanos {
+                self.root_span_end_from_wall_nanos = Some(start + v.saturating_mul(1_000_000));
             }
         }
-
-        if let Some(tm) = obj.get("targetMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = tm.get("targetsConfigured").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_TARGETS_CONFIGURED, v));
+        let timing_attrs: &[(&str, &str)] = &[
+            ("cpuTimeInMs", BAZEL_METRICS_CPU_TIME_MS),
+            ("analysisPhaseTimeInMs", BAZEL_METRICS_ANALYSIS_PHASE_MS),
+            ("executionPhaseTimeInMs", BAZEL_METRICS_EXECUTION_PHASE_MS),
+            ("criticalPathMs", BAZEL_METRICS_CRITICAL_PATH_MS),
+            ("actionsExecutionStartInMs", BAZEL_METRICS_ACTIONS_EXECUTION_START_MS),
+        ];
+        for &(json_key, attr_key) in timing_attrs {
+            if let Some(v) = t.get(json_key).and_then(|v| v.as_i64()) {
+                self.set_root_attr(KeyValue::new(attr_key, v));
             }
         }
+    }
 
-        if let Some(pm) = obj.get("packageMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = pm.get("packagesLoaded").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_PACKAGES_LOADED, v));
+    fn apply_memory_metrics_attrs(&self, obj: &serde_json::Map<String, serde_json::Value>) {
+        let Some(m) = obj.get("memoryMetrics").and_then(|v| v.as_object()) else { return };
+        if let Some(v) = m.get("usedHeapSizePostBuild").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_HEAP_POST_BUILD, v));
+        }
+        if let Some(v) = m.get("peakPostGcHeapSize").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_PEAK_HEAP_POST_GC, v));
+        }
+    }
+
+    fn apply_target_package_metrics_attrs(&self, obj: &serde_json::Map<String, serde_json::Value>) {
+        if let Some(v) = obj.get("targetMetrics")
+            .and_then(|v| v.get("targetsConfigured"))
+            .and_then(|v| v.as_i64())
+        {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_TARGETS_CONFIGURED, v));
+        }
+        if let Some(v) = obj.get("packageMetrics")
+            .and_then(|v| v.get("packagesLoaded"))
+            .and_then(|v| v.as_i64())
+        {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_PACKAGES_LOADED, v));
+        }
+    }
+
+    fn apply_artifact_metrics_attrs(&self, obj: &serde_json::Map<String, serde_json::Value>) {
+        let Some(am) = obj.get("artifactMetrics").and_then(|v| v.as_object()) else { return };
+        let artifact_attrs: &[(&str, &str)] = &[
+            ("sourceArtifactsRead", BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT),
+            ("outputArtifactsSeen", BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT),
+            ("outputArtifactsFromActionCache", BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT),
+            ("topLevelArtifacts", BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT),
+        ];
+        for &(json_key, attr_key) in artifact_attrs {
+            if let Some(v) = am.get(json_key).and_then(|v| v.get("count")).and_then(|v| v.as_i64()) {
+                self.set_root_attr(KeyValue::new(attr_key, v));
             }
         }
+    }
 
-        if let Some(am) = obj.get("artifactMetrics").and_then(|v| v.as_object()) {
-            if let Some(f) = am.get("sourceArtifactsRead").and_then(|v| v.as_object()) {
-                if let Some(v) = f.get("count").and_then(|v| v.as_i64()) {
-                    cx.span()
-                        .set_attribute(KeyValue::new(BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT, v));
-                }
-            }
-            if let Some(f) = am.get("outputArtifactsSeen").and_then(|v| v.as_object()) {
-                if let Some(v) = f.get("count").and_then(|v| v.as_i64()) {
-                    cx.span()
-                        .set_attribute(KeyValue::new(BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT, v));
-                }
-            }
-            if let Some(f) = am.get("outputArtifactsFromActionCache").and_then(|v| v.as_object()) {
-                if let Some(v) = f.get("count").and_then(|v| v.as_i64()) {
-                    cx.span().set_attribute(KeyValue::new(
-                        BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT,
-                        v,
-                    ));
-                }
-            }
+    fn apply_network_metrics_attrs(&self, obj: &serde_json::Map<String, serde_json::Value>) {
+        let Some(nm) = obj.get("networkMetrics").and_then(|v| v.as_object()) else { return };
+        if let Some(v) = nm.get("bytesSent").and_then(|v| v.as_u64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_BYTES_SENT, v as i64));
         }
-
-        if let Some(nm) = obj.get("networkMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = nm.get("bytesSent").and_then(|v| v.as_u64()) {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_METRICS_BYTES_SENT, v as i64));
-            }
-            if let Some(v) = nm.get("bytesRecv").and_then(|v| v.as_u64()) {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_METRICS_BYTES_RECV, v as i64));
-            }
+        if let Some(v) = nm.get("bytesRecv").and_then(|v| v.as_u64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_BYTES_RECV, v as i64));
         }
+    }
 
-        if let Some(runners) = summary
+    fn apply_runner_count_attrs(&self, summary: Option<&serde_json::Value>) {
+        let Some(runners) = summary
             .and_then(|s| s.as_object())
             .and_then(|s| s.get("runnerCount"))
             .and_then(|v| v.as_array())
-        {
-            for r in runners {
-                let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let count = r.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-                cx.span().set_attribute(KeyValue::new(
-                    format!("bazel.metrics.runner.{name}"),
-                    count,
-                ));
-            }
+        else {
+            return;
+        };
+        for r in runners {
+            let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let count = r.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            self.set_root_attr(KeyValue::new(format!("bazel.metrics.runner.{name}"), count));
         }
+    }
 
-        if let Some(t) = obj.get("timingMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = t.get("actionsExecutionStartInMs").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTION_START_MS, v));
-            }
+    fn apply_cumulative_metrics_attrs(&self, obj: &serde_json::Map<String, serde_json::Value>) {
+        let Some(cm) = obj.get("cumulativeMetrics").and_then(|v| v.as_object()) else { return };
+        if let Some(v) = cm.get("numAnalyses").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES, v));
         }
-
-        if let Some(cm) = obj.get("cumulativeMetrics").and_then(|v| v.as_object()) {
-            if let Some(v) = cm.get("numAnalyses").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES, v));
-            }
-            if let Some(v) = cm.get("numBuilds").and_then(|v| v.as_i64()) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_BUILDS, v));
-            }
-        }
-
-        if let Some(am) = obj.get("artifactMetrics").and_then(|v| v.as_object()) {
-            if let Some(f) = am.get("topLevelArtifacts").and_then(|v| v.as_object()) {
-                if let Some(v) = f.get("count").and_then(|v| v.as_i64()) {
-                    cx.span()
-                        .set_attribute(KeyValue::new(BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT, v));
-                }
-            }
+        if let Some(v) = cm.get("numBuilds").and_then(|v| v.as_i64()) {
+            self.set_root_attr(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_BUILDS, v));
         }
     }
 
@@ -1895,19 +1855,18 @@ impl OtelMapper {
 
     /// BuildToolLogs → extract critical path info, set root attribute for URI, emit span event.
     pub fn on_build_tool_logs(&mut self, logs: &serde_json::Value) {
-        let Some(cx) = &self.root_context else { return };
         if let Some(entries) = logs.get("log").and_then(|v| v.as_array()) {
             for entry in entries {
                 let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if name == "critical path" || name.contains("critical") {
                     let uri = entry.get("uri").and_then(|v| v.as_str()).unwrap_or("");
                     if !uri.is_empty() {
-                        cx.span().set_attribute(KeyValue::new(
+                        self.set_root_attr(KeyValue::new(
                             BAZEL_CRITICAL_PATH_LOG_URI,
                             uri.to_string(),
                         ));
                     }
-                    cx.span().add_event(
+                    self.add_root_event(
                         "build_tool_log",
                         vec![
                             KeyValue::new("log.name", name.to_string()),
@@ -2000,24 +1959,7 @@ impl OtelMapper {
 
         self.target_contexts.insert(label.to_string(), cx.clone());
         for act in actions {
-            self.on_action_completed(
-                act.label.as_deref(),
-                act.mnemonic.as_deref(),
-                act.success,
-                act.exit_code,
-                act.exit_code_name.as_deref(),
-                act.primary_output.as_deref(),
-                act.configuration.as_deref(),
-                &act.command_line,
-                act.stdout_uri.as_deref(),
-                act.stderr_uri.as_deref(),
-                act.start_nanos,
-                act.end_nanos,
-                act.cached,
-                act.hostname.as_deref(),
-                act.cached_remotely,
-                act.runner.as_deref(),
-            );
+            self.on_action_completed(&ActionCompletedEvent::from_buffered(act));
         }
         let cx = self.target_contexts.remove(label).unwrap_or(cx);
 
@@ -2137,6 +2079,7 @@ impl OtelMapper {
 
                     // Body = stderr (primary Bazel output); stdout as attribute
                     // when both are present.
+                    debug_assert!(has_content, "expected non-empty stderr or stdout");
                     match (!stderr.is_empty(), !stdout.is_empty()) {
                         (true, true) => {
                             record.set_body(AnyValue::String(stderr.into()));
@@ -2151,7 +2094,7 @@ impl OtelMapper {
                         (false, true) => {
                             record.set_body(AnyValue::String(stdout.into()));
                         }
-                        (false, false) => unreachable!("has_content guard"),
+                        (false, false) => {}
                     }
 
                     logger.emit(record);
@@ -2202,25 +2145,152 @@ fn nanos_to_system_time(nanos: i64) -> SystemTime {
     }
 }
 
-/// Compact summary of actionData: "Mnemonic(count), ..." sorted by count desc.
-fn summarize_action_data(entries: &[serde_json::Value]) -> String {
-    let mut by_mnemonic: HashMap<&str, i64> = HashMap::new();
-    for entry in entries {
-        let mnemonic = entry
-            .get("mnemonic")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let count = entry
-            .get("actionsExecuted")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        *by_mnemonic.entry(mnemonic).or_default() += count;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Helper function tests ----
+
+    #[test]
+    fn strip_ansi_no_escapes() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
     }
-    let mut sorted: Vec<_> = by_mnemonic.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    sorted
-        .iter()
-        .map(|(m, c)| format!("{m}({c})"))
-        .collect::<Vec<_>>()
-        .join(", ")
+
+    #[test]
+    fn strip_ansi_csi_sequence() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strip_ansi_osc_sequence() {
+        assert_eq!(strip_ansi("before\x1b]0;title\x07after"), "beforeafter");
+    }
+
+    #[test]
+    fn strip_ansi_empty() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn bytestream_uri_to_display_non_bytestream() {
+        assert_eq!(bytestream_uri_to_display("file:///tmp/out"), "file:///tmp/out");
+    }
+
+    #[test]
+    fn bytestream_uri_to_display_strips_authority() {
+        let uri = "bytestream://remote.example.com/blobs/abc123/42";
+        assert_eq!(bytestream_uri_to_display(uri), "blobs/abc123/42");
+    }
+
+    #[test]
+    fn tail_byte_offset_short_string() {
+        assert_eq!(tail_byte_offset("hello", 10), 0);
+    }
+
+    #[test]
+    fn tail_byte_offset_exact() {
+        assert_eq!(tail_byte_offset("hello", 5), 0);
+    }
+
+    #[test]
+    fn tail_byte_offset_truncates() {
+        assert_eq!(tail_byte_offset("hello world", 5), 6);
+    }
+
+    #[test]
+    fn append_progress_capped_within_limit() {
+        let mut buf = String::from("hello ");
+        append_progress_capped(&mut buf, "world");
+        assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn normalize_label_strips_at() {
+        assert_eq!(normalize_label("@@repo//:t"), "repo//:t");
+        assert_eq!(normalize_label("@repo//:t"), "repo//:t");
+        assert_eq!(normalize_label("//pkg:t"), "//pkg:t");
+    }
+
+    #[test]
+    fn nanos_to_system_time_positive() {
+        let t = nanos_to_system_time(1_000_000_000);
+        assert_eq!(t, UNIX_EPOCH + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn nanos_to_system_time_negative() {
+        assert_eq!(nanos_to_system_time(-1), UNIX_EPOCH);
+    }
+
+    // ---- Mapper lifecycle tests ----
+
+    fn test_mapper() -> OtelMapper {
+        use opentelemetry::trace::TracerProvider;
+        let tp = opentelemetry_sdk::trace::TracerProvider::builder().build();
+        let tracer = tp.tracer("test");
+        OtelMapper::new(tracer, None)
+    }
+
+    #[test]
+    fn root_span_lifecycle() {
+        let mut mapper = test_mapper();
+        assert!(mapper.root_context.is_none());
+
+        mapper.on_build_started("test-uuid", "build", Some(1_000_000_000), None);
+        assert!(mapper.root_context.is_some());
+        assert_eq!(mapper.cached_command.as_deref(), Some("build"));
+
+        mapper.on_build_finished(Some(0), Some(2_000_000_000), None);
+        assert_eq!(mapper.exit_code, Some(0));
+
+        mapper.finish();
+        assert!(mapper.root_context.is_none());
+    }
+
+    #[test]
+    fn pattern_enriches_root_name() {
+        let mut mapper = test_mapper();
+        mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+        mapper.on_pattern(&["//...".to_string()]);
+        assert_eq!(mapper.cached_patterns, vec!["//..."]);
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let mut mapper = test_mapper();
+        mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+        mapper.on_build_finished(Some(0), None, None);
+        mapper.reset();
+        assert!(mapper.root_context.is_none());
+        assert!(mapper.exit_code.is_none());
+        assert!(mapper.cached_command.is_none());
+    }
+
+    #[test]
+    fn action_completed_event_from_buffered() {
+        let act = BufferedAction {
+            label: Some("//pkg:t".to_string()),
+            mnemonic: Some("Javac".to_string()),
+            success: true,
+            exit_code: Some(0),
+            exit_code_name: None,
+            primary_output: Some("out.jar".to_string()),
+            configuration: None,
+            command_line: vec!["javac".to_string(), "Main.java".to_string()],
+            stdout_uri: None,
+            stderr_uri: None,
+            start_nanos: Some(100),
+            end_nanos: Some(200),
+            cached: Some(false),
+            hostname: None,
+            cached_remotely: None,
+            runner: None,
+        };
+        let ev = ActionCompletedEvent::from_buffered(&act);
+        assert_eq!(ev.label, Some("//pkg:t"));
+        assert_eq!(ev.mnemonic, Some("Javac"));
+        assert!(ev.success);
+        assert_eq!(ev.command_line.len(), 2);
+    }
 }
+

@@ -1,13 +1,27 @@
 //! BEP event router
 //!
-//! Routes BEP events to appropriate handlers based on event type.
+//! Dispatches incoming Bazel Build Event Protocol (BEP) events to the
+//! [`OtelMapper`] for span creation and to [`BuildState`] for bookkeeping.
+//!
+//! Supports two input paths:
+//! - **Protobuf** (gRPC BES): [`route_build_event`] receives decoded
+//!   `BuildEvent` protos from the gRPC server and maps them directly.
+//! - **JSON** (file / stdin): [`route`] receives [`BepJsonEvent`] objects
+//!   parsed from newline-delimited JSON BEP streams.
+//!
+//! The router owns deferred `TracerProvider` initialization so invocation-
+//! scoped resource attributes (invocation_id, command, workspace) are available
+//! on every span.
 
 use super::decoder::BepJsonEvent;
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
 use crate::build_event_stream::ActionExecuted;
-use crate::otel::{build_invocation_resource, init_tracer_provider_with_resource, ExportConfig, OtelMapper};
+use crate::otel::{
+    build_invocation_resource, init_tracer_provider_with_resource, ActionCompletedEvent,
+    ExportConfig, OtelMapper, TestResultEvent,
+};
 use crate::state::{ActionProcessingMode, BuildState};
 use opentelemetry::logs::LoggerProvider as _;
 use opentelemetry::trace::TracerProvider;
@@ -339,11 +353,6 @@ impl EventRouter {
             BepId::Configuration(c) => {
                 if let Some(BepPayload::Configuration(cfg)) = &event.payload {
                     let id = c.id.clone();
-                    self.state.add_configuration(
-                        id.clone(),
-                        Some(cfg.mnemonic.clone()),
-                        Some(cfg.platform_name.clone()),
-                    );
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_configuration(
                             &id,
@@ -523,7 +532,7 @@ impl EventRouter {
                         act.success,
                         Some(act.exit_code),
                     );
-                    if self.mapper.is_some() {
+                    if let Some(mapper) = &mut self.mapper {
                         let stdout_uri = act
                             .stdout
                             .as_ref()
@@ -540,24 +549,24 @@ impl EventRouter {
                         });
                         let (cached_from_spawn, runner_from_spawn) =
                             extract_spawn_exec_from_action(act);
-                        self.state.record_and_buffer_action(
-                            label,
-                            Some(act.r#type.clone()),
-                            Some(primary_output),
-                            act.success,
-                            Some(act.exit_code),
-                            None,
-                            configuration,
-                            act.command_line.clone(),
-                            stdout_uri,
-                            stderr_uri,
-                            start_nanos,
-                            end_nanos,
-                            cached_from_spawn,
-                            None,
-                            None,
-                            runner_from_spawn,
-                        );
+                        mapper.on_action_completed(&ActionCompletedEvent {
+                            label: Some(&label),
+                            mnemonic: Some(&act.r#type),
+                            success: act.success,
+                            exit_code: Some(act.exit_code),
+                            exit_code_name: None,
+                            primary_output: Some(&primary_output),
+                            configuration: configuration.as_deref(),
+                            command_line: &act.command_line,
+                            stdout_path: stdout_uri.as_deref(),
+                            stderr_path: stderr_uri.as_deref(),
+                            start_time_nanos: start_nanos,
+                            end_time_nanos: end_nanos,
+                            cached: cached_from_spawn,
+                            hostname: None,
+                            cached_remotely: None,
+                            runner: runner_from_spawn.as_deref(),
+                        });
                     }
                 }
                 Ok(())
@@ -657,19 +666,19 @@ impl EventRouter {
                     let duration_nanos = pr.test_attempt_duration.as_ref()
                         .map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos));
                     if let Some(mapper) = &mut self.mapper {
-                        mapper.on_test_result(
-                            &label,
-                            Some(crate::grpc::server::test_status_to_str(pr.status)),
-                            Some(tr.attempt),
-                            Some(tr.run),
-                            Some(tr.shard),
-                            Some(pr.cached_locally),
+                        mapper.on_test_result(&TestResultEvent {
+                            label: &label,
+                            status: Some(crate::grpc::server::test_status_to_str(pr.status)),
+                            attempt: Some(tr.attempt),
+                            run: Some(tr.run),
+                            shard: Some(tr.shard),
+                            cached: Some(pr.cached_locally),
                             strategy,
                             start_time_nanos,
                             duration_nanos,
                             hostname,
                             cached_remotely,
-                        );
+                        });
                     }
                 } else {
                     debug!(
@@ -950,12 +959,6 @@ impl EventRouter {
                     mnemonic,
                     platform,
                     "Configuration"
-                );
-
-                self.state.add_configuration(
-                    config_id.to_string(),
-                    mnemonic.map(String::from),
-                    platform.map(String::from),
                 );
 
                 if let Some(mapper) = &mut self.mapper {
@@ -1349,7 +1352,7 @@ impl EventRouter {
                 .filter(|s| !s.is_empty());
 
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_action_completed(
+                mapper.on_action_completed(&ActionCompletedEvent {
                     label,
                     mnemonic,
                     success,
@@ -1357,16 +1360,16 @@ impl EventRouter {
                     exit_code_name,
                     primary_output,
                     configuration,
-                    &command_line,
+                    command_line: &command_line,
                     stdout_path,
                     stderr_path,
                     start_time_nanos,
                     end_time_nanos,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
+                    cached: None,
+                    hostname: None,
+                    cached_remotely: None,
+                    runner: None,
+                });
             }
         }
         Ok(())
@@ -1462,7 +1465,7 @@ impl EventRouter {
             );
 
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_test_result(
+                mapper.on_test_result(&TestResultEvent {
                     label,
                     status,
                     attempt,
@@ -1474,7 +1477,7 @@ impl EventRouter {
                     duration_nanos,
                     hostname,
                     cached_remotely,
-                );
+                });
             }
         }
         Ok(())

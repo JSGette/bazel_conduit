@@ -182,3 +182,46 @@ pub fn shorten_label(label: &str) -> &str {
     }
     label
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_label_main_repo_canonical() {
+        assert_eq!(shorten_label("@@//path/to:target"), "//path/to:target");
+    }
+
+    #[test]
+    fn shorten_label_external_repo() {
+        assert_eq!(shorten_label("@rules_rust//rust:defs.bzl"), "//rust:defs.bzl");
+    }
+
+    #[test]
+    fn shorten_label_double_at_external() {
+        assert_eq!(
+            shorten_label("@@rules_rust+0.40.0//rust:defs.bzl"),
+            "rules_rust+0.40.0//rust:defs.bzl"
+        );
+    }
+
+    #[test]
+    fn shorten_label_no_prefix() {
+        assert_eq!(shorten_label("//path/to:target"), "//path/to:target");
+    }
+
+    #[test]
+    fn shorten_label_empty() {
+        assert_eq!(shorten_label(""), "");
+    }
+
+    #[test]
+    fn shorten_label_at_no_double_slash() {
+        assert_eq!(shorten_label("@repo"), "@repo");
+    }
+
+    #[test]
+    fn shorten_label_short_label() {
+        assert_eq!(shorten_label("//:main"), "//:main");
+    }
+}

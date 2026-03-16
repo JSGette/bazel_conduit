@@ -69,14 +69,6 @@ impl TargetActionBuffer {
     }
 }
 
-/// Configuration state
-#[derive(Debug, Clone)]
-pub struct ConfigurationState {
-    pub id: String,
-    pub mnemonic: Option<String>,
-    pub platform: Option<String>,
-}
-
 /// Build state tracker
 #[derive(Debug)]
 pub struct BuildState {
@@ -96,9 +88,6 @@ pub struct BuildState {
     // Workspace
     workspace_status: HashMap<String, String>,
     patterns: Vec<String>,
-
-    // Configurations (config_id -> ConfigurationState)
-    configurations: DashMap<String, ConfigurationState>,
 
     // Targets (label -> TargetState)
     targets: DashMap<String, TargetState>,
@@ -134,7 +123,6 @@ impl BuildState {
             action_mode: ActionProcessingMode::default(),
             workspace_status: HashMap::new(),
             patterns: Vec::new(),
-            configurations: DashMap::new(),
             targets: DashMap::new(),
             named_sets: DashMap::new(),
             actions: Vec::new(),
@@ -250,26 +238,6 @@ impl BuildState {
 
     pub fn patterns(&self) -> &[String] {
         &self.patterns
-    }
-
-    // =========================================================================
-    // Configurations
-    // =========================================================================
-
-    pub fn add_configuration(
-        &self,
-        id: String,
-        mnemonic: Option<String>,
-        platform: Option<String>,
-    ) {
-        self.configurations.insert(
-            id.clone(),
-            ConfigurationState {
-                id,
-                mnemonic,
-                platform,
-            },
-        );
     }
 
     // =========================================================================
@@ -500,7 +468,6 @@ impl BuildState {
         self.action_mode = ActionProcessingMode::default();
         self.workspace_status.clear();
         self.patterns.clear();
-        self.configurations.clear();
         self.targets.clear();
         self.named_sets.clear();
         self.actions.clear();
