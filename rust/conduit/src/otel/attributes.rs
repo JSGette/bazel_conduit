@@ -27,6 +27,7 @@ pub const BAZEL_CONFIG_IS_TOOL: &str = "bazel.config.is_tool";
 
 // Target span
 pub const BAZEL_TARGET_LABEL: &str = "bazel.target.label";
+pub const BAZEL_TARGET_LABEL_SHORT: &str = "bazel.target.label_short";
 pub const BAZEL_TARGET_KIND: &str = "bazel.target.kind";
 pub const BAZEL_TARGET_SUCCESS: &str = "bazel.target.success";
 pub const BAZEL_TARGET_TAGS: &str = "bazel.target.tags";
@@ -47,6 +48,7 @@ pub const BAZEL_ACTION_COMMAND_LINE: &str = "bazel.action.command_line";
 pub const BAZEL_ACTION_STDOUT: &str = "bazel.action.stdout";
 pub const BAZEL_ACTION_STDERR: &str = "bazel.action.stderr";
 pub const BAZEL_ACTION_LABEL: &str = "bazel.action.label";
+pub const BAZEL_ACTION_LABEL_SHORT: &str = "bazel.action.label_short";
 pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
 
 // Spawn span (exec log enrichment)
@@ -61,6 +63,7 @@ pub const BAZEL_SPAWN_DIGEST: &str = "bazel.spawn.digest";
 pub const BAZEL_SPAWN_INPUT_BYTES: &str = "bazel.spawn.input_bytes";
 pub const BAZEL_SPAWN_INPUT_FILES: &str = "bazel.spawn.input_files";
 pub const BAZEL_SPAWN_TARGET_LABEL: &str = "bazel.spawn.target_label";
+pub const BAZEL_SPAWN_TARGET_LABEL_SHORT: &str = "bazel.spawn.target_label_short";
 pub const BAZEL_SPAWN_MNEMONIC: &str = "bazel.spawn.mnemonic";
 pub const BAZEL_SPAWN_PRIMARY_OUTPUT: &str = "bazel.spawn.primary_output";
 pub const BAZEL_SPAWN_LISTED_OUTPUTS: &str = "bazel.spawn.listed_outputs";
@@ -151,3 +154,26 @@ pub const BAZEL_NAMED_SET_FILE_COUNT: &str = "bazel.named_set.file_count";
 // Progress / build log span events
 pub const BAZEL_PROGRESS_STDERR: &str = "bazel.progress.stderr";
 pub const BAZEL_PROGRESS_STDOUT: &str = "bazel.progress.stdout";
+
+// -----------------------------------------------------------------------------
+// Label helpers (for readable span names and attributes)
+// -----------------------------------------------------------------------------
+
+/// Strip Bzlmod canonical repository prefixes from a Bazel label for readable
+/// span names and label attributes.
+///
+/// - `@@//path/to:target` (main repo canonical) → `//path/to:target`
+/// - `@repository_name//path:target` (external repo) → `//path:target`
+///
+/// Full label remains available on spans via attributes (e.g. `bazel.target.label`).
+pub fn shorten_label(label: &str) -> &str {
+    if label.starts_with("@@") {
+        return &label[2..];
+    }
+    if label.starts_with('@') {
+        if let Some(idx) = label.find("//") {
+            return &label[idx..];
+        }
+    }
+    label
+}

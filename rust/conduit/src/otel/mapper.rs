@@ -15,9 +15,9 @@
 //!     └── target {label} (aborted by Bazel)
 //!
 //! Correlated OTel log records:
-//!   - build.log (accumulated progress stderr/stdout, emitted as a Log
-//!     record correlated with the trace via trace_id/span_id — falls back
-//!     to a span event when no LoggerProvider is configured)
+//!   - build.log (accumulated progress stderr/stdout, each capped at 1 MB;
+//!     emitted as a Log record correlated with the trace via trace_id/span_id —
+//!     falls back to a span event when no LoggerProvider is configured)
 //!
 //! Action processing modes:
 //!   - lightweight (default): only failed actions create spans
@@ -96,6 +96,23 @@ fn strip_ansi(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Convert a bytestream URI to a display-friendly form: show the path part (e.g. after
+/// the authority, such as `blobs/hash/size`) or leave as-is if no path or not bytestream.
+fn bytestream_uri_to_display(uri: &str) -> Cow<'_, str> {
+    const PREFIX: &str = "bytestream://";
+    if !uri.starts_with(PREFIX) {
+        return Cow::Borrowed(uri);
+    }
+    let after_prefix = &uri[PREFIX.len()..];
+    if let Some(slash) = after_prefix.find('/') {
+        let path = &after_prefix[slash + 1..];
+        if !path.is_empty() {
+            return Cow::Owned(path.to_string());
+        }
+    }
+    Cow::Borrowed(uri)
+}
+
 /// Key for caching action span context for exec log enrichment.
 /// Matches SpawnExec entries by target_label, mnemonic, and primary output.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -110,22 +127,76 @@ fn normalize_label(s: &str) -> &str {
     s.trim_start_matches('@')
 }
 
-/// Strip Bzlmod canonical prefixes for human-readable span names.
-/// `@@+_repo_rules+openssl//:libssl` → `openssl//:libssl`
-/// Keeps the full label available via attributes.
-fn shorten_label(label: &str) -> &str {
-    let stripped = label.trim_start_matches('@');
-    if let Some(idx) = stripped.find("//") {
-        let prefix = &stripped[..idx];
-        if let Some(plus) = prefix.rfind('+') {
-            return &stripped[plus + 1..];
-        }
-    }
-    stripped
-}
-
+/// Maximum size in bytes for each of progress_stderr and progress_stdout.
+/// Each stream is capped at 1 MB; when appending would exceed the cap, the
+/// existing buffer is truncated to keep the tail (recent output) and new
+/// content is appended. Enforced in [`OtelMapper::on_progress`].
 const PROGRESS_CAP_BYTES: usize = 1024 * 1024; // 1 MB
 const COMMAND_LINE_CAP_BYTES: usize = 4096; // 4 KB
+
+/// Byte length of the suffix added when we truncate from the front.
+const PROGRESS_TRUNCATION_SUFFIX: &str = "\n...(truncated)\n";
+
+/// Return the byte offset into `s` such that `s[offset..]` is the last at most
+/// `max_tail_bytes` bytes of `s` at a valid UTF-8 character boundary.
+fn tail_byte_offset(s: &str, max_tail_bytes: usize) -> usize {
+    if s.len() <= max_tail_bytes {
+        return 0;
+    }
+    let start = s.len() - max_tail_bytes;
+    let mut i = start;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
+}
+
+/// Append `new_content` to `buf` while keeping total size ≤ PROGRESS_CAP_BYTES.
+/// When appending would exceed the cap, truncates the existing buffer to keep
+/// the tail (recent output), adds a truncation marker, then appends the new content.
+fn append_progress_capped(buf: &mut String, new_content: &str) {
+    let suffix_len = PROGRESS_TRUNCATION_SUFFIX.len();
+    let max_total = PROGRESS_CAP_BYTES;
+
+    if buf.len() + new_content.len() <= max_total {
+        buf.push_str(new_content);
+        return;
+    }
+
+    // Need to drop from the front: keep last (max_total - new_content.len() - suffix_len) bytes of buf.
+    let max_old_tail = max_total.saturating_sub(new_content.len()).saturating_sub(suffix_len);
+    if max_old_tail > 0 {
+        let offset = tail_byte_offset(buf, max_old_tail);
+        let tail = buf[offset..].to_string();
+        buf.clear();
+        buf.push_str(&tail);
+        buf.push_str(PROGRESS_TRUNCATION_SUFFIX);
+    } else {
+        buf.clear();
+        // New content alone exceeds cap: keep only the tail of new_content.
+        let keep_new = max_total.saturating_sub(suffix_len);
+        if keep_new > 0 {
+            let offset = tail_byte_offset(new_content, keep_new.min(new_content.len()));
+            buf.push_str(PROGRESS_TRUNCATION_SUFFIX);
+            buf.push_str(&new_content[offset..]);
+        }
+        return;
+    }
+
+    // Append new_content; if we're still over cap, trim from the end of new_content.
+    let remaining = max_total.saturating_sub(buf.len());
+    if new_content.len() <= remaining {
+        buf.push_str(new_content);
+    } else {
+        let end = new_content.len() - remaining;
+        let mut trim_start = end;
+        while trim_start < new_content.len() && !new_content.is_char_boundary(trim_start) {
+            trim_start += 1;
+        }
+        buf.push_str(&new_content[trim_start..]);
+        buf.push_str("\n...(truncated)");
+    }
+}
 
 impl ActionSpanKey {
     pub fn new(
@@ -237,8 +308,9 @@ pub struct OtelMapper {
     target_has_non_cached_action: HashMap<String, bool>,
 
     /// Accumulated stderr / stdout from all progress messages.
-    /// Flushed as an OTel log record correlated with the trace in [`finish`].
-    /// Falls back to a span event if no logger is available.
+    /// Each is capped at 1 MB (see [`PROGRESS_CAP_BYTES`]); when the cap would
+    /// be exceeded, the buffer is truncated to keep the tail and new content
+    /// is appended. Flushed as an OTel log record in [`finish`].
     progress_stderr: String,
     progress_stdout: String,
 
@@ -565,6 +637,7 @@ impl OtelMapper {
         let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
         ];
         if let Some(r) = reason {
@@ -691,7 +764,10 @@ impl OtelMapper {
         start_nanos_override: Option<i64>,
     ) -> Context {
         let short = shorten_label(label);
-        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
+        ];
         if let Some(k) = &configured.kind {
             attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
         }
@@ -723,7 +799,9 @@ impl OtelMapper {
     /// Ensure a target span exists in `target_contexts`, creating it
     /// lazily (under root) if we have `ConfiguredTarget` metadata, or a
     /// synthetic target from the action label when no TargetConfigured was seen.
-    fn ensure_target_span(&mut self, label: &str) {
+    /// When `action_start_nanos` is set (e.g. from ActionExecuted), the new span's
+    /// start time is set so target timing reflects the action.
+    fn ensure_target_span(&mut self, label: &str, action_start_nanos: Option<i64>) {
         if self.target_contexts.contains_key(label)
             || self.pending_output_resolutions.contains_key(label)
         {
@@ -732,11 +810,11 @@ impl OtelMapper {
         let parent = self.choose_parent_for_label(label);
         let Some(parent) = parent else { return };
         if let Some(configured) = self.configured_targets.get(label) {
-            let cx = self.create_target_span(label, configured, &parent, None);
+            let cx = self.create_target_span(label, configured, &parent, action_start_nanos);
             debug!("Lazily created target span for {label} (action needed parent)");
             self.target_contexts.insert(label.to_string(), cx);
         } else {
-            let cx = self.create_synthetic_target_span(label, &parent);
+            let cx = self.create_synthetic_target_span(label, &parent, action_start_nanos);
             debug!("Created synthetic target span for {label} (from action label)");
             self.target_contexts.insert(label.to_string(), cx);
         }
@@ -776,17 +854,26 @@ impl OtelMapper {
 
     /// Create a target span with only the label (no kind/tags). Used when we see
     /// an action with a label but no prior TargetConfigured event.
-    fn create_synthetic_target_span(&self, label: &str, parent: &Context) -> Context {
+    fn create_synthetic_target_span(
+        &self,
+        label: &str,
+        parent: &Context,
+        start_nanos: Option<i64>,
+    ) -> Context {
         let short = shorten_label(label);
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new("bazel.target.synthetic", true),
         ];
-        let builder = self
+        let mut builder = self
             .tracer
             .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
+        if let Some(nanos) = start_nanos {
+            builder = builder.with_start_time(nanos_to_system_time(nanos));
+        }
         let span = self.tracer.build_with_context(builder, parent);
         Context::new().with_span(span)
     }
@@ -911,11 +998,17 @@ impl OtelMapper {
     ) {
         // Consume the configured metadata (if any).
         let configured = self.configured_targets.remove(label);
-        // End any lazily-created span to avoid leaks.
+        // End any open span from target_contexts to avoid leaks.
         if let Some(existing) = self.target_contexts.remove(label) {
             existing.span().set_status(Status::Unset);
             existing.span().end();
             debug!("Ended leaked target span for {label} on skip");
+        }
+        // End any open span from pending_output_resolutions (deferred end).
+        if let Some(pending) = self.pending_output_resolutions.remove(label) {
+            pending.parent_cx.span().set_status(Status::Unset);
+            pending.parent_cx.span().end();
+            debug!("Ended pending output resolution span for {label} on skip");
         }
 
         // Lazily create the "skipped" parent span.
@@ -939,6 +1032,7 @@ impl OtelMapper {
         let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
         ];
         if let Some(configured) = &configured {
@@ -983,13 +1077,17 @@ impl OtelMapper {
         let all_files = Self::resolve_files(cache, file_set_ids);
 
         if !all_files.is_empty() {
-            let file_list = if all_files.len() <= 20 {
-                all_files.join(", ")
+            let display_files: Vec<String> = all_files
+                .iter()
+                .map(|s| bytestream_uri_to_display(s).into_owned())
+                .collect();
+            let file_list = if display_files.len() <= 20 {
+                display_files.join(", ")
             } else {
                 format!(
                     "{} ... and {} more",
-                    all_files[..20].join(", "),
-                    all_files.len() - 20
+                    display_files[..20].join(", "),
+                    display_files.len() - 20
                 )
             };
             cx.span()
@@ -1126,7 +1224,7 @@ impl OtelMapper {
         end_time_nanos: Option<i64>,
     ) {
         if let Some(l) = label {
-            self.ensure_target_span(l);
+            self.ensure_target_span(l, start_time_nanos);
         }
 
         let parent = label
@@ -1172,6 +1270,7 @@ impl OtelMapper {
         }
         if let Some(l) = label {
             attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, l.to_string()));
+            attrs.push(KeyValue::new(BAZEL_ACTION_LABEL_SHORT, shorten_label(l).to_string()));
         }
         if let Some(cfg) = configuration {
             let resolved = self.configurations.get(cfg).cloned();
@@ -1349,7 +1448,7 @@ impl OtelMapper {
             return;
         }
 
-        self.ensure_target_span(label);
+        self.ensure_target_span(label, None);
 
         let parent = self
             .target_contexts
@@ -1373,7 +1472,10 @@ impl OtelMapper {
             _ => format!("test {label}"),
         };
 
-        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
+        ];
         if let Some(s) = status {
             attrs.push(KeyValue::new(BAZEL_TEST_STATUS, s.to_string()));
         }
@@ -1447,7 +1549,10 @@ impl OtelMapper {
         total_num_cached: Option<i32>,
     ) {
         if let Some(cx) = &self.root_context {
-            let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+            let mut attrs = vec![
+                KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+                KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
+            ];
             if let Some(s) = overall_status {
                 attrs.push(KeyValue::new(BAZEL_TEST_OVERALL_STATUS, s.to_string()));
             }
@@ -1479,7 +1584,10 @@ impl OtelMapper {
         overall_test_status: Option<&str>,
     ) {
         if let Some(cx) = &self.root_context {
-            let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+            let mut attrs = vec![
+                KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+                KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
+            ];
             if let Some(s) = overall_build_success {
                 attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_BUILD_SUCCESS, s));
             }
@@ -1497,30 +1605,18 @@ impl OtelMapper {
 
     /// Progress with stderr/stdout → text is buffered and flushed as a
     /// single `build.log` event on the root `bazel.invocation` span in
-    /// [`finish`].
+    /// [`finish`]. Each stream is capped at [`PROGRESS_CAP_BYTES`] (1 MB);
+    /// when appending would exceed the cap, the existing buffer is truncated
+    /// to keep the tail (recent output), then the new content is appended.
     pub fn on_progress(&mut self, stderr: Option<&str>, stdout: Option<&str>) {
         if let Some(err) = stderr {
-            if !err.is_empty() && self.progress_stderr.len() < PROGRESS_CAP_BYTES {
-                let stripped = strip_ansi(err);
-                let remaining = PROGRESS_CAP_BYTES.saturating_sub(self.progress_stderr.len());
-                if stripped.len() <= remaining {
-                    self.progress_stderr.push_str(&stripped);
-                } else {
-                    self.progress_stderr.push_str(&stripped[..remaining]);
-                    self.progress_stderr.push_str("\n...(truncated)");
-                }
+            if !err.is_empty() {
+                append_progress_capped(&mut self.progress_stderr, &strip_ansi(err));
             }
         }
         if let Some(out) = stdout {
-            if !out.is_empty() && self.progress_stdout.len() < PROGRESS_CAP_BYTES {
-                let stripped = strip_ansi(out);
-                let remaining = PROGRESS_CAP_BYTES.saturating_sub(self.progress_stdout.len());
-                if stripped.len() <= remaining {
-                    self.progress_stdout.push_str(&stripped);
-                } else {
-                    self.progress_stdout.push_str(&stripped[..remaining]);
-                    self.progress_stdout.push_str("\n...(truncated)");
-                }
+            if !out.is_empty() {
+                append_progress_capped(&mut self.progress_stdout, &strip_ansi(out));
             }
         }
     }
@@ -1816,6 +1912,7 @@ impl OtelMapper {
         let short = shorten_label(label);
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new("bazel.target.synthetic", true),
         ];
         let mut builder = self

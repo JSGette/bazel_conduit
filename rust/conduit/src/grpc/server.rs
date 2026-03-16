@@ -136,6 +136,8 @@ impl PublishBuildEvent for BesServer {
 
                         if tx.send(Ok(response)).await.is_err() {
                             debug!("Response channel closed");
+                            let mut router = router.lock().await;
+                            router.finish();
                             break;
                         }
                     }

@@ -1589,13 +1589,24 @@ impl Default for EventRouter {
 }
 
 /// Check for --build_event_publish_all_actions with exact matching.
-/// Avoids false positives from --nobuild_event_publish_all_actions.
+/// Explicitly rejects --nobuild_event_publish_all_actions* and =false/=0 to avoid false positives.
 fn has_publish_all_actions_flag(options: &[&str]) -> bool {
-    options.iter().any(|opt| {
-        *opt == "--build_event_publish_all_actions"
+    let mut seen_on = false;
+    for opt in options {
+        if opt.starts_with("--nobuild_event_publish_all_actions")
+            || *opt == "--build_event_publish_all_actions=false"
+            || *opt == "--build_event_publish_all_actions=0"
+        {
+            return false;
+        }
+        if *opt == "--build_event_publish_all_actions"
             || *opt == "--build_event_publish_all_actions=true"
             || *opt == "--build_event_publish_all_actions=1"
-    })
+        {
+            seen_on = true;
+        }
+    }
+    seen_on
 }
 
 /// Return a short name for the BEP event type (for diagnostic logging).

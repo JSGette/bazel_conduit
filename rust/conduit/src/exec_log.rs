@@ -159,12 +159,18 @@ fn build_output_index(cache: &HashMap<ActionSpanKey, SpanContext>) -> HashMap<St
 // Matching
 // ---------------------------------------------------------------------------
 
+/// Parent directory of a path (everything before the last `/`). Empty if no slash.
+fn output_dir(path: &str) -> &str {
+    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+}
+
 /// Find a parent SpanContext for this SpawnExec.
 ///
 /// Strategy (in order):
 ///   1. Exact ActionSpanKey match (label + mnemonic + output)
 ///   2. Output-only match (handles label mismatches across targets)
-///   3. (label, mnemonic) fuzzy output match
+///   3. (label, mnemonic) fuzzy output match (exact / ends_with)
+///   4. (label, mnemonic) match by output directory (e.g. TestRunner: test.log vs test.xml)
 fn find_parent_for_spawn(
     cache: &HashMap<ActionSpanKey, SpanContext>,
     label_mnemonic_index: &HashMap<(String, String), Vec<(String, SpanContext)>>,
@@ -208,6 +214,21 @@ fn find_parent_for_spawn(
             if cached_out == *out || cached_out.ends_with(out) || out.ends_with(cached_out.as_str())
             {
                 return Some(cx.clone());
+            }
+        }
+    }
+
+    // 4. Match by output directory (e.g. TestRunner: action has test.log, spawn has test.xml)
+    if !outputs.is_empty() {
+        for out in &outputs {
+            let spawn_dir = output_dir(out);
+            if spawn_dir.is_empty() {
+                continue;
+            }
+            for (cached_out, cx) in candidates {
+                if !cached_out.is_empty() && output_dir(cached_out) == spawn_dir {
+                    return Some(cx.clone());
+                }
             }
         }
     }
@@ -385,9 +406,10 @@ fn emit_unmatched_under_synthetic_targets(
     for (label, spawns) in &by_target {
         let (min_start, max_end) = compute_time_bounds(spawns);
 
-        let span_name = format!("target {}", label);
+        let span_name = format!("target {}", shorten_label(label));
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.clone()),
+            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
             KeyValue::new("bazel.target.synthetic", true),
         ];
 
@@ -491,6 +513,10 @@ fn build_spawn_attributes(s: &SpawnExec) -> Vec<KeyValue> {
         attrs.push(KeyValue::new(
             BAZEL_SPAWN_TARGET_LABEL,
             s.target_label.clone(),
+        ));
+        attrs.push(KeyValue::new(
+            BAZEL_SPAWN_TARGET_LABEL_SHORT,
+            shorten_label(&s.target_label).to_string(),
         ));
     }
     if !s.mnemonic.is_empty() {

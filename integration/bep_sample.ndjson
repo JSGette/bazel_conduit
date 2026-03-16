@@ -1,0 +1,2 @@
+{"id":{"started":{}},"started":{"uuid":"aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee","command":"build","workspaceDirectory":"/tmp","workingDirectory":"/tmp","buildToolVersion":"7.0.0","serverPid":12345,"host":"localhost","user":"test"}}
+{"id":{"buildFinished":{}},"finished":{"exitCode":{"name":"SUCCESS","code":0},"finishTimeMillis":1000},"lastMessage":true}
