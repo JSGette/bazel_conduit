@@ -5,6 +5,7 @@
 use super::ActionProcessingMode;
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Tracked state for a single target
 #[derive(Debug, Clone)]
@@ -108,6 +109,9 @@ pub struct BuildState {
 
     // Build metrics (stored as JSON for now)
     build_metrics: Option<serde_json::Value>,
+
+    // Execution log path (from --execution_log_binary_file=)
+    exec_log_path: Option<PathBuf>,
 }
 
 impl BuildState {
@@ -131,6 +135,7 @@ impl BuildState {
             actions: Vec::new(),
             target_action_buffers: DashMap::new(),
             build_metrics: None,
+            exec_log_path: None,
         }
     }
 
@@ -212,6 +217,14 @@ impl BuildState {
 
     pub fn action_mode(&self) -> ActionProcessingMode {
         self.action_mode
+    }
+
+    pub fn set_exec_log_path(&mut self, path: Option<PathBuf>) {
+        self.exec_log_path = path;
+    }
+
+    pub fn exec_log_path(&self) -> Option<&PathBuf> {
+        self.exec_log_path.as_ref()
     }
 
     // =========================================================================
@@ -391,6 +404,30 @@ impl BuildState {
         })
     }
 
+    /// Drain ALL remaining action buffers (unconsumed transitive deps).
+    /// Returns a vec of (label, earliest, latest, actions) tuples.
+    pub fn drain_remaining_action_buffers(
+        &self,
+    ) -> Vec<(String, Option<i64>, Option<i64>, Vec<BufferedAction>)> {
+        let keys: Vec<String> = self
+            .target_action_buffers
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+        let mut result = Vec::new();
+        for key in keys {
+            if let Some((label, buf)) = self.target_action_buffers.remove(&key) {
+                result.push((
+                    label,
+                    buf.earliest_start_nanos,
+                    buf.latest_end_nanos,
+                    buf.actions,
+                ));
+            }
+        }
+        result
+    }
+
     // =========================================================================
     // Build metrics
     // =========================================================================
@@ -432,6 +469,28 @@ impl BuildState {
             failed_actions,
             action_mode: self.action_mode,
         }
+    }
+
+    /// Reset all state for a new build invocation.
+    pub fn reset(&mut self) {
+        self.invocation_id = None;
+        self.command = None;
+        self.command_args.clear();
+        self.start_time_millis = None;
+        self.end_time_millis = None;
+        self.exit_code = None;
+        self.finished = false;
+        self.startup_options.clear();
+        self.action_mode = ActionProcessingMode::default();
+        self.workspace_status.clear();
+        self.patterns.clear();
+        self.configurations.clear();
+        self.targets.clear();
+        self.named_sets.clear();
+        self.actions.clear();
+        self.target_action_buffers.clear();
+        self.build_metrics = None;
+        self.exec_log_path = None;
     }
 }
 

@@ -27,10 +27,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};
-use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
 use tracing::{debug, info, warn};
 
@@ -95,6 +96,51 @@ fn strip_ansi(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Key for caching action span context for exec log enrichment.
+/// Matches SpawnExec entries by target_label, mnemonic, and primary output.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct ActionSpanKey {
+    pub target_label: String,
+    pub mnemonic: String,
+    pub primary_output: String,
+}
+
+/// Normalize label for matching: strip leading `@` so BEP `@@repo//:t` and exec log `@repo//:t` match.
+fn normalize_label(s: &str) -> &str {
+    s.trim_start_matches('@')
+}
+
+/// Strip Bzlmod canonical prefixes for human-readable span names.
+/// `@@+_repo_rules+openssl//:libssl` → `openssl//:libssl`
+/// Keeps the full label available via attributes.
+fn shorten_label(label: &str) -> &str {
+    let stripped = label.trim_start_matches('@');
+    if let Some(idx) = stripped.find("//") {
+        let prefix = &stripped[..idx];
+        if let Some(plus) = prefix.rfind('+') {
+            return &stripped[plus + 1..];
+        }
+    }
+    stripped
+}
+
+const PROGRESS_CAP_BYTES: usize = 1024 * 1024; // 1 MB
+const COMMAND_LINE_CAP_BYTES: usize = 4096; // 4 KB
+
+impl ActionSpanKey {
+    pub fn new(
+        target_label: Option<&str>,
+        mnemonic: Option<&str>,
+        primary_output: Option<&str>,
+    ) -> Self {
+        Self {
+            target_label: normalize_label(target_label.unwrap_or("")).to_string(),
+            mnemonic: mnemonic.unwrap_or("").to_string(),
+            primary_output: primary_output.unwrap_or("").to_string(),
+        }
+    }
+}
+
 /// Metadata captured at `TargetConfigured` time.
 ///
 /// Span creation is **deferred** until `TargetCompleted` so the mapper can
@@ -106,6 +152,7 @@ struct ConfiguredTarget {
     kind: Option<String>,
     tags: Vec<String>,
     event_time_nanos: Option<i64>,
+    test_size: Option<String>,
 }
 
 /// Target span kept open until output file sets are resolved so we can
@@ -114,6 +161,21 @@ struct PendingOutputResolution {
     parent_cx: Context,
     file_set_ids: Vec<String>,
     event_time_nanos: Option<i64>,
+}
+
+/// Test result data buffered when root span is not yet created (replay in on_build_started).
+struct BufferedTestResult {
+    label: String,
+    status: Option<String>,
+    attempt: Option<i32>,
+    run: Option<i32>,
+    shard: Option<i32>,
+    cached: Option<bool>,
+    strategy: Option<String>,
+    start_time_nanos: Option<i64>,
+    duration_nanos: Option<i64>,
+    hostname: Option<String>,
+    cached_remotely: Option<bool>,
 }
 
 /// A single entry in the NamedSet cache.
@@ -156,6 +218,24 @@ pub struct OtelMapper {
     /// Created lazily on first skipped target, ended in [`finish`].
     skipped_context: Option<Context>,
 
+    /// Single `external deps` parent span grouping targets from external repos.
+    /// Created lazily on first external target, ended in [`finish`].
+    external_deps_context: Option<Context>,
+
+    /// Cached configurations: config hash → mnemonic (e.g. `k8-fastbuild`).
+    configurations: HashMap<String, String>,
+
+    /// Cached command name from BuildStarted (for root span name).
+    cached_command: Option<String>,
+
+    /// Cached build patterns (for root span name).
+    cached_patterns: Vec<String>,
+
+    /// Tracks how many child action spans each target has (for cached detection).
+    target_action_counts: HashMap<String, u32>,
+    /// Tracks whether any action for a target was NOT a cache hit.
+    target_has_non_cached_action: HashMap<String, bool>,
+
     /// Accumulated stderr / stdout from all progress messages.
     /// Flushed as an OTel log record correlated with the trace in [`finish`].
     /// Falls back to a span event if no logger is available.
@@ -181,6 +261,22 @@ pub struct OtelMapper {
     /// Replayed once `on_build_started` fires.
     /// Tuple: (url, success, wallclock arrival time, downloader).
     pending_fetches: Vec<(String, bool, SystemTime, Option<String>)>,
+
+    /// TestResult events that arrived before the root span was created.
+    /// Replayed once `on_build_started` fires (BES can send test events before Started).
+    pending_test_results: Vec<BufferedTestResult>,
+
+    /// Path to execution log binary file (from --execution_log_binary_file=).
+    /// Set in on_exec_log_detected, used in finish() for enrichment.
+    exec_log_path: Option<PathBuf>,
+
+    /// Workspace directory from BuildStarted (for resolving relative exec log path).
+    workspace_directory: Option<PathBuf>,
+
+    /// Cached action span contexts for exec log enrichment.
+    /// Key: (target_label, mnemonic, primary_output). Used in finish() to attach
+    /// spawn child spans to the correct action span.
+    action_span_cache: HashMap<ActionSpanKey, SpanContext>,
 }
 
 impl OtelMapper {
@@ -196,6 +292,12 @@ impl OtelMapper {
             pending_output_resolutions: HashMap::new(),
             fetches_context: None,
             skipped_context: None,
+            external_deps_context: None,
+            configurations: HashMap::new(),
+            cached_command: None,
+            cached_patterns: Vec::new(),
+            target_action_counts: HashMap::new(),
+            target_has_non_cached_action: HashMap::new(),
             progress_stderr: String::new(),
             progress_stdout: String::new(),
             logger,
@@ -203,6 +305,10 @@ impl OtelMapper {
             finish_time_nanos: None,
             named_set_cache: HashMap::new(),
             pending_fetches: Vec::new(),
+            pending_test_results: Vec::new(),
+            exec_log_path: None,
+            action_span_cache: HashMap::new(),
+            workspace_directory: None,
         }
     }
 
@@ -220,12 +326,15 @@ impl OtelMapper {
         start_time_nanos: Option<i64>,
         event_time_nanos: Option<i64>,
     ) {
+        self.cached_command = Some(command.to_string());
+
         let trace_id = trace_context::uuid_to_trace_id(uuid);
         let parent_cx = trace_context::make_root_context(trace_id);
 
+        let span_name = format!("bazel {command}");
         let mut builder = self
             .tracer
-            .span_builder("bazel.invocation")
+            .span_builder(span_name)
             .with_kind(SpanKind::Internal)
             .with_attributes(vec![
                 KeyValue::new(BAZEL_INVOCATION_ID, uuid.to_string()),
@@ -271,6 +380,27 @@ impl OtelMapper {
                 self.emit_fetch_span(&url, success, arrival, downloader.as_deref());
             }
         }
+
+        // Replay test results that arrived before the root span (e.g. BES stream order).
+        if !self.pending_test_results.is_empty() {
+            let buffered: Vec<_> = std::mem::take(&mut self.pending_test_results);
+            info!("Replaying {} buffered test result events", buffered.len());
+            for b in buffered {
+                self.on_test_result(
+                    &b.label,
+                    b.status.as_deref(),
+                    b.attempt,
+                    b.run,
+                    b.shard,
+                    b.cached,
+                    b.strategy.as_deref(),
+                    b.start_time_nanos,
+                    b.duration_nanos,
+                    b.hostname.as_deref(),
+                    b.cached_remotely,
+                );
+            }
+        }
     }
 
     /// Extended BuildStarted fields → set attributes on root span.
@@ -286,6 +416,9 @@ impl OtelMapper {
         let Some(cx) = &self.root_context else { return };
         if let Some(v) = workspace_dir {
             cx.span().set_attribute(KeyValue::new(BAZEL_WORKSPACE_DIR, v.to_string()));
+            if !v.is_empty() {
+                self.workspace_directory = Some(PathBuf::from(v));
+            }
         }
         if let Some(v) = working_dir {
             cx.span().set_attribute(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
@@ -313,15 +446,25 @@ impl OtelMapper {
         if let Some(cx) = &self.root_context {
             if !startup_options.is_empty() {
                 cx.span().set_attribute(KeyValue::new(
-                    "bazel.startup_options",
+                    BAZEL_STARTUP_OPTIONS,
                     startup_options.join(" "),
                 ));
             }
             if !explicit_cmd_line.is_empty() {
                 cx.span().set_attribute(KeyValue::new(
-                    "bazel.explicit_cmd_line",
+                    BAZEL_EXPLICIT_CMD_LINE,
                     explicit_cmd_line.join(" "),
                 ));
+            }
+        }
+    }
+
+    /// OptionsParsed → extract tool_tag if present.
+    pub fn on_tool_tag(&mut self, tool_tag: &str) {
+        if !tool_tag.is_empty() {
+            if let Some(cx) = &self.root_context {
+                cx.span()
+                    .set_attribute(KeyValue::new(BAZEL_TOOL_TAG, tool_tag.to_string()));
             }
         }
     }
@@ -334,13 +477,21 @@ impl OtelMapper {
         }
     }
 
+    /// Execution log path detected (from --execution_log_binary_file=).
+    /// Stored for use in finish() to enrich the trace with spawn data.
+    pub fn on_exec_log_detected(&mut self, path: PathBuf) {
+        self.exec_log_path = Some(path);
+    }
+
     /// WorkspaceStatus → add workspace attributes to root span.
+    /// BUILD_USER and BUILD_HOST are mapped to bazel.user/bazel.host directly
+    /// (same semantic as the BuildStarted fields) to avoid duplication.
     pub fn on_workspace_status(&mut self, items: &HashMap<String, String>) {
         if let Some(cx) = &self.root_context {
             for (key, value) in items {
                 let attr_key = match key.as_str() {
-                    "BUILD_USER" => BAZEL_WORKSPACE_USER.to_string(),
-                    "BUILD_HOST" => BAZEL_WORKSPACE_HOST.to_string(),
+                    "BUILD_USER" => BAZEL_USER.to_string(),
+                    "BUILD_HOST" => BAZEL_HOST.to_string(),
                     _ => format!("bazel.workspace.{}", key.to_lowercase()),
                 };
                 cx.span()
@@ -359,12 +510,16 @@ impl OtelMapper {
         }
     }
 
-    /// Pattern expanded → add build patterns as attribute.
+    /// Pattern expanded → add build patterns as attribute and enrich root span name.
     pub fn on_pattern(&mut self, patterns: &[String]) {
         if let Some(cx) = &self.root_context {
             if !patterns.is_empty() {
+                self.cached_patterns = patterns.to_vec();
                 cx.span()
                     .set_attribute(KeyValue::new(BAZEL_PATTERNS, patterns.join(", ")));
+                if let Some(cmd) = &self.cached_command {
+                    cx.span().update_name(format!("bazel {} {}", cmd, patterns.join(" ")));
+                }
             }
         }
     }
@@ -407,23 +562,21 @@ impl OtelMapper {
             None => return,
         };
 
+        let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
         ];
         if let Some(r) = reason {
-            attrs.push(KeyValue::new("bazel.target.abort_reason", r.to_string()));
+            attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_REASON, r.to_string()));
         }
         if let Some(d) = description {
-            attrs.push(KeyValue::new(
-                "bazel.target.abort_description",
-                d.to_string(),
-            ));
+            attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_DESCRIPTION, d.to_string()));
         }
 
         let builder = self
             .tracer
-            .span_builder(format!("target {label}"))
+            .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
 
@@ -446,13 +599,17 @@ impl OtelMapper {
     // Configuration events
     // =====================================================================
 
-    /// Configuration → span event on root span.
+    /// Configuration → span event on root span. Also caches mnemonic for action enrichment.
     pub fn on_configuration(
         &mut self,
         config_id: &str,
         mnemonic: Option<&str>,
         platform: Option<&str>,
     ) {
+        if let Some(m) = mnemonic {
+            self.configurations
+                .insert(config_id.to_string(), m.to_string());
+        }
         if let Some(cx) = &self.root_context {
             let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
             if let Some(m) = mnemonic {
@@ -463,6 +620,27 @@ impl OtelMapper {
             }
             cx.span().add_event("configuration", attrs);
             debug!("Added configuration event: {config_id}");
+        }
+    }
+
+    /// Configuration with cpu/is_tool → add to root span event.
+    pub fn on_configuration_extended(
+        &mut self,
+        config_id: &str,
+        cpu: Option<&str>,
+        is_tool: Option<bool>,
+    ) {
+        if let Some(cx) = &self.root_context {
+            let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
+            if let Some(c) = cpu {
+                attrs.push(KeyValue::new(BAZEL_CONFIG_CPU, c.to_string()));
+            }
+            if let Some(t) = is_tool {
+                attrs.push(KeyValue::new(BAZEL_CONFIG_IS_TOOL, t));
+            }
+            if !attrs.is_empty() {
+                cx.span().add_event("configuration_detail", attrs);
+            }
         }
     }
 
@@ -482,6 +660,7 @@ impl OtelMapper {
         kind: Option<&str>,
         tags: &[String],
         event_time_nanos: Option<i64>,
+        test_size: Option<&str>,
     ) {
         if self.root_context.is_none() {
             warn!("TargetConfigured before BuildStarted for {label}");
@@ -494,6 +673,7 @@ impl OtelMapper {
                 kind: kind.map(String::from),
                 tags: tags.to_vec(),
                 event_time_nanos,
+                test_size: test_size.filter(|s| !s.is_empty()).map(String::from),
             },
         );
 
@@ -510,6 +690,7 @@ impl OtelMapper {
         parent: &Context,
         start_nanos_override: Option<i64>,
     ) -> Context {
+        let short = shorten_label(label);
         let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
         if let Some(k) = &configured.kind {
             attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
@@ -520,11 +701,14 @@ impl OtelMapper {
                 configured.tags.join(", "),
             ));
         }
+        if let Some(ts) = &configured.test_size {
+            attrs.push(KeyValue::new(BAZEL_TARGET_TEST_SIZE, ts.clone()));
+        }
 
         let start_nanos = start_nanos_override.or(configured.event_time_nanos);
         let mut builder = self
             .tracer
-            .span_builder(format!("target {label}"))
+            .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
 
@@ -545,28 +729,62 @@ impl OtelMapper {
         {
             return;
         }
-        let Some(root) = &self.root_context else {
-            return;
-        };
+        let parent = self.choose_parent_for_label(label);
+        let Some(parent) = parent else { return };
         if let Some(configured) = self.configured_targets.get(label) {
-            let cx = self.create_target_span(label, configured, root, None);
+            let cx = self.create_target_span(label, configured, &parent, None);
             debug!("Lazily created target span for {label} (action needed parent)");
             self.target_contexts.insert(label.to_string(), cx);
         } else {
-            // No TargetConfigured for this label; create a synthetic target from the action label.
-            let cx = self.create_synthetic_target_span(label, root);
+            let cx = self.create_synthetic_target_span(label, &parent);
             debug!("Created synthetic target span for {label} (from action label)");
             self.target_contexts.insert(label.to_string(), cx);
+        }
+    }
+
+    /// Returns true if a label looks like an external dependency.
+    fn is_external_label(label: &str) -> bool {
+        label.starts_with("@@") || label.contains("+_repo_rules+")
+    }
+
+    /// Choose the correct parent for a target: root for local targets,
+    /// `external deps` group span for external dependencies.
+    fn choose_parent_for_label(&mut self, label: &str) -> Option<Context> {
+        if Self::is_external_label(label) {
+            self.ensure_external_deps_span();
+            self.external_deps_context.clone()
+        } else {
+            self.root_context.clone()
+        }
+    }
+
+    /// Lazily create the `external deps` parent span.
+    fn ensure_external_deps_span(&mut self) {
+        if self.external_deps_context.is_some() {
+            return;
+        }
+        if let Some(root_cx) = &self.root_context {
+            let builder = self
+                .tracer
+                .span_builder("external deps")
+                .with_kind(SpanKind::Internal);
+            let span = self.tracer.build_with_context(builder, root_cx);
+            self.external_deps_context = Some(Context::new().with_span(span));
+            debug!("Created 'external deps' parent span");
         }
     }
 
     /// Create a target span with only the label (no kind/tags). Used when we see
     /// an action with a label but no prior TargetConfigured event.
     fn create_synthetic_target_span(&self, label: &str, parent: &Context) -> Context {
-        let attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        let short = shorten_label(label);
+        let attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new("bazel.target.synthetic", true),
+        ];
         let builder = self
             .tracer
-            .span_builder(format!("target {label}"))
+            .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
         let span = self.tracer.build_with_context(builder, parent);
@@ -591,13 +809,14 @@ impl OtelMapper {
     ) {
         let effective_end = latest_action_end_nanos.or(event_time_nanos);
 
-        // Get or create the span under root.
+        // Get or create the span under the appropriate parent.
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
             cx
         } else if let Some(configured) = self.configured_targets.remove(label) {
-            if let Some(root) = &self.root_context {
+            let parent = self.choose_parent_for_label(label);
+            if let Some(parent) = parent {
                 let start_override = earliest_action_start_nanos;
-                let cx = self.create_target_span(label, &configured, root, start_override);
+                let cx = self.create_target_span(label, &configured, &parent, start_override);
                 debug!("Created target span for {label} at completion time");
                 cx
             } else {
@@ -692,9 +911,12 @@ impl OtelMapper {
     ) {
         // Consume the configured metadata (if any).
         let configured = self.configured_targets.remove(label);
-        // Also consume any lazily-created span (shouldn't exist for skipped,
-        // but clean up just in case).
-        let _existing = self.target_contexts.remove(label);
+        // End any lazily-created span to avoid leaks.
+        if let Some(existing) = self.target_contexts.remove(label) {
+            existing.span().set_status(Status::Unset);
+            existing.span().end();
+            debug!("Ended leaked target span for {label} on skip");
+        }
 
         // Lazily create the "skipped" parent span.
         if self.skipped_context.is_none() {
@@ -714,7 +936,7 @@ impl OtelMapper {
             None => return,
         };
 
-        // Build the child span.
+        let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
@@ -725,37 +947,28 @@ impl OtelMapper {
             }
         }
         if let Some(r) = reason {
-            attrs.push(KeyValue::new("bazel.target.abort_reason", r.to_string()));
+            attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_REASON, r.to_string()));
         }
         if let Some(d) = description {
-            attrs.push(KeyValue::new(
-                "bazel.target.abort_description",
-                d.to_string(),
-            ));
+            attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_DESCRIPTION, d.to_string()));
         }
 
-        let mut builder = self
+        let instant = event_time_nanos
+            .map(nanos_to_system_time)
+            .unwrap_or_else(SystemTime::now);
+
+        let builder = self
             .tracer
-            .span_builder(format!("target {label}"))
+            .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
-            .with_attributes(attrs);
-
-        // Use configured start time if available.
-        if let Some(configured) = &configured {
-            if let Some(nanos) = configured.event_time_nanos {
-                builder = builder.with_start_time(nanos_to_system_time(nanos));
-            }
-        }
+            .with_attributes(attrs)
+            .with_start_time(instant);
 
         let span = self.tracer.build_with_context(builder, parent);
         let cx = Context::new().with_span(span);
 
         cx.span().set_status(Status::Unset);
-        if let Some(nanos) = event_time_nanos {
-            cx.span().end_with_timestamp(nanos_to_system_time(nanos));
-        } else {
-            cx.span().end();
-        }
+        cx.span().end_with_timestamp(instant);
 
         debug!("Created and ended skipped target span for {label}");
     }
@@ -932,9 +1145,14 @@ impl OtelMapper {
             }
         };
 
+        // Track action for cached-target detection.
+        if let Some(l) = label {
+            *self.target_action_counts.entry(l.to_string()).or_insert(0) += 1;
+        }
+
         let span_name = match (label, mnemonic) {
-            (Some(l), Some(m)) => format!("action {m} {l}"),
-            (Some(l), None) => format!("action {l}"),
+            (Some(l), Some(m)) => format!("action {m} {}", shorten_label(l)),
+            (Some(l), None) => format!("action {}", shorten_label(l)),
             (None, Some(m)) => format!("action {m}"),
             _ => "action".to_string(),
         };
@@ -956,16 +1174,18 @@ impl OtelMapper {
             attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, l.to_string()));
         }
         if let Some(cfg) = configuration {
-            attrs.push(KeyValue::new(
-                BAZEL_ACTION_CONFIGURATION,
-                cfg.to_string(),
-            ));
+            let resolved = self.configurations.get(cfg).cloned();
+            let display_val = resolved.unwrap_or_else(|| cfg.to_string());
+            attrs.push(KeyValue::new(BAZEL_ACTION_CONFIGURATION, display_val));
         }
         if !command_line.is_empty() {
-            attrs.push(KeyValue::new(
-                BAZEL_ACTION_COMMAND_LINE,
-                command_line.join(" "),
-            ));
+            let joined = command_line.join(" ");
+            let capped = if joined.len() > COMMAND_LINE_CAP_BYTES {
+                format!("{}...(truncated)", &joined[..COMMAND_LINE_CAP_BYTES])
+            } else {
+                joined
+            };
+            attrs.push(KeyValue::new(BAZEL_ACTION_COMMAND_LINE, capped));
         }
         if let Some(p) = stdout_path {
             attrs.push(KeyValue::new(BAZEL_ACTION_STDOUT, p.to_string()));
@@ -985,6 +1205,10 @@ impl OtelMapper {
         }
 
         let mut span = self.tracer.build_with_context(builder, &parent);
+
+        let span_cx = span.span_context().clone();
+        let key = ActionSpanKey::new(label, mnemonic, primary_output);
+        self.action_span_cache.insert(key, span_cx);
 
         if success {
             span.set_status(Status::Ok);
@@ -1092,6 +1316,7 @@ impl OtelMapper {
 
     /// TestResult → child span under target span for a single test attempt.
     /// When `start_time_nanos` / `duration_nanos` are present, span uses accurate timing.
+    /// Buffers and replays if root span is not yet created (BES can send test events before Started).
     pub fn on_test_result(
         &mut self,
         label: &str,
@@ -1103,7 +1328,27 @@ impl OtelMapper {
         strategy: Option<&str>,
         start_time_nanos: Option<i64>,
         duration_nanos: Option<i64>,
+        hostname: Option<&str>,
+        cached_remotely: Option<bool>,
     ) {
+        if self.root_context.is_none() {
+            self.pending_test_results.push(BufferedTestResult {
+                label: label.to_string(),
+                status: status.map(String::from),
+                attempt,
+                run,
+                shard,
+                cached,
+                strategy: strategy.map(String::from),
+                start_time_nanos,
+                duration_nanos,
+                hostname: hostname.map(String::from),
+                cached_remotely,
+            });
+            debug!("Buffered test result (root not ready): {label}");
+            return;
+        }
+
         self.ensure_target_span(label);
 
         let parent = self
@@ -1147,6 +1392,14 @@ impl OtelMapper {
         if let Some(st) = strategy {
             attrs.push(KeyValue::new(BAZEL_TEST_STRATEGY, st.to_string()));
         }
+        if let Some(h) = hostname {
+            if !h.is_empty() {
+                attrs.push(KeyValue::new(BAZEL_TEST_HOSTNAME, h.to_string()));
+            }
+        }
+        if let Some(cr) = cached_remotely {
+            attrs.push(KeyValue::new(BAZEL_TEST_CACHED_REMOTELY, cr));
+        }
 
         let mut builder = self
             .tracer
@@ -1178,7 +1431,7 @@ impl OtelMapper {
             span.end();
         }
 
-        debug!("Created test result span for {label}");
+        info!(label, status = ?status, "Created test result span");
     }
 
     /// TestSummary → span event on root (target span is already ended).
@@ -1247,13 +1500,27 @@ impl OtelMapper {
     /// [`finish`].
     pub fn on_progress(&mut self, stderr: Option<&str>, stdout: Option<&str>) {
         if let Some(err) = stderr {
-            if !err.is_empty() {
-                self.progress_stderr.push_str(&strip_ansi(err));
+            if !err.is_empty() && self.progress_stderr.len() < PROGRESS_CAP_BYTES {
+                let stripped = strip_ansi(err);
+                let remaining = PROGRESS_CAP_BYTES.saturating_sub(self.progress_stderr.len());
+                if stripped.len() <= remaining {
+                    self.progress_stderr.push_str(&stripped);
+                } else {
+                    self.progress_stderr.push_str(&stripped[..remaining]);
+                    self.progress_stderr.push_str("\n...(truncated)");
+                }
             }
         }
         if let Some(out) = stdout {
-            if !out.is_empty() {
-                self.progress_stdout.push_str(&strip_ansi(out));
+            if !out.is_empty() && self.progress_stdout.len() < PROGRESS_CAP_BYTES {
+                let stripped = strip_ansi(out);
+                let remaining = PROGRESS_CAP_BYTES.saturating_sub(self.progress_stdout.len());
+                if stripped.len() <= remaining {
+                    self.progress_stdout.push_str(&stripped);
+                } else {
+                    self.progress_stdout.push_str(&stripped[..remaining]);
+                    self.progress_stdout.push_str("\n...(truncated)");
+                }
             }
         }
     }
@@ -1282,7 +1549,12 @@ impl OtelMapper {
     // =====================================================================
 
     /// BuildFinished → record exit code and finish time (root span is ended in [`finish`]).
-    pub fn on_build_finished(&mut self, exit_code: Option<i32>, finish_time_nanos: Option<i64>) {
+    pub fn on_build_finished(
+        &mut self,
+        exit_code: Option<i32>,
+        finish_time_nanos: Option<i64>,
+        exit_code_name: Option<&str>,
+    ) {
         self.exit_code = exit_code;
         self.finish_time_nanos = finish_time_nanos;
 
@@ -1290,6 +1562,10 @@ impl OtelMapper {
             if let Some(code) = exit_code {
                 cx.span()
                     .set_attribute(KeyValue::new(BAZEL_EXIT_CODE, code as i64));
+            }
+            if let Some(name) = exit_code_name {
+                cx.span()
+                    .set_attribute(KeyValue::new(BAZEL_EXIT_CODE_NAME, name.to_string()));
             }
         }
     }
@@ -1317,9 +1593,20 @@ impl OtelMapper {
                     .set_attribute(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTED, executed));
             }
             if let Some(action_data) = s.get("actionData").and_then(|v| v.as_array()) {
-                let summary = summarize_action_data(action_data);
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_METRICS_ACTION_DATA, summary));
+                for entry in action_data {
+                    let mnemonic = entry
+                        .get("mnemonic")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let count = entry
+                        .get("actionsExecuted")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    cx.span().set_attribute(KeyValue::new(
+                        format!("bazel.metrics.actions.{mnemonic}"),
+                        count,
+                    ));
+                }
             }
             if let Some(acs) = s.get("actionCacheStatistics").and_then(|v| v.as_object()) {
                 if let Some(hits) = acs.get("hits").and_then(|v| v.as_i64()) {
@@ -1404,12 +1691,18 @@ impl OtelMapper {
             }
         }
 
-        if let Some(v) = summary
+        if let Some(runners) = summary
             .and_then(|s| s.as_object())
             .and_then(|s| s.get("runnerCount"))
+            .and_then(|v| v.as_array())
         {
-            if let Ok(s) = serde_json::to_string(v) {
-                cx.span().set_attribute(KeyValue::new(BAZEL_METRICS_RUNNER_COUNT, s));
+            for r in runners {
+                let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let count = r.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+                cx.span().set_attribute(KeyValue::new(
+                    format!("bazel.metrics.runner.{name}"),
+                    count,
+                ));
             }
         }
 
@@ -1439,11 +1732,159 @@ impl OtelMapper {
     }
 
     // =====================================================================
+    // Build tool logs (critical path)
+    // =====================================================================
+
+    /// BuildToolLogs → extract critical path info and emit as span event.
+    pub fn on_build_tool_logs(&mut self, logs: &serde_json::Value) {
+        let Some(cx) = &self.root_context else { return };
+        if let Some(entries) = logs.get("log").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name == "critical path" || name.contains("critical") {
+                    let uri = entry.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                    cx.span().add_event(
+                        "build_tool_log",
+                        vec![
+                            KeyValue::new("log.name", name.to_string()),
+                            KeyValue::new("log.uri", uri.to_string()),
+                        ],
+                    );
+                    debug!("Recorded build tool log: {name}");
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // State management
+    // =====================================================================
+
+    /// Reset all mapper state for a new build invocation.
+    pub fn reset(&mut self) {
+        if let Some(cx) = self.root_context.take() {
+            cx.span().end();
+        }
+        if let Some(cx) = self.fetches_context.take() {
+            cx.span().end();
+        }
+        if let Some(cx) = self.skipped_context.take() {
+            cx.span().end();
+        }
+        if let Some(cx) = self.external_deps_context.take() {
+            cx.span().end();
+        }
+        for (_, cx) in self.target_contexts.drain() {
+            cx.span().end();
+        }
+        for (_, p) in self.pending_output_resolutions.drain() {
+            p.parent_cx.span().end();
+        }
+        self.configured_targets.clear();
+        self.configurations.clear();
+        self.cached_command = None;
+        self.cached_patterns.clear();
+        self.target_action_counts.clear();
+        self.target_has_non_cached_action.clear();
+        self.progress_stderr.clear();
+        self.progress_stdout.clear();
+        self.exit_code = None;
+        self.finish_time_nanos = None;
+        self.named_set_cache.clear();
+        self.pending_fetches.clear();
+        self.pending_test_results.clear();
+        self.exec_log_path = None;
+        self.action_span_cache.clear();
+        self.workspace_directory = None;
+    }
+
+    /// Create synthetic target spans and replay actions for orphaned buffers
+    /// (transitive deps with actions but no TargetCompleted event).
+    pub fn drain_orphaned_actions(
+        &mut self,
+        label: &str,
+        earliest: Option<i64>,
+        latest: Option<i64>,
+        actions: &[BufferedAction],
+    ) {
+        if actions.is_empty() {
+            return;
+        }
+        let parent = self.choose_parent_for_label(label);
+        let Some(parent) = parent else { return };
+
+        let short = shorten_label(label);
+        let attrs = vec![
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+            KeyValue::new("bazel.target.synthetic", true),
+        ];
+        let mut builder = self
+            .tracer
+            .span_builder(format!("target {short}"))
+            .with_kind(SpanKind::Internal)
+            .with_attributes(attrs);
+
+        if let Some(nanos) = earliest {
+            builder = builder.with_start_time(nanos_to_system_time(nanos));
+        }
+
+        let span = self.tracer.build_with_context(builder, &parent);
+        let cx = Context::new().with_span(span);
+
+        self.target_contexts.insert(label.to_string(), cx.clone());
+        for act in actions {
+            self.on_action_completed(
+                act.label.as_deref(),
+                act.mnemonic.as_deref(),
+                act.success,
+                act.exit_code,
+                act.primary_output.as_deref(),
+                act.configuration.as_deref(),
+                &act.command_line,
+                act.stdout_uri.as_deref(),
+                act.stderr_uri.as_deref(),
+                act.start_nanos,
+                act.end_nanos,
+            );
+        }
+        let cx = self.target_contexts.remove(label).unwrap_or(cx);
+
+        if let Some(nanos) = latest {
+            cx.span().end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            cx.span().end();
+        }
+        debug!("Created synthetic target span for orphaned transitive dep {label} ({} actions)", actions.len());
+    }
+
+    // =====================================================================
     // Finalization
     // =====================================================================
 
     /// End all remaining spans (call after last BEP event).
     pub fn finish(&mut self) {
+        // Enrich trace with execution log data if --execution_log_binary_file was set.
+        if let Some(ref path) = self.exec_log_path {
+            let resolved = if path.is_relative() {
+                self.workspace_directory
+                    .as_ref()
+                    .map(|ws| ws.join(path))
+                    .unwrap_or_else(|| path.clone())
+            } else {
+                path.clone()
+            };
+            let root_cx = self
+                .root_context
+                .as_ref()
+                .map(|c| c.span().span_context().clone());
+            crate::exec_log::enrich_trace(
+                &resolved,
+                &self.action_span_cache,
+                &self.tracer,
+                root_cx.as_ref(),
+            );
+        }
+
         // End the `fetches` parent span.
         if let Some(cx) = self.fetches_context.take() {
             cx.span().set_status(Status::Ok);
@@ -1490,6 +1931,13 @@ impl OtelMapper {
             cx.span().set_status(Status::Unset);
             cx.span().end();
             debug!("Ended 'skipped targets' span");
+        }
+
+        // End the `external deps` parent span.
+        if let Some(cx) = self.external_deps_context.take() {
+            cx.span().set_status(Status::Ok);
+            cx.span().end();
+            debug!("Ended 'external deps' span");
         }
 
         // Flush accumulated progress text as an OTel log record correlated

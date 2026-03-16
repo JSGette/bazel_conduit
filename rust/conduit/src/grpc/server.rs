@@ -150,6 +150,8 @@ impl PublishBuildEvent for BesServer {
                     }
                     Err(e) => {
                         error!(error = %e, "Stream error");
+                        let mut router = router.lock().await;
+                        router.finish();
                         let _ = tx
                             .send(Err(Status::internal(format!("Stream error: {e}"))))
                             .await;

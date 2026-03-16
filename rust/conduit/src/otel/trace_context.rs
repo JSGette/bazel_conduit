@@ -48,8 +48,9 @@ pub fn make_root_context(trace_id: TraceId) -> Context {
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<TracerProvider>> {
     let resource = Resource::new(vec![
-        KeyValue::new("service.name", "conduit"),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.name", "bazel"),
+        KeyValue::new("telemetry.sdk.name", "conduit"),
+        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
     ]);
 
     match config {
@@ -83,8 +84,9 @@ pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<Trac
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_logger_provider(config: &ExportConfig) -> anyhow::Result<Option<LoggerProvider>> {
     let resource = Resource::new(vec![
-        KeyValue::new("service.name", "conduit"),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.name", "bazel"),
+        KeyValue::new("telemetry.sdk.name", "conduit"),
+        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
     ]);
 
     match config {

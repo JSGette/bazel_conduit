@@ -8,8 +8,19 @@ use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
 use crate::otel::OtelMapper;
 use crate::state::{ActionProcessingMode, BuildState};
+use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, info, trace};
+
+const EXEC_LOG_BINARY_FILE_PREFIX: &str = "--execution_log_binary_file=";
+
+fn extract_exec_log_binary_path(options: &[&str]) -> Option<PathBuf> {
+    options
+        .iter()
+        .find_map(|opt| opt.strip_prefix(EXEC_LOG_BINARY_FILE_PREFIX))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
 
 /// Errors that can occur during event routing
 #[derive(Error, Debug)]
@@ -55,9 +66,13 @@ impl EventRouter {
         &mut self.state
     }
 
-    /// Finalize: end any remaining open spans and flush.
+    /// Finalize: drain remaining action buffers and end all open spans.
     pub fn finish(&mut self) {
         if let Some(mapper) = &mut self.mapper {
+            let remaining = self.state.drain_remaining_action_buffers();
+            for (label, earliest, latest, actions) in remaining {
+                mapper.drain_orphaned_actions(&label, earliest, latest, &actions);
+            }
             mapper.finish();
         }
     }
@@ -110,11 +125,12 @@ impl EventRouter {
             // ExecRequest for `bazel run`
             "execRequest" => Ok(()),
 
+            "buildToolLogs" => self.handle_build_tool_logs(event),
+
             // Ignored events (no OTel value)
             "structuredCommandLine" => Ok(()), // Redundant with optionsParsed
             "convenienceSymlinksIdentified" => Ok(()), // Local filesystem detail
             "workspaceInfo" => Ok(()), // Rarely populated
-            "buildToolLogs" => Ok(()), // BES-level, not BEP-level
 
             // Unknown events
             other => {
@@ -135,10 +151,22 @@ impl EventRouter {
             None => return Err(RouterError::MissingEventId),
         };
 
-        trace!("Routing BEP event (proto)");
+        let event_type = bep_event_type_name(id);
+        match event_type {
+            "TestResult" | "TestSummary" | "TargetConfigured" | "TargetCompleted" | "Started" | "BuildFinished" => {
+                info!(event_type, "BEP event received");
+            }
+            _ => {
+                trace!(event_type, "BEP event received");
+            }
+        }
 
         match id {
             BepId::Started(_) => {
+                self.state.reset();
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.reset();
+                }
                 if let Some(BepPayload::Started(s)) = &event.payload {
                     let start_time_nanos = s
                         .start_time
@@ -197,9 +225,7 @@ impl EventRouter {
                         .chain(&o.explicit_cmd_line)
                         .map(String::as_str)
                         .collect();
-                    let has_all_actions = all_options
-                        .iter()
-                        .any(|opt| opt.contains("build_event_publish_all_actions"));
+                    let has_all_actions = has_publish_all_actions_flag(&all_options);
                     self.state.set_action_mode(if has_all_actions {
                         ActionProcessingMode::Full
                     } else {
@@ -208,10 +234,19 @@ impl EventRouter {
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_action_mode(self.state.action_mode());
                     }
+                    if let Some(path) = extract_exec_log_binary_path(&all_options) {
+                        self.state.set_exec_log_path(Some(path.clone()));
+                        if let Some(mapper) = &mut self.mapper {
+                            mapper.on_exec_log_detected(path);
+                        }
+                    }
                     self.state.set_startup_options(o.startup_options.clone());
                     let explicit = o.explicit_cmd_line.clone();
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_options_parsed(&o.startup_options, &explicit);
+                        if !o.tool_tag.is_empty() {
+                            mapper.on_tool_tag(&o.tool_tag);
+                        }
                     }
                 }
                 Ok(())
@@ -247,6 +282,11 @@ impl EventRouter {
                             Some(cfg.mnemonic.as_str()),
                             Some(cfg.platform_name.as_str()),
                         );
+                        mapper.on_configuration_extended(
+                            &id,
+                            if cfg.cpu.is_empty() { None } else { Some(cfg.cpu.as_str()) },
+                            Some(cfg.is_tool),
+                        );
                     }
                 }
                 Ok(())
@@ -254,6 +294,7 @@ impl EventRouter {
             BepId::BuildFinished(_) => {
                 if let Some(BepPayload::Finished(f)) = &event.payload {
                     let exit_code = f.exit_code.as_ref().map(|ec| ec.code);
+                    let exit_code_name = f.exit_code.as_ref().map(|ec| ec.name.as_str());
                     let finish_time_nanos = f
                         .finish_time
                         .as_ref()
@@ -274,7 +315,7 @@ impl EventRouter {
                     }
                     self.state.mark_finished();
                     if let Some(mapper) = &mut self.mapper {
-                        mapper.on_build_finished(exit_code, finish_time_nanos);
+                        mapper.on_build_finished(exit_code, finish_time_nanos, exit_code_name);
                     }
                 }
                 Ok(())
@@ -304,6 +345,13 @@ impl EventRouter {
                     let label = t.label.clone();
                     let kind = c.target_kind.clone();
                     let tags = c.tag.clone();
+                    let test_size = match c.test_size {
+                        1 => Some("SMALL"),
+                        2 => Some("MEDIUM"),
+                        3 => Some("LARGE"),
+                        4 => Some("ENORMOUS"),
+                        _ => None,
+                    };
                     self.state.start_target(label.clone(), Some(kind.clone()), None);
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_target_configured(
@@ -311,6 +359,7 @@ impl EventRouter {
                             Some(kind.as_str()),
                             &tags,
                             event_time_nanos,
+                            test_size,
                         );
                     }
                 }
@@ -514,12 +563,20 @@ impl EventRouter {
                 Ok(())
             }
             BepId::TestResult(tr) => {
+                let label = tr.label.clone();
                 if let Some(BepPayload::TestResult(pr)) = &event.payload {
-                    let label = tr.label.clone();
-                    let strategy: Option<&str> = pr
-                        .execution_info
-                        .as_ref()
-                        .map(|ei| ei.strategy.as_str());
+                    info!(
+                        label = %label,
+                        status = ?crate::grpc::server::test_status_to_str(pr.status),
+                        attempt = tr.attempt,
+                        "Received TestResult (BEP)"
+                    );
+                    let ei = pr.execution_info.as_ref();
+                    let strategy: Option<&str> = ei.map(|e| e.strategy.as_str());
+                    let hostname: Option<&str> = ei
+                        .map(|e| e.hostname.as_str())
+                        .filter(|h| !h.is_empty());
+                    let cached_remotely: Option<bool> = ei.map(|e| e.cached_remotely);
                     let start_time_nanos = pr.test_attempt_start.as_ref()
                         .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
                     let duration_nanos = pr.test_attempt_duration.as_ref()
@@ -535,8 +592,15 @@ impl EventRouter {
                             strategy,
                             start_time_nanos,
                             duration_nanos,
+                            hostname,
+                            cached_remotely,
                         );
                     }
+                } else {
+                    debug!(
+                        label = %label,
+                        "TestResult id received but payload is not TestResult (payload variant mismatch)"
+                    );
                 }
                 Ok(())
             }
@@ -572,11 +636,29 @@ impl EventRouter {
                 }
                 Ok(())
             }
+            BepId::BuildToolLogs(_) => {
+                if let Some(BepPayload::BuildToolLogs(btl)) = &event.payload {
+                    if let Some(mapper) = &mut self.mapper {
+                        let logs: Vec<serde_json::Value> = btl
+                            .log
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "name": f.name,
+                                    "uri": crate::grpc::server::bep_file_uri(f),
+                                })
+                            })
+                            .collect();
+                        let json = serde_json::json!({"log": logs});
+                        mapper.on_build_tool_logs(&json);
+                    }
+                }
+                Ok(())
+            }
             BepId::StructuredCommandLine(_)
             | BepId::TestProgress(_)
             | BepId::ExecRequest(_)
             | BepId::Workspace(_)
-            | BepId::BuildToolLogs(_)
             | BepId::ConvenienceSymlinksIdentified(_)
             | BepId::Unknown(_) => Ok(()),
         }
@@ -587,6 +669,11 @@ impl EventRouter {
     // =========================================================================
 
     fn handle_started(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        self.state.reset();
+        if let Some(mapper) = &mut self.mapper {
+            mapper.reset();
+        }
+
         let payload = event.get_payload("started");
 
         if let Some(started) = payload {
@@ -681,10 +768,7 @@ impl EventRouter {
                 .filter_map(|v| v.as_str())
                 .collect();
 
-            // Check for --build_event_publish_all_actions flag
-            let has_all_actions = all_options
-                .iter()
-                .any(|opt| opt.contains("build_event_publish_all_actions"));
+            let has_all_actions = has_publish_all_actions_flag(&all_options);
 
             if has_all_actions {
                 info!("Detected --build_event_publish_all_actions → full action processing");
@@ -698,6 +782,13 @@ impl EventRouter {
             // OTel: record action mode on root span
             if let Some(mapper) = &mut self.mapper {
                 mapper.on_action_mode(self.state.action_mode());
+            }
+
+            if let Some(path) = extract_exec_log_binary_path(&all_options) {
+                self.state.set_exec_log_path(Some(path.clone()));
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_exec_log_detected(path);
+                }
             }
 
             // Extract startup options
@@ -722,9 +813,16 @@ impl EventRouter {
                 })
                 .unwrap_or_default();
 
-            // OTel
             if let Some(mapper) = &mut self.mapper {
                 mapper.on_options_parsed(&startup_opts, &explicit);
+
+                let tool_tag = payload
+                    .get("toolTag")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !tool_tag.is_empty() {
+                    mapper.on_tool_tag(tool_tag);
+                }
             }
         }
         Ok(())
@@ -779,9 +877,12 @@ impl EventRouter {
                     platform.map(String::from),
                 );
 
-                // OTel: add configuration as span event on root
                 if let Some(mapper) = &mut self.mapper {
                     mapper.on_configuration(config_id, mnemonic, platform);
+
+                    let cpu = payload.get("cpu").and_then(|v| v.as_str());
+                    let is_tool = payload.get("isTool").and_then(|v| v.as_bool());
+                    mapper.on_configuration_extended(config_id, cpu, is_tool);
                 }
             }
         }
@@ -795,6 +896,10 @@ impl EventRouter {
                 .and_then(|ec| ec.get("code"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
+            let exit_code_name = payload
+                .get("exitCode")
+                .and_then(|ec| ec.get("name"))
+                .and_then(|v| v.as_str());
             let finish_time_millis = payload.get("finishTimeMillis").and_then(|v| v.as_i64());
             let finish_time_nanos = payload
                 .get("finishTimeNanos")
@@ -815,7 +920,7 @@ impl EventRouter {
             self.state.mark_finished();
 
             if let Some(mapper) = &mut self.mapper {
-                mapper.on_build_finished(exit_code, finish_time_nanos);
+                mapper.on_build_finished(exit_code, finish_time_nanos, exit_code_name);
             }
         }
         Ok(())
@@ -878,6 +983,11 @@ impl EventRouter {
                 .and_then(|c| c.get("targetKind"))
                 .and_then(|v| v.as_str());
 
+            let test_size = payload
+                .and_then(|c| c.get("testSize"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+
             let tags: Vec<String> = payload
                 .and_then(|c| c.get("tag"))
                 .and_then(|v| v.as_array())
@@ -901,13 +1011,13 @@ impl EventRouter {
                 None,
             );
 
-            // OTel: create target span with BES event_time as start
             if let Some(mapper) = &mut self.mapper {
                 mapper.on_target_configured(
                     label,
                     target_kind,
                     &tags,
                     event.event_time_nanos,
+                    test_size,
                 );
             }
         }
@@ -1215,12 +1325,16 @@ impl EventRouter {
             let cached = payload
                 .and_then(|p| p.get("cachedLocally"))
                 .and_then(|v| v.as_bool());
-            let strategy = payload
-                .and_then(|p| p.get("executionInfo"))
-                .and_then(|ei| ei.get("strategy"))
-                .and_then(|v| v.as_str());
+            let ei = payload.and_then(|p| p.get("executionInfo"));
+            let strategy = ei.and_then(|e| e.get("strategy")).and_then(|v| v.as_str());
+            let hostname = ei
+                .and_then(|e| e.get("hostname"))
+                .and_then(|v| v.as_str())
+                .filter(|h| !h.is_empty());
+            let cached_remotely = ei
+                .and_then(|e| e.get("cachedRemotely"))
+                .and_then(|v| v.as_bool());
 
-            // Test attempt info from the event ID
             let attempt = event
                 .id
                 .get("testResult")
@@ -1266,6 +1380,8 @@ impl EventRouter {
                     strategy,
                     start_time_nanos,
                     duration_nanos,
+                    hostname,
+                    cached_remotely,
                 );
             }
         }
@@ -1443,6 +1559,16 @@ impl EventRouter {
         Ok(())
     }
 
+    fn handle_build_tool_logs(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        if let Some(payload) = event.get_payload("buildToolLogs") {
+            debug!("Build tool logs received");
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_build_tool_logs(payload);
+            }
+        }
+        Ok(())
+    }
+
     fn handle_build_metadata(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         if let Some(payload) = event.get_payload("buildMetadata") {
             debug!("Build metadata received");
@@ -1459,5 +1585,50 @@ impl EventRouter {
 impl Default for EventRouter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Check for --build_event_publish_all_actions with exact matching.
+/// Avoids false positives from --nobuild_event_publish_all_actions.
+fn has_publish_all_actions_flag(options: &[&str]) -> bool {
+    options.iter().any(|opt| {
+        *opt == "--build_event_publish_all_actions"
+            || *opt == "--build_event_publish_all_actions=true"
+            || *opt == "--build_event_publish_all_actions=1"
+    })
+}
+
+/// Return a short name for the BEP event type (for diagnostic logging).
+fn bep_event_type_name(id: &crate::build_event_stream::build_event_id::Id) -> &'static str {
+    use crate::build_event_stream::build_event_id::Id;
+    match id {
+        Id::Started(_) => "Started",
+        Id::UnstructuredCommandLine(_) => "UnstructuredCommandLine",
+        Id::StructuredCommandLine(_) => "StructuredCommandLine",
+        Id::OptionsParsed(_) => "OptionsParsed",
+        Id::WorkspaceStatus(_) => "WorkspaceStatus",
+        Id::Configuration(_) => "Configuration",
+        Id::Pattern(_) => "Pattern",
+        Id::PatternSkipped(_) => "PatternSkipped",
+        Id::TargetConfigured(_) => "TargetConfigured",
+        Id::TargetCompleted(_) => "TargetCompleted",
+        Id::ActionCompleted(_) => "ActionCompleted",
+        Id::NamedSet(_) => "NamedSet",
+        Id::TestResult(_) => "TestResult",
+        Id::TestSummary(_) => "TestSummary",
+        Id::BuildFinished(_) => "BuildFinished",
+        Id::BuildMetrics(_) => "BuildMetrics",
+        Id::TargetSummary(_) => "TargetSummary",
+        Id::Progress(_) => "Progress",
+        Id::Fetch(_) => "Fetch",
+        Id::Workspace(_) => "Workspace",
+        Id::BuildToolLogs(_) => "BuildToolLogs",
+        Id::BuildMetadata(_) => "BuildMetadata",
+        Id::ConvenienceSymlinksIdentified(_) => "ConvenienceSymlinksIdentified",
+        Id::UnconfiguredLabel(_) => "UnconfiguredLabel",
+        Id::ConfiguredLabel(_) => "ConfiguredLabel",
+        Id::TestProgress(_) => "TestProgress",
+        Id::ExecRequest(_) => "ExecRequest",
+        Id::Unknown(_) => "Unknown",
     }
 }

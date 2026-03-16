@@ -4,6 +4,7 @@
 //! OpenTelemetry traces for observability.
 
 pub mod bep;
+pub mod exec_log;
 pub mod grpc;
 pub mod otel;
 pub mod state;
