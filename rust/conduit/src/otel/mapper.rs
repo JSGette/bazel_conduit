@@ -180,6 +180,38 @@ pub struct ActionSpanKey {
     pub primary_output: String,
 }
 
+/// Cached action span data for exec log enrichment.
+/// Carries the SpanContext plus timing bounds so child spawn spans can be
+/// clamped to the parent action's time range (required by Datadog's flame graph).
+#[derive(Clone)]
+pub struct ActionSpanInfo {
+    pub span_context: SpanContext,
+    pub start_nanos: Option<i64>,
+    pub end_nanos: Option<i64>,
+}
+
+/// Clamp a (start, end) time range to fit within (bound_start, bound_end).
+/// Ensures the result satisfies start <= end when both are present.
+pub fn clamp_time_range(
+    start: Option<i64>,
+    end: Option<i64>,
+    bound_start: Option<i64>,
+    bound_end: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    let clamped_start = match (start, bound_start) {
+        (Some(s), Some(bs)) => Some(s.max(bs)),
+        (s, _) => s,
+    };
+    let clamped_end = match (end, bound_end) {
+        (Some(e), Some(be)) => Some(e.min(be)),
+        (e, _) => e,
+    };
+    match (clamped_start, clamped_end) {
+        (Some(s), Some(e)) if s > e => (Some(e), Some(e)),
+        _ => (clamped_start, clamped_end),
+    }
+}
+
 /// Normalize label for matching: strip leading `@` so BEP `@@repo//:t` and exec log `@repo//:t` match.
 fn normalize_label(s: &str) -> &str {
     s.trim_start_matches('@')
@@ -411,10 +443,10 @@ pub struct OtelMapper {
     /// Workspace directory from BuildStarted (for resolving relative exec log path).
     workspace_directory: Option<PathBuf>,
 
-    /// Cached action span contexts for exec log enrichment.
+    /// Cached action span info for exec log enrichment.
     /// Key: (target_label, mnemonic, primary_output). Used in finish() to attach
-    /// spawn child spans to the correct action span.
-    action_span_cache: HashMap<ActionSpanKey, SpanContext>,
+    /// spawn child spans to the correct action span, with timing for clamping.
+    action_span_cache: HashMap<ActionSpanKey, ActionSpanInfo>,
 }
 
 impl OtelMapper {
@@ -1392,18 +1424,31 @@ impl OtelMapper {
             }
         };
 
+        // Clamp action timing to root span bounds so cached-action timestamps
+        // (which reflect original remote execution time) don't escape the build.
+        let (clamped_start, clamped_end) = clamp_time_range(
+            ev.start_time_nanos,
+            ev.end_time_nanos,
+            self.root_span_start_nanos,
+            self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
+        );
+
         let span_cx = self.build_and_end_child_span(
             &parent,
             span_name,
             SpanKind::Internal,
             attrs,
             status,
-            ev.start_time_nanos,
-            ev.end_time_nanos,
+            clamped_start,
+            clamped_end,
         );
 
         let key = ActionSpanKey::new(ev.label, ev.mnemonic, ev.primary_output);
-        self.action_span_cache.insert(key, span_cx);
+        self.action_span_cache.insert(key, ActionSpanInfo {
+            span_context: span_cx,
+            start_nanos: clamped_start,
+            end_nanos: clamped_end,
+        });
 
         debug!("Created action span (success={}) for {:?}", ev.success, ev.label);
     }
@@ -1938,6 +1983,10 @@ impl OtelMapper {
         let parent = self.choose_parent_for_label(label);
         let Some(parent) = parent else { return };
 
+        let root_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
+        let (clamped_start, clamped_end) =
+            clamp_time_range(earliest, latest, self.root_span_start_nanos, root_end);
+
         let short = shorten_label(label);
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
@@ -1950,7 +1999,7 @@ impl OtelMapper {
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
 
-        if let Some(nanos) = earliest {
+        if let Some(nanos) = clamped_start {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
         }
 
@@ -1963,7 +2012,7 @@ impl OtelMapper {
         }
         let cx = self.target_contexts.remove(label).unwrap_or(cx);
 
-        if let Some(nanos) = latest {
+        if let Some(nanos) = clamped_end {
             cx.span().end_with_timestamp(nanos_to_system_time(nanos));
         } else {
             cx.span().end();
@@ -1991,11 +2040,14 @@ impl OtelMapper {
                 .root_context
                 .as_ref()
                 .map(|c| c.span().span_context().clone());
+            let root_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
             crate::exec_log::enrich_trace(
                 &resolved,
                 &self.action_span_cache,
                 &self.tracer,
                 root_cx.as_ref(),
+                self.root_span_start_nanos,
+                root_end,
             );
         }
 
@@ -2264,6 +2316,50 @@ mod tests {
         assert!(mapper.root_context.is_none());
         assert!(mapper.exit_code.is_none());
         assert!(mapper.cached_command.is_none());
+    }
+
+    #[test]
+    fn clamp_time_range_no_bounds() {
+        let (s, e) = clamp_time_range(Some(10), Some(20), None, None);
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(20));
+    }
+
+    #[test]
+    fn clamp_time_range_clamps_start() {
+        let (s, e) = clamp_time_range(Some(5), Some(20), Some(10), None);
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(20));
+    }
+
+    #[test]
+    fn clamp_time_range_clamps_end() {
+        let (s, e) = clamp_time_range(Some(10), Some(30), None, Some(20));
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(20));
+    }
+
+    #[test]
+    fn clamp_time_range_both_bounds() {
+        // Spawn starts before parent and ends after parent
+        let (s, e) = clamp_time_range(Some(5), Some(30), Some(10), Some(20));
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(20));
+    }
+
+    #[test]
+    fn clamp_time_range_inverted_collapses() {
+        // After clamping, start > end → collapse to (end, end)
+        let (s, e) = clamp_time_range(Some(25), Some(8), Some(10), Some(20));
+        assert_eq!(s, Some(8));
+        assert_eq!(e, Some(8));
+    }
+
+    #[test]
+    fn clamp_time_range_within_bounds_unchanged() {
+        let (s, e) = clamp_time_range(Some(12), Some(18), Some(10), Some(20));
+        assert_eq!(s, Some(12));
+        assert_eq!(e, Some(18));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use prost::Message;
 use tracing::{debug, info, warn};
 
 use crate::otel::attributes::*;
-use crate::otel::mapper::ActionSpanKey;
+use crate::otel::mapper::{ActionSpanInfo, ActionSpanKey, clamp_time_range};
 use spawn_proto::tools::protos::SpawnExec;
 
 fn nanos_to_system_time(nanos: i64) -> SystemTime {
@@ -129,27 +129,27 @@ fn spawn_exec_candidate_keys(s: &SpawnExec) -> Vec<ActionSpanKey> {
 // Indexes
 // ---------------------------------------------------------------------------
 
-/// (normalized_label, mnemonic) -> list of (primary_output, SpanContext).
+/// (normalized_label, mnemonic) -> list of (primary_output, ActionSpanInfo).
 fn build_label_mnemonic_index(
-    cache: &HashMap<ActionSpanKey, SpanContext>,
-) -> HashMap<(String, String), Vec<(String, SpanContext)>> {
-    let mut index: HashMap<(String, String), Vec<(String, SpanContext)>> = HashMap::new();
-    for (k, cx) in cache {
+    cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
+) -> HashMap<(String, String), Vec<(String, ActionSpanInfo)>> {
+    let mut index: HashMap<(String, String), Vec<(String, ActionSpanInfo)>> = HashMap::new();
+    for (k, info) in cache {
         let key = (k.target_label.clone(), k.mnemonic.clone());
         index
             .entry(key)
             .or_default()
-            .push((k.primary_output.clone(), cx.clone()));
+            .push((k.primary_output.clone(), info.clone()));
     }
     index
 }
 
-/// output_path -> SpanContext, for matching by output alone when labels diverge.
-fn build_output_index(cache: &HashMap<ActionSpanKey, SpanContext>) -> HashMap<String, SpanContext> {
+/// output_path -> ActionSpanInfo, for matching by output alone when labels diverge.
+fn build_output_index(cache: &HashMap<ActionSpanKey, ActionSpanInfo>) -> HashMap<String, ActionSpanInfo> {
     let mut index = HashMap::new();
-    for (k, cx) in cache {
+    for (k, info) in cache {
         if !k.primary_output.is_empty() {
-            index.insert(k.primary_output.clone(), cx.clone());
+            index.insert(k.primary_output.clone(), info.clone());
         }
     }
     index
@@ -164,7 +164,7 @@ fn output_dir(path: &str) -> &str {
     path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }
 
-/// Find a parent SpanContext for this SpawnExec.
+/// Find a parent ActionSpanInfo for this SpawnExec.
 ///
 /// Strategy (in order):
 ///   1. Exact ActionSpanKey match (label + mnemonic + output)
@@ -172,27 +172,27 @@ fn output_dir(path: &str) -> &str {
 ///   3. (label, mnemonic) fuzzy output match (exact / ends_with)
 ///   4. (label, mnemonic) match by output directory (e.g. TestRunner: test.log vs test.xml)
 fn find_parent_for_spawn(
-    cache: &HashMap<ActionSpanKey, SpanContext>,
-    label_mnemonic_index: &HashMap<(String, String), Vec<(String, SpanContext)>>,
-    output_index: &HashMap<String, SpanContext>,
+    cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
+    label_mnemonic_index: &HashMap<(String, String), Vec<(String, ActionSpanInfo)>>,
+    output_index: &HashMap<String, ActionSpanInfo>,
     s: &SpawnExec,
-) -> Option<SpanContext> {
+) -> Option<ActionSpanInfo> {
     // 1. exact key match
     for k in spawn_exec_candidate_keys(s) {
-        if let Some(cx) = cache.get(&k) {
-            return Some(cx.clone());
+        if let Some(info) = cache.get(&k) {
+            return Some(info.clone());
         }
     }
 
     // 2. output-only match
     for out in &s.listed_outputs {
-        if let Some(cx) = output_index.get(out.as_str()) {
-            return Some(cx.clone());
+        if let Some(info) = output_index.get(out.as_str()) {
+            return Some(info.clone());
         }
     }
     for f in &s.actual_outputs {
-        if let Some(cx) = output_index.get(f.path.as_str()) {
-            return Some(cx.clone());
+        if let Some(info) = output_index.get(f.path.as_str()) {
+            return Some(info.clone());
         }
     }
 
@@ -210,10 +210,10 @@ fn find_parent_for_spawn(
         .chain(s.actual_outputs.iter().map(|f| f.path.as_str()))
         .collect();
     for out in &outputs {
-        for (cached_out, cx) in candidates {
+        for (cached_out, info) in candidates {
             if cached_out == *out || cached_out.ends_with(out) || out.ends_with(cached_out.as_str())
             {
-                return Some(cx.clone());
+                return Some(info.clone());
             }
         }
     }
@@ -225,9 +225,9 @@ fn find_parent_for_spawn(
             if spawn_dir.is_empty() {
                 continue;
             }
-            for (cached_out, cx) in candidates {
+            for (cached_out, info) in candidates {
                 if !cached_out.is_empty() && output_dir(cached_out) == spawn_dir {
-                    return Some(cx.clone());
+                    return Some(info.clone());
                 }
             }
         }
@@ -321,11 +321,16 @@ fn duration_to_ms_raw(seconds: i64, nanos: i32) -> i64 {
 ///   1. Parse all entries, attempt to match each to a BEP action span.
 ///   2. For unmatched entries, create synthetic target spans grouped by
 ///      target_label, then emit spawn spans under them.
+///
+/// `root_start_nanos` / `root_end_nanos` are the root span's time bounds,
+/// used to clamp synthetic target spans so they don't escape the build window.
 pub fn enrich_trace(
     path: &Path,
-    action_span_cache: &HashMap<ActionSpanKey, SpanContext>,
+    action_span_cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
     tracer: &opentelemetry_sdk::trace::Tracer,
     root_span_context: Option<&SpanContext>,
+    root_start_nanos: Option<i64>,
+    root_end_nanos: Option<i64>,
 ) {
     let mut parser = match ExecLogParser::open(path) {
         Ok(p) => p,
@@ -338,7 +343,7 @@ pub fn enrich_trace(
     let label_mnemonic_index = build_label_mnemonic_index(action_span_cache);
     let output_index = build_output_index(action_span_cache);
 
-    let mut matched: Vec<(SpanContext, SpawnExec)> = Vec::new();
+    let mut matched: Vec<(ActionSpanInfo, SpawnExec)> = Vec::new();
     let mut unmatched: Vec<SpawnExec> = Vec::new();
 
     // Pass 1: parse and classify
@@ -350,7 +355,7 @@ pub fn enrich_trace(
             &entry,
         );
         match parent {
-            Some(cx) => matched.push((cx, entry)),
+            Some(info) => matched.push((info, entry)),
             None => unmatched.push(entry),
         }
     }
@@ -358,15 +363,21 @@ pub fn enrich_trace(
     let total = matched.len() + unmatched.len();
 
     // Emit matched spans under their BEP action parent
-    for (parent_cx, entry) in &matched {
-        emit_spawn_span(tracer, parent_cx, entry);
+    for (parent_info, entry) in &matched {
+        emit_spawn_span(tracer, parent_info, entry);
     }
 
     // Pass 2: group unmatched by target_label, create synthetic parents
     let unmatched_count = unmatched.len();
     if !unmatched.is_empty() {
         if let Some(root_cx) = root_span_context {
-            emit_unmatched_under_synthetic_targets(tracer, root_cx, unmatched);
+            emit_unmatched_under_synthetic_targets(
+                tracer,
+                root_cx,
+                unmatched,
+                root_start_nanos,
+                root_end_nanos,
+            );
         } else {
             debug!(
                 count = unmatched_count,
@@ -385,10 +396,14 @@ pub fn enrich_trace(
 }
 
 /// Group unmatched spawns by target_label and emit under synthetic target spans.
+/// Timing is clamped to root span bounds to prevent synthetic targets from
+/// escaping the build time window (e.g. cached actions with old timestamps).
 fn emit_unmatched_under_synthetic_targets(
     tracer: &opentelemetry_sdk::trace::Tracer,
     root_cx: &SpanContext,
     entries: Vec<SpawnExec>,
+    root_start_nanos: Option<i64>,
+    root_end_nanos: Option<i64>,
 ) {
     let mut by_target: HashMap<String, Vec<SpawnExec>> = HashMap::new();
     for entry in entries {
@@ -404,7 +419,9 @@ fn emit_unmatched_under_synthetic_targets(
     let root_ctx = Context::new().with_remote_span_context(root_cx.clone());
 
     for (label, spawns) in &by_target {
-        let (min_start, max_end) = compute_time_bounds(spawns);
+        let (raw_start, raw_end) = compute_time_bounds(spawns);
+        let (clamped_start, clamped_end) =
+            clamp_time_range(raw_start, raw_end, root_start_nanos, root_end_nanos);
 
         let span_name = format!("target {}", shorten_label(label));
         let attrs = vec![
@@ -417,18 +434,29 @@ fn emit_unmatched_under_synthetic_targets(
             .span_builder(span_name)
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
-        if let Some(start) = min_start {
+        if let Some(start) = clamped_start {
             builder = builder.with_start_time(nanos_to_system_time(start));
         }
 
+        let synthetic_info = ActionSpanInfo {
+            span_context: SpanContext::empty_context(),
+            start_nanos: clamped_start,
+            end_nanos: clamped_end,
+        };
+
         let mut target_span = tracer.build_with_context(builder, &root_ctx);
         let target_cx = target_span.span_context().clone();
+        let target_info = ActionSpanInfo {
+            span_context: target_cx,
+            start_nanos: synthetic_info.start_nanos,
+            end_nanos: synthetic_info.end_nanos,
+        };
 
         for entry in spawns {
-            emit_spawn_span(tracer, &target_cx, entry);
+            emit_spawn_span(tracer, &target_info, entry);
         }
 
-        if let Some(end) = max_end {
+        if let Some(end) = clamped_end {
             target_span.end_with_timestamp(nanos_to_system_time(end));
         } else {
             target_span.end();
@@ -464,19 +492,24 @@ fn compute_time_bounds(spawns: &[SpawnExec]) -> (Option<i64>, Option<i64>) {
 // Span emission with full exec log data
 // ---------------------------------------------------------------------------
 
+/// Create a spawn child span under the given parent action.
+/// Spawn timing from the exec log is clamped to the parent action's bounds
+/// so child spans don't start before or end after their parent (required by
+/// Datadog's flame graph, which uses temporal containment for nesting).
 fn emit_spawn_span(
     tracer: &opentelemetry_sdk::trace::Tracer,
-    parent_cx: &SpanContext,
+    parent_info: &ActionSpanInfo,
     s: &SpawnExec,
 ) {
-    let parent_ctx = Context::new().with_remote_span_context(parent_cx.clone());
+    let parent_ctx = Context::new().with_remote_span_context(parent_info.span_context.clone());
     let name = spawn_operation_name(s);
 
     let mut attrs = build_spawn_attributes(s);
 
-    let (start_time, end_time) = extract_timing(s);
+    let (raw_start, raw_end) = extract_timing(s);
+    let (start_time, end_time) =
+        clamp_time_range(raw_start, raw_end, parent_info.start_nanos, parent_info.end_nanos);
 
-    // Pre-allocate capacity hint
     attrs.reserve(4);
 
     let mut builder = tracer
