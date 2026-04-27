@@ -77,23 +77,43 @@ impl PublishBuildEvent for BesServer {
 
     /// Handle the bidirectional stream of build tool events
     ///
-    /// This is the main method that receives BEP events from Bazel.
-    /// Each request contains an OrderedBuildEvent wrapping a BES BuildEvent,
-    /// which in turn contains a google.protobuf.Any wrapping a
-    /// build_event_stream.BuildEvent.
+    /// Receive loop is decoupled from routing: incoming events are decoded and
+    /// ACKed inline, then forwarded to a single worker task that calls into the
+    /// OTel mapper serially (preserving order). This keeps Bazel's BES upload
+    /// timer bounded by network + decode latency rather than span emission cost.
     async fn publish_build_tool_event_stream(
         &self,
         request: Request<Streaming<PublishBuildToolEventStreamRequest>>,
     ) -> Result<Response<Self::PublishBuildToolEventStreamStream>, Status> {
         let mut stream = request.into_inner();
-        let (tx, rx) = mpsc::channel(128);
+        let (ack_tx, ack_rx) = mpsc::channel(128);
+        let (route_tx, mut route_rx) =
+            mpsc::channel::<(crate::build_event_stream::BuildEvent, Option<i64>)>(
+                ROUTE_CHANNEL_CAPACITY,
+            );
         let router = self.router.clone();
 
         info!("Build tool event stream started");
 
+        let router_for_worker = router.clone();
+        tokio::spawn(async move {
+            let mut routed: u64 = 0;
+            while let Some((build_event, event_time_nanos)) = route_rx.recv().await {
+                let mut router = router_for_worker.lock().await;
+                if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
+                    warn!(error = %e, "Failed to route BEP event");
+                }
+                routed += 1;
+            }
+            let mut router = router_for_worker.lock().await;
+            router.finish();
+            let summary = router.state().summary();
+            info!("\n{}", summary);
+            info!("Routing worker drained ({routed} events routed)");
+        });
+
         tokio::spawn(async move {
             let mut event_count: u64 = 0;
-
             loop {
                 match stream.message().await {
                     Ok(Some(req)) => {
@@ -104,6 +124,10 @@ impl PublishBuildEvent for BesServer {
                             .as_ref()
                             .map(|e| e.sequence_number)
                             .unwrap_or(0);
+                        let stream_id = req
+                            .ordered_build_event
+                            .as_ref()
+                            .and_then(|e| e.stream_id.clone());
 
                         trace!(
                             sequence = sequence_number,
@@ -111,61 +135,49 @@ impl PublishBuildEvent for BesServer {
                             "Received build tool event"
                         );
 
-                        // Extract the BazelEvent Any payload from the BES BuildEvent
-                        if let Some((build_event, event_time_nanos)) =
-                            crate::grpc::server::decode_bep_event_from_request(&req)
-                        {
-                            let mut router = router.lock().await;
-                            if let Err(e) =
-                                router.route_build_event(&build_event, event_time_nanos)
-                            {
-                                warn!(error = %e, "Failed to route BEP event");
-                            }
-                        }
-
-                        // Send acknowledgement
-                        let stream_id = req
-                            .ordered_build_event
-                            .as_ref()
-                            .and_then(|e| e.stream_id.clone());
-
                         let response = PublishBuildToolEventStreamResponse {
                             stream_id,
                             sequence_number,
                         };
-
-                        if tx.send(Ok(response)).await.is_err() {
-                            debug!("Response channel closed");
-                            let mut router = router.lock().await;
-                            router.finish();
+                        if ack_tx.send(Ok(response)).await.is_err() {
+                            debug!("ACK channel closed");
                             break;
+                        }
+
+                        if let Some(decoded) =
+                            crate::grpc::server::decode_bep_event_from_request(&req)
+                        {
+                            if route_tx.send(decoded).await.is_err() {
+                                warn!("Routing worker channel closed");
+                                break;
+                            }
                         }
                     }
                     Ok(None) => {
-                        // Stream ended — finalize OTel spans, then print summary.
-                        let mut router = router.lock().await;
-                        router.finish();
-                        let summary = router.state().summary();
-                        info!("\n{}", summary);
-                        info!("gRPC stream completed ({event_count} events processed)");
+                        info!("gRPC stream completed ({event_count} events received)");
+                        // Dropping route_tx signals the worker to drain and finalize.
+                        drop(route_tx);
                         break;
                     }
                     Err(e) => {
                         error!(error = %e, "Stream error");
-                        let mut router = router.lock().await;
-                        router.finish();
-                        let _ = tx
+                        let _ = ack_tx
                             .send(Err(Status::internal(format!("Stream error: {e}"))))
                             .await;
+                        drop(route_tx);
                         break;
                     }
                 }
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(ReceiverStream::new(ack_rx)))
     }
 }
+
+/// Bound on the receive→worker hand-off; sized to match the OTel batch queue
+/// so even a fully-cached giant build never backpressures the BES ACK path.
+const ROUTE_CHANNEL_CAPACITY: usize = 65536;
 
 /// Extract a BEP event from a PublishBuildToolEventStreamRequest.
 ///

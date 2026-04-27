@@ -1,7 +1,7 @@
 use clap::Parser;
 use conduit_lib::bep::{BepDecoder, EventRouter};
 use conduit_lib::grpc::run_server;
-use conduit_lib::otel::{ExportConfig, init_logger_provider};
+use conduit_lib::otel::{ExportConfig, init_logger_provider, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -32,6 +32,11 @@ struct Args {
     /// OTLP endpoint (used when --export=otlp)
     #[arg(long, default_value = "http://localhost:4317")]
     otlp_endpoint: String,
+
+    /// Max spans per OTLP export RPC. Keep below the receiver's gRPC
+    /// `max_recv_msg_size` (4 MiB default) to avoid RESOURCE_EXHAUSTED.
+    #[arg(long, default_value_t = DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE)]
+    otlp_max_export_batch_size: usize,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
@@ -66,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         "stdout" => ExportConfig::Stdout,
         "otlp" => ExportConfig::Otlp {
             endpoint: args.otlp_endpoint.clone(),
+            max_export_batch_size: args.otlp_max_export_batch_size,
         },
         _ => ExportConfig::None,
     };

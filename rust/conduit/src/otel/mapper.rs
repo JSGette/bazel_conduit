@@ -192,12 +192,21 @@ pub struct ActionSpanInfo {
 
 /// Clamp a (start, end) time range to fit within (bound_start, bound_end).
 /// Ensures the result satisfies start <= end when both are present.
+///
+/// Heuristic: when the entire range predates `bound_start` (both start and end
+/// are strictly before the invocation began), treat it as a cache hit replaying
+/// original exec timestamps and collapse to zero duration at `bound_start`.
 pub fn clamp_time_range(
     start: Option<i64>,
     end: Option<i64>,
     bound_start: Option<i64>,
     bound_end: Option<i64>,
 ) -> (Option<i64>, Option<i64>) {
+    if let (Some(s), Some(e), Some(bs)) = (start, end, bound_start) {
+        if s < bs && e <= bs {
+            return (Some(bs), Some(bs));
+        }
+    }
     let clamped_start = match (start, bound_start) {
         (Some(s), Some(bs)) => Some(s.max(bs)),
         (s, _) => s,
@@ -239,6 +248,20 @@ fn tail_byte_offset(s: &str, max_tail_bytes: usize) -> usize {
         i += 1;
     }
     i.min(s.len())
+}
+
+/// Truncate `s` to at most `max_bytes` bytes, stepping back to the nearest
+/// UTF-8 boundary and appending `suffix`. Returns the original string when
+/// it already fits.
+pub fn truncate_to_byte_limit(s: &str, max_bytes: usize, suffix: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &s[..cut], suffix)
 }
 
 /// Append `new_content` to `buf` while keeping total size ≤ PROGRESS_CAP_BYTES.
@@ -1402,11 +1425,7 @@ impl OtelMapper {
         }
         if !ev.command_line.is_empty() {
             let joined = ev.command_line.join(" ");
-            let capped = if joined.len() > COMMAND_LINE_CAP_BYTES {
-                format!("{}...(truncated)", &joined[..COMMAND_LINE_CAP_BYTES])
-            } else {
-                joined
-            };
+            let capped = truncate_to_byte_limit(&joined, COMMAND_LINE_CAP_BYTES, "...(truncated)");
             attrs.push(KeyValue::new(BAZEL_ACTION_COMMAND_LINE, capped));
         }
         if let Some(p) = ev.stdout_path {
@@ -2360,6 +2379,41 @@ mod tests {
         let (s, e) = clamp_time_range(Some(12), Some(18), Some(10), Some(20));
         assert_eq!(s, Some(12));
         assert_eq!(e, Some(18));
+    }
+
+    #[test]
+    fn clamp_time_range_cached_collapses_to_zero() {
+        // Both endpoints predate the invocation → cached replay, zero duration at bound_start.
+        let (s, e) = clamp_time_range(Some(2), Some(8), Some(10), Some(20));
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(10));
+    }
+
+    #[test]
+    fn clamp_time_range_cached_end_equal_bound_start() {
+        // end exactly at bound_start still counts as fully-before.
+        let (s, e) = clamp_time_range(Some(2), Some(10), Some(10), Some(20));
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(10));
+    }
+
+    #[test]
+    fn truncate_to_byte_limit_short_string_unchanged() {
+        let out = truncate_to_byte_limit("hello", 10, "...");
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn truncate_to_byte_limit_ascii_truncates() {
+        let out = truncate_to_byte_limit("0123456789abcdef", 5, "...");
+        assert_eq!(out, "01234...");
+    }
+
+    #[test]
+    fn truncate_to_byte_limit_steps_back_to_char_boundary() {
+        // 'é' is 2 bytes; cutting at 5 lands mid-char, must step back to 4.
+        let out = truncate_to_byte_limit("café café", 5, "...");
+        assert_eq!(out, "café...");
     }
 
     #[test]

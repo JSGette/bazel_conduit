@@ -7,5 +7,5 @@ pub mod trace_context;
 pub use mapper::{ActionCompletedEvent, OtelMapper, TestResultEvent};
 pub use trace_context::{
     build_invocation_resource, init_logger_provider, init_tracer_provider,
-    init_tracer_provider_with_resource, ExportConfig,
+    init_tracer_provider_with_resource, ExportConfig, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE,
 };

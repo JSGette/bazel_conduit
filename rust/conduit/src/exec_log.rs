@@ -22,8 +22,12 @@ use prost::Message;
 use tracing::{debug, info, warn};
 
 use crate::otel::attributes::*;
-use crate::otel::mapper::{ActionSpanInfo, ActionSpanKey, clamp_time_range};
+use crate::otel::mapper::{ActionSpanInfo, ActionSpanKey, clamp_time_range, truncate_to_byte_limit};
 use spawn_proto::tools::protos::SpawnExec;
+
+/// Cap for string attributes built from variable-length lists (listed_outputs,
+/// command args) so a single span can't single-handedly blow the OTLP payload.
+const SPAWN_ATTR_CAP_BYTES: usize = 4096;
 
 fn nanos_to_system_time(nanos: i64) -> SystemTime {
     if nanos >= 0 {
@@ -567,11 +571,13 @@ fn build_spawn_attributes(s: &SpawnExec) -> Vec<KeyValue> {
         attrs.push(KeyValue::new(BAZEL_SPAWN_PRIMARY_OUTPUT, primary_output));
     }
 
-    // All listed outputs
     if !s.listed_outputs.is_empty() {
+        let joined = s.listed_outputs.join(", ");
+        let total = s.listed_outputs.len();
+        let suffix = format!("... ({total} outputs total)");
         attrs.push(KeyValue::new(
             BAZEL_SPAWN_LISTED_OUTPUTS,
-            s.listed_outputs.join(", "),
+            truncate_to_byte_limit(&joined, SPAWN_ATTR_CAP_BYTES, &suffix),
         ));
     }
 
@@ -602,15 +608,12 @@ fn build_spawn_attributes(s: &SpawnExec) -> Vec<KeyValue> {
         }
     }
 
-    // Command (join args; cap at 4KB to avoid blowing up span size)
     if !s.command_args.is_empty() {
         let cmd = s.command_args.join(" ");
-        let cmd = if cmd.len() > 4096 {
-            format!("{}...", &cmd[..4096])
-        } else {
-            cmd
-        };
-        attrs.push(KeyValue::new(BAZEL_SPAWN_COMMAND, cmd));
+        attrs.push(KeyValue::new(
+            BAZEL_SPAWN_COMMAND,
+            truncate_to_byte_limit(&cmd, SPAWN_ATTR_CAP_BYTES, "..."),
+        ));
     }
 
     // I/O counts

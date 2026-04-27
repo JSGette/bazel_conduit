@@ -9,6 +9,10 @@ use opentelemetry_sdk::logs::LoggerProvider;
 use opentelemetry_sdk::trace::TracerProvider;
 use opentelemetry_sdk::Resource;
 
+/// Default max spans per OTLP export RPC. Sized below gRPC's 4 MiB default
+/// receive limit so conduit works against off-the-shelf receivers without tuning.
+pub const DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE: usize = 512;
+
 /// Export configuration for OTel spans.
 #[derive(Debug, Clone)]
 pub enum ExportConfig {
@@ -17,7 +21,11 @@ pub enum ExportConfig {
     /// Print spans as JSON to stdout (for development).
     Stdout,
     /// Send spans via OTLP gRPC to an endpoint (Jaeger, Datadog Agent, etc.).
-    Otlp { endpoint: String },
+    Otlp {
+        endpoint: String,
+        /// Applies to the trace exporter only (log exporter uses its own batching).
+        max_export_batch_size: usize,
+    },
 }
 
 /// Convert a Bazel invocation UUID string into an OTel TraceID.
@@ -64,7 +72,7 @@ fn build_tracer_provider(
                 .build();
             Ok(Some(provider))
         }
-        ExportConfig::Otlp { endpoint } => {
+        ExportConfig::Otlp { endpoint, max_export_batch_size } => {
             use opentelemetry_otlp::WithExportConfig;
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
@@ -72,7 +80,7 @@ fn build_tracer_provider(
                 .build()?;
             let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
                 .with_max_queue_size(65536)
-                .with_max_export_batch_size(4096)
+                .with_max_export_batch_size(*max_export_batch_size)
                 .build();
             let batch_processor =
                 opentelemetry_sdk::trace::BatchSpanProcessor::builder(
@@ -141,7 +149,7 @@ pub fn init_logger_provider(config: &ExportConfig) -> anyhow::Result<Option<Logg
                 .build();
             Ok(Some(provider))
         }
-        ExportConfig::Otlp { endpoint } => {
+        ExportConfig::Otlp { endpoint, .. } => {
             use opentelemetry_otlp::WithExportConfig;
             let exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_tonic()
