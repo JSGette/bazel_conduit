@@ -8,10 +8,31 @@ use opentelemetry::{Context, KeyValue};
 use opentelemetry_sdk::logs::LoggerProvider;
 use opentelemetry_sdk::trace::TracerProvider;
 use opentelemetry_sdk::Resource;
+use std::time::Duration;
 
-/// Default max spans per OTLP export RPC. Sized below gRPC's 4 MiB default
+/// Default max records per OTLP export RPC. Sized below gRPC's 4 MiB default
 /// receive limit so conduit works against off-the-shelf receivers without tuning.
 pub const DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE: usize = 512;
+
+/// Steady-state ticker between OTLP exports. 200 ms keeps trace-list / Datadog
+/// APM updates feeling live while keeping per-RPC overhead low.
+const SCHEDULED_DELAY: Duration = Duration::from_millis(200);
+
+/// Per-export RPC deadline. With Tokio runtime + a healthy Datadog Agent,
+/// 2 s is generous; we'd rather drop a stalled batch than pile pressure on
+/// the queue.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Span queue depth. Sized to absorb a 12 k-event bazel test on a slow
+/// receiver without dropping spans.
+const MAX_QUEUE_SIZE: usize = 65_536;
+
+/// Run two exports in flight so a single slow RPC doesn't stall the queue.
+const MAX_CONCURRENT_EXPORTS: usize = 2;
+
+// TODO(transport): once the OTLP endpoint moves off-host, enable HTTP/2 keep-alive
+// (`http2_keep_alive_interval`, `keep_alive_while_idle`) and `gzip-tonic`
+// compression on both exporters.
 
 /// Export configuration for OTel spans.
 #[derive(Debug, Clone)]
@@ -77,15 +98,14 @@ fn build_tracer_provider(
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
+                .with_timeout(EXPORT_TIMEOUT)
                 .build()?;
-            // 1 s scheduled_delay keeps live streaming snappy in `--serve`
-            // mode where the TracerProvider is rebuilt per invocation
-            // (Resource carries `bazel.invocation_id`). Default 5 s would
-            // delay the first batch noticeably for short builds.
             let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
-                .with_max_queue_size(65536)
+                .with_max_queue_size(MAX_QUEUE_SIZE)
                 .with_max_export_batch_size(*max_export_batch_size)
-                .with_scheduled_delay(std::time::Duration::from_secs(1))
+                .with_scheduled_delay(SCHEDULED_DELAY)
+                .with_max_export_timeout(EXPORT_TIMEOUT)
+                .with_max_concurrent_exports(MAX_CONCURRENT_EXPORTS)
                 .build();
             let batch_processor =
                 opentelemetry_sdk::trace::BatchSpanProcessor::builder(
@@ -96,6 +116,48 @@ fn build_tracer_provider(
                 .build();
             let provider = TracerProvider::builder()
                 .with_span_processor(batch_processor)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+    }
+}
+
+fn build_logger_provider(
+    config: &ExportConfig,
+    resource: Resource,
+) -> anyhow::Result<Option<LoggerProvider>> {
+    match config {
+        ExportConfig::None => Ok(None),
+        ExportConfig::Stdout => {
+            let exporter = opentelemetry_stdout::LogExporter::default();
+            let provider = LoggerProvider::builder()
+                .with_simple_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            Ok(Some(provider))
+        }
+        ExportConfig::Otlp { endpoint, max_export_batch_size } => {
+            use opentelemetry_otlp::WithExportConfig;
+            let exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .with_timeout(EXPORT_TIMEOUT)
+                .build()?;
+            let batch_config = opentelemetry_sdk::logs::BatchConfigBuilder::default()
+                .with_max_queue_size(MAX_QUEUE_SIZE)
+                .with_max_export_batch_size(*max_export_batch_size)
+                .with_scheduled_delay(SCHEDULED_DELAY)
+                .with_max_export_timeout(EXPORT_TIMEOUT)
+                .build();
+            let batch_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(
+                exporter,
+                opentelemetry_sdk::runtime::Tokio,
+            )
+            .with_batch_config(batch_config)
+            .build();
+            let provider = LoggerProvider::builder()
+                .with_log_processor(batch_processor)
                 .with_resource(resource)
                 .build();
             Ok(Some(provider))
@@ -143,30 +205,7 @@ pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<Trac
 ///
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_logger_provider(config: &ExportConfig) -> anyhow::Result<Option<LoggerProvider>> {
-    let resource = default_resource();
-    match config {
-        ExportConfig::None => Ok(None),
-        ExportConfig::Stdout => {
-            let exporter = opentelemetry_stdout::LogExporter::default();
-            let provider = LoggerProvider::builder()
-                .with_simple_exporter(exporter)
-                .with_resource(resource)
-                .build();
-            Ok(Some(provider))
-        }
-        ExportConfig::Otlp { endpoint, .. } => {
-            use opentelemetry_otlp::WithExportConfig;
-            let exporter = opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()?;
-            let provider = LoggerProvider::builder()
-                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                .with_resource(resource)
-                .build();
-            Ok(Some(provider))
-        }
-    }
+    build_logger_provider(config, default_resource())
 }
 
 #[cfg(test)]

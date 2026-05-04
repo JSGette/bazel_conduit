@@ -182,14 +182,10 @@ impl EventRouter {
     /// worker) deadlocks the runtime when the queue is non-empty: the export
     /// and timeout-timer tasks share workers with us, so the worker we just
     /// blocked is the one that would have driven the response back.
-    /// Instead we rely on the periodic `scheduled_delay` ticker to drain
-    /// (200 ms once Phase 1 lands; 1 s today for spans, 1 s default for logs).
+    /// Instead we rely on the periodic `scheduled_delay` ticker (200 ms,
+    /// see [`crate::otel::trace_context`]) to drain.
     pub fn finish(&mut self) {
         if let Some(mapper) = &mut self.mapper {
-            let remaining = self.state.drain_remaining_action_buffers();
-            for (label, earliest, latest, actions) in remaining {
-                mapper.drain_orphaned_actions(&label, earliest, latest, &actions);
-            }
             mapper.finish();
         }
     }
@@ -431,11 +427,10 @@ impl EventRouter {
                         .as_ref()
                         .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos))
                         .or_else(|| {
-                            if f.finish_time_millis != 0 {
-                                Some(f.finish_time_millis * 1_000_000)
-                            } else {
-                                None
-                            }
+                            // Bazel pre-7.0 only set the deprecated `finish_time_millis`.
+                            #[allow(deprecated)]
+                            let ms = f.finish_time_millis;
+                            (ms != 0).then_some(ms * 1_000_000)
                         });
                     if let Some(code) = exit_code {
                         self.state.set_exit_code(code);
@@ -526,19 +521,12 @@ impl EventRouter {
                         None,
                     );
                     if let Some(mapper) = &mut self.mapper {
-                        let (earliest, latest, buffered) = self
-                            .state
-                            .take_target_action_buffer(&label)
-                            .unwrap_or((None, None, vec![]));
                         mapper.on_target_completed(
                             &label,
                             c.success,
                             &file_sets,
                             &tags,
                             event_time_nanos,
-                            earliest,
-                            latest,
-                            &buffered,
                         );
                     }
                 }
@@ -1252,21 +1240,14 @@ impl EventRouter {
                 None,
             );
 
-            // OTel: end target span with resolved file sets + action-based timing when available
+            // OTel: end target span with resolved file sets.
             if let Some(mapper) = &mut self.mapper {
-                let (earliest, latest, buffered) = self
-                    .state
-                    .take_target_action_buffer(label)
-                    .unwrap_or((None, None, vec![]));
                 mapper.on_target_completed(
                     label,
                     success,
                     &file_sets,
                     &tags,
                     event.event_time_nanos,
-                    earliest,
-                    latest,
-                    &buffered,
                 );
             }
         }

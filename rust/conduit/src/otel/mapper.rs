@@ -38,7 +38,6 @@ use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt,
 use opentelemetry::{Context, KeyValue};
 use tracing::{debug, info, warn};
 
-use crate::state::BufferedAction;
 use super::attributes::*;
 use super::redact::Redactor;
 use super::trace_context;
@@ -135,29 +134,6 @@ pub struct ActionCompletedEvent<'a> {
     pub hostname: Option<&'a str>,
     pub cached_remotely: Option<bool>,
     pub runner: Option<&'a str>,
-}
-
-impl<'a> ActionCompletedEvent<'a> {
-    pub fn from_buffered(act: &'a BufferedAction) -> Self {
-        Self {
-            label: act.label.as_deref(),
-            mnemonic: act.mnemonic.as_deref(),
-            success: act.success,
-            exit_code: act.exit_code,
-            exit_code_name: act.exit_code_name.as_deref(),
-            primary_output: act.primary_output.as_deref(),
-            configuration: act.configuration.as_deref(),
-            command_line: &act.command_line,
-            stdout_path: act.stdout_uri.as_deref(),
-            stderr_path: act.stderr_uri.as_deref(),
-            start_time_nanos: act.start_nanos,
-            end_time_nanos: act.end_nanos,
-            cached: act.cached,
-            hostname: act.hostname.as_deref(),
-            cached_remotely: act.cached_remotely,
-            runner: act.runner.as_deref(),
-        }
-    }
 }
 
 /// Arguments for [`OtelMapper::on_test_result`].
@@ -1067,8 +1043,6 @@ impl OtelMapper {
     /// TargetCompleted → create (or reuse) the target span, set attributes,
     /// then either set output attributes and end (if file sets resolved), or
     /// keep the span open for later resolution in [`on_named_set`] / [`finish`].
-    /// Target start/end use earliest action start and latest action end when
-    /// available so duration reflects actual work.
     pub fn on_target_completed(
         &mut self,
         label: &str,
@@ -1076,15 +1050,11 @@ impl OtelMapper {
         file_set_ids: &[String],
         tags: &[String],
         event_time_nanos: Option<i64>,
-        earliest_action_start_nanos: Option<i64>,
-        latest_action_end_nanos: Option<i64>,
-        buffered_actions: &[BufferedAction],
     ) {
         // Clamp end-of-target to the invocation window. Cached targets re-emit
         // their original action timestamps, so without this a span ending at
         // event_time will run from the cached `start` (weeks ago) to today.
-        let raw_end = latest_action_end_nanos.or(event_time_nanos);
-        let (_, effective_end) = self.clamp_to_invocation(earliest_action_start_nanos, raw_end);
+        let (_, effective_end) = self.clamp_to_invocation(None, event_time_nanos);
 
         // Get or create the span under the appropriate parent.
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
@@ -1092,8 +1062,7 @@ impl OtelMapper {
         } else if let Some(configured) = self.configured_targets.remove(label) {
             let parent = self.choose_parent_for_label(label);
             if let Some(parent) = parent {
-                let start_override = earliest_action_start_nanos;
-                let cx = self.create_target_span(label, &configured, &parent, start_override);
+                let cx = self.create_target_span(label, &configured, &parent, None);
                 debug!("Created target span for {label} at completion time");
                 cx
             } else {
@@ -1117,18 +1086,6 @@ impl OtelMapper {
                 .set_attribute(KeyValue::new(BAZEL_TARGET_TAGS, tags.join(", ")));
         }
 
-        // Sub-ms target with no actions → mark trivial (e.g. alias, no-op).
-        if buffered_actions.is_empty() {
-            let duration_nanos = match (earliest_action_start_nanos, effective_end) {
-                (Some(s), Some(e)) if e > s => e - s,
-                _ => 0,
-            };
-            if duration_nanos < 1_000_000 {
-                cx.span()
-                    .set_attribute(KeyValue::new(BAZEL_TARGET_TRIVIAL, true));
-            }
-        }
-
         let status = if success {
             Status::Ok
         } else {
@@ -1137,15 +1094,6 @@ impl OtelMapper {
             }
         };
         cx.span().set_status(status);
-
-        // Replay buffered actions as children of this target (target was created with action-based timing).
-        if !buffered_actions.is_empty() {
-            self.target_contexts.insert(label.to_string(), cx.clone());
-            for act in buffered_actions {
-                self.on_action_completed(&ActionCompletedEvent::from_buffered(act));
-            }
-            self.target_contexts.remove(label);
-        }
 
         if file_set_ids.is_empty() {
             if let Some(nanos) = effective_end {
@@ -2098,58 +2046,6 @@ impl OtelMapper {
         self.workspace_directory = None;
     }
 
-    /// Create synthetic target spans and replay actions for orphaned buffers
-    /// (transitive deps with actions but no TargetCompleted event).
-    pub fn drain_orphaned_actions(
-        &mut self,
-        label: &str,
-        earliest: Option<i64>,
-        latest: Option<i64>,
-        actions: &[BufferedAction],
-    ) {
-        if actions.is_empty() {
-            return;
-        }
-        let parent = self.choose_parent_for_label(label);
-        let Some(parent) = parent else { return };
-
-        let root_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
-        let (clamped_start, clamped_end) =
-            clamp_time_range(earliest, latest, self.root_span_start_nanos, root_end);
-
-        let short = shorten_label(label);
-        let attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
-            KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
-        ];
-        let mut builder = self
-            .tracer
-            .span_builder(format!("target {short}"))
-            .with_kind(SpanKind::Internal)
-            .with_attributes(attrs);
-
-        if let Some(nanos) = clamped_start {
-            builder = builder.with_start_time(nanos_to_system_time(nanos));
-        }
-
-        let span = self.tracer.build_with_context(builder, &parent);
-        let cx = Context::new().with_span(span);
-
-        self.target_contexts.insert(label.to_string(), cx.clone());
-        for act in actions {
-            self.on_action_completed(&ActionCompletedEvent::from_buffered(act));
-        }
-        let cx = self.target_contexts.remove(label).unwrap_or(cx);
-
-        if let Some(nanos) = clamped_end {
-            cx.span().end_with_timestamp(nanos_to_system_time(nanos));
-        } else {
-            cx.span().end();
-        }
-        debug!("Created synthetic target span for orphaned transitive dep {label} ({} actions)", actions.len());
-    }
-
     // =====================================================================
     // Finalization
     // =====================================================================
@@ -2517,31 +2413,5 @@ mod tests {
         assert_eq!(e, Some(2_000_000_000));
     }
 
-    #[test]
-    fn action_completed_event_from_buffered() {
-        let act = BufferedAction {
-            label: Some("//pkg:t".to_string()),
-            mnemonic: Some("Javac".to_string()),
-            success: true,
-            exit_code: Some(0),
-            exit_code_name: None,
-            primary_output: Some("out.jar".to_string()),
-            configuration: None,
-            command_line: vec!["javac".to_string(), "Main.java".to_string()],
-            stdout_uri: None,
-            stderr_uri: None,
-            start_nanos: Some(100),
-            end_nanos: Some(200),
-            cached: Some(false),
-            hostname: None,
-            cached_remotely: None,
-            runner: None,
-        };
-        let ev = ActionCompletedEvent::from_buffered(&act);
-        assert_eq!(ev.label, Some("//pkg:t"));
-        assert_eq!(ev.mnemonic, Some("Javac"));
-        assert!(ev.success);
-        assert_eq!(ev.command_line.len(), 2);
-    }
 }
 

@@ -116,8 +116,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut router = EventRouter::new().with_redactor(redactor);
-    if !matches!(&export_config, ExportConfig::None) {
-        let lp = log_provider.ok_or_else(|| anyhow::anyhow!("export enabled but LoggerProvider init failed"))?;
+    if let Some(lp) = log_provider {
         router = router.with_export(export_config.clone(), lp);
     }
 

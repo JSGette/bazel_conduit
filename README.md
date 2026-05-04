@@ -234,7 +234,7 @@ Bazel sometimes sends `start_time_nanos = 0` on action spans with `end_time_nano
 
 ### Lesson 5: BatchSpanProcessor Can Silently Drop Spans
 
-The default OpenTelemetry `BatchSpanProcessor` queue size is 2048 spans. Large Bazel builds (thousands of actions + spawns) overflow this easily. Conduit sets the queue to **65,536** with a batch size of **4,096** to avoid silent span loss.
+The default OpenTelemetry `BatchSpanProcessor` queue size is 2048 spans. Large Bazel builds (thousands of actions + spawns) overflow this easily. Conduit configures both the span and log batch processors with queue **65,536**, batch **512**, scheduled delay **200 ms**, and per-export timeout **2 s** (see `rust/conduit/src/otel/trace_context.rs`).
 
 ### Lesson 6: Proto-Generated Duration Types Vary
 
@@ -246,7 +246,7 @@ BEP events use `@@repo//:target` (double-at canonical form) while the execution 
 
 ### Lesson 8: LoggerProvider Flush Timing in Server Mode
 
-In gRPC serve mode, `router.finish()` emits OTel log records to the batch processor, but if `shutdown_providers()` is never called (e.g., the server loops for the next connection), the batch processor may never flush. Explicit shutdown or force-flush is required after each build stream completes.
+In gRPC serve mode, `router.finish()` emits OTel log records to the batch processor and returns. We deliberately do **not** call `force_flush()` from the route worker: both `BatchSpanProcessor::force_flush` and `BatchLogProcessor::force_flush` use a sync `block_on` against their worker channel, which deadlocks the Tokio runtime under load. Drain instead happens via the 200 ms `scheduled_delay` ticker; explicit `shutdown_providers()` is called from `main` only at process exit.
 
 ### Lesson 9: Not All BEP Actions Appear in the Execution Log
 

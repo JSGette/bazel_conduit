@@ -37,7 +37,6 @@ pub const BAZEL_TARGET_OUTPUT_FILES: &str = "bazel.target.output_files";
 pub const BAZEL_TARGET_ABORT_REASON: &str = "bazel.target.abort_reason";
 pub const BAZEL_TARGET_ABORT_DESCRIPTION: &str = "bazel.target.abort_description";
 pub const BAZEL_TARGET_CACHED: &str = "bazel.target.cached";
-pub const BAZEL_TARGET_TRIVIAL: &str = "bazel.target.trivial";
 pub const BAZEL_TARGET_SYNTHETIC: &str = "bazel.target.synthetic";
 pub const BAZEL_TARGET_TEST_SIZE: &str = "bazel.target.test_size";
 
