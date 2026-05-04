@@ -15,9 +15,12 @@
 //!     └── target {label} (aborted by Bazel)
 //!
 //! Correlated OTel log records:
-//!   - build.log (accumulated progress stderr/stdout, each capped at 1 MB;
-//!     emitted as a Log record correlated with the trace via trace_id/span_id —
-//!     falls back to a span event when no LoggerProvider is configured)
+//!   - bazel.progress (one record per BEP `Progress` event, streamed as the
+//!     build runs and correlated with the root span via trace_id/span_id;
+//!     each record's stderr/stdout body is ANSI-stripped and capped at 1 MB).
+//!     Without a `LoggerProvider`, all progress text accumulates in memory
+//!     and is attached to the root span as a single `build.log` event in
+//!     `finish`.
 //!
 //! Action processing modes:
 //!   - lightweight (default): only failed actions create spans
@@ -37,6 +40,7 @@ use tracing::{debug, info, warn};
 
 use crate::state::BufferedAction;
 use super::attributes::*;
+use super::redact::Redactor;
 use super::trace_context;
 
 /// Strip ANSI escape sequences (colors, cursor movement, etc.) from a string.
@@ -420,16 +424,16 @@ pub struct OtelMapper {
     /// Tracks whether any action for a target was NOT a cache hit.
     target_has_non_cached_action: HashMap<String, bool>,
 
-    /// Accumulated stderr / stdout from all progress messages.
-    /// Each is capped at 1 MB (see [`PROGRESS_CAP_BYTES`]); when the cap would
-    /// be exceeded, the buffer is truncated to keep the tail and new content
-    /// is appended. Flushed as an OTel log record in [`finish`].
+    /// Fallback buffers for the no-logger path: when no `LoggerProvider` is
+    /// configured, progress text accumulates here and is attached to the root
+    /// span as a single `build.log` event in [`finish`]. Each stream is capped
+    /// at 1 MB (see [`PROGRESS_CAP_BYTES`]). Unused on the streaming path.
     progress_stderr: String,
     progress_stdout: String,
 
-    /// Optional OTel logger for emitting build logs as log records.
-    /// When present, build.log is emitted as a correlated log record
-    /// instead of a span event — much friendlier for large build output.
+    /// Optional OTel logger. When present, every BEP `Progress` event is
+    /// emitted as its own correlated log record (streaming) rather than
+    /// buffered until the build ends.
     logger: Option<opentelemetry_sdk::logs::Logger>,
 
     /// Cached exit code from BuildFinished (root span ends in [`finish`]).
@@ -470,6 +474,10 @@ pub struct OtelMapper {
     /// Key: (target_label, mnemonic, primary_output). Used in finish() to attach
     /// spawn child spans to the correct action span, with timing for clamping.
     action_span_cache: HashMap<ActionSpanKey, ActionSpanInfo>,
+
+    /// Scrubs sensitive values out of command-line attributes before they
+    /// hit the exporter. See [`crate::otel::redact`].
+    redactor: Redactor,
 }
 
 impl OtelMapper {
@@ -504,12 +512,41 @@ impl OtelMapper {
             exec_log_path: None,
             action_span_cache: HashMap::new(),
             workspace_directory: None,
+            redactor: Redactor::default_enabled(),
         }
+    }
+
+    /// Override the default redactor (e.g. to disable scrubbing or to
+    /// supply a custom name pattern list from the CLI).
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     // =====================================================================
     // Private helpers
     // =====================================================================
+
+    /// Clamp a `(start, end)` pair to the current invocation's window.
+    ///
+    /// Bazel preserves the original execution timestamps on cached
+    /// `ActionExecuted` events and propagates them up to per-target metadata,
+    /// so a build that replays a cache from weeks ago can produce spans whose
+    /// `start_time` predates the invocation by days. Applying this at every
+    /// site that hands BEP-supplied nanos to `with_start_time` /
+    /// `end_with_timestamp` keeps every span within the root's window.
+    fn clamp_to_invocation(
+        &self,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> (Option<i64>, Option<i64>) {
+        clamp_time_range(
+            start,
+            end,
+            self.root_span_start_nanos,
+            self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
+        )
+    }
 
     /// Set an attribute on the root span (no-op if root span not yet created).
     fn set_root_attr(&self, kv: KeyValue) {
@@ -712,10 +749,12 @@ impl OtelMapper {
         explicit_cmd_line: &[String],
     ) {
         if !startup_options.is_empty() {
-            self.set_root_attr(KeyValue::new(BAZEL_STARTUP_OPTIONS, startup_options.join(" ")));
+            let scrubbed = self.redactor.scrub_args(startup_options);
+            self.set_root_attr(KeyValue::new(BAZEL_STARTUP_OPTIONS, scrubbed.join(" ")));
         }
         if !explicit_cmd_line.is_empty() {
-            self.set_root_attr(KeyValue::new(BAZEL_EXPLICIT_CMD_LINE, explicit_cmd_line.join(" ")));
+            let scrubbed = self.redactor.scrub_args(explicit_cmd_line);
+            self.set_root_attr(KeyValue::new(BAZEL_EXPLICIT_CMD_LINE, scrubbed.join(" ")));
         }
     }
 
@@ -754,7 +793,8 @@ impl OtelMapper {
     /// UnstructuredCommandLine → add full command line as attribute.
     pub fn on_command_line(&mut self, args: &[String]) {
         if !args.is_empty() {
-            self.set_root_attr(KeyValue::new(BAZEL_COMMAND_LINE, args.join(" ")));
+            let scrubbed = self.redactor.scrub_args(args);
+            self.set_root_attr(KeyValue::new(BAZEL_COMMAND_LINE, scrubbed.join(" ")));
         }
     }
 
@@ -931,7 +971,8 @@ impl OtelMapper {
             attrs.push(KeyValue::new(BAZEL_TARGET_TEST_SIZE, ts.clone()));
         }
 
-        let start_nanos = start_nanos_override.or(configured.event_time_nanos);
+        let raw_start = start_nanos_override.or(configured.event_time_nanos);
+        let (start_nanos, _) = self.clamp_to_invocation(raw_start, None);
         let mut builder = self
             .tracer
             .span_builder(format!("target {short}"))
@@ -1015,7 +1056,8 @@ impl OtelMapper {
             .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
-        if let Some(nanos) = start_nanos {
+        let (clamped_start, _) = self.clamp_to_invocation(start_nanos, None);
+        if let Some(nanos) = clamped_start {
             builder = builder.with_start_time(nanos_to_system_time(nanos));
         }
         let span = self.tracer.build_with_context(builder, parent);
@@ -1038,7 +1080,11 @@ impl OtelMapper {
         latest_action_end_nanos: Option<i64>,
         buffered_actions: &[BufferedAction],
     ) {
-        let effective_end = latest_action_end_nanos.or(event_time_nanos);
+        // Clamp end-of-target to the invocation window. Cached targets re-emit
+        // their original action timestamps, so without this a span ending at
+        // event_time will run from the cached `start` (weeks ago) to today.
+        let raw_end = latest_action_end_nanos.or(event_time_nanos);
+        let (_, effective_end) = self.clamp_to_invocation(earliest_action_start_nanos, raw_end);
 
         // Get or create the span under the appropriate parent.
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
@@ -1189,7 +1235,8 @@ impl OtelMapper {
             attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_DESCRIPTION, d.to_string()));
         }
 
-        let instant = event_time_nanos
+        let (_, clamped_event) = self.clamp_to_invocation(None, event_time_nanos);
+        let instant = clamped_event
             .map(nanos_to_system_time)
             .unwrap_or_else(SystemTime::now);
 
@@ -1424,7 +1471,8 @@ impl OtelMapper {
             attrs.push(KeyValue::new(BAZEL_ACTION_CONFIGURATION, display_val));
         }
         if !ev.command_line.is_empty() {
-            let joined = ev.command_line.join(" ");
+            let scrubbed = self.redactor.scrub_args(ev.command_line);
+            let joined = scrubbed.join(" ");
             let capped = truncate_to_byte_limit(&joined, COMMAND_LINE_CAP_BYTES, "...(truncated)");
             attrs.push(KeyValue::new(BAZEL_ACTION_COMMAND_LINE, capped));
         }
@@ -1630,10 +1678,14 @@ impl OtelMapper {
             }
         };
 
-        let end_nanos = match (ev.start_time_nanos, ev.duration_nanos) {
+        let raw_end = match (ev.start_time_nanos, ev.duration_nanos) {
             (Some(start), Some(dur)) => Some(start + dur),
             _ => None,
         };
+        // Cached test results carry the original execution timestamps; clamp
+        // so they don't escape the current invocation's window.
+        let (start_nanos, end_nanos) =
+            self.clamp_to_invocation(ev.start_time_nanos, raw_end);
 
         self.build_and_end_child_span(
             &parent,
@@ -1641,7 +1693,7 @@ impl OtelMapper {
             SpanKind::Internal,
             attrs,
             status,
-            ev.start_time_nanos,
+            start_nanos,
             end_nanos,
         );
 
@@ -1711,22 +1763,81 @@ impl OtelMapper {
     // Progress events
     // =====================================================================
 
-    /// Progress with stderr/stdout → text is buffered and flushed as a
-    /// single `build.log` event on the root `bazel.invocation` span in
-    /// [`finish`]. Each stream is capped at [`PROGRESS_CAP_BYTES`] (1 MB);
-    /// when appending would exceed the cap, the existing buffer is truncated
-    /// to keep the tail (recent output), then the new content is appended.
+    /// Progress with stderr/stdout. With a logger configured, each event is
+    /// emitted immediately as a correlated `bazel.progress` log record
+    /// (streaming, capped at [`PROGRESS_CAP_BYTES`] per record). Without a
+    /// logger, content accumulates in [`progress_stderr`]/[`progress_stdout`]
+    /// and is attached as a single span event in [`finish`].
     pub fn on_progress(&mut self, stderr: Option<&str>, stdout: Option<&str>) {
-        if let Some(err) = stderr {
-            if !err.is_empty() {
-                append_progress_capped(&mut self.progress_stderr, &strip_ansi(err));
-            }
+        let stderr = stderr.unwrap_or("");
+        let stdout = stdout.unwrap_or("");
+        if stderr.is_empty() && stdout.is_empty() {
+            return;
         }
-        if let Some(out) = stdout {
-            if !out.is_empty() {
-                append_progress_capped(&mut self.progress_stdout, &strip_ansi(out));
-            }
+
+        if self.logger.is_some() && self.root_context.is_some() {
+            self.emit_progress_log(stderr, stdout);
+            return;
         }
+
+        // No logger → buffer for the fallback span event in finish().
+        if !stderr.is_empty() {
+            append_progress_capped(&mut self.progress_stderr, &strip_ansi(stderr));
+        }
+        if !stdout.is_empty() {
+            append_progress_capped(&mut self.progress_stdout, &strip_ansi(stdout));
+        }
+    }
+
+    /// Emit one `bazel.progress` log record correlated with the root span.
+    /// Body is stderr (Bazel's primary output stream); stdout, when present,
+    /// rides as an attribute. Each stream is ANSI-stripped and capped per
+    /// record so a single noisy progress message can't blow up the exporter.
+    fn emit_progress_log(&self, stderr: &str, stdout: &str) {
+        let Some(logger) = self.logger.as_ref() else { return };
+        let Some(cx) = self.root_context.as_ref() else { return };
+        let span_cx = cx.span().span_context().clone();
+
+        let stderr = if stderr.is_empty() {
+            String::new()
+        } else {
+            truncate_to_byte_limit(&strip_ansi(stderr), PROGRESS_CAP_BYTES, "...(truncated)")
+        };
+        let stdout = if stdout.is_empty() {
+            String::new()
+        } else {
+            truncate_to_byte_limit(&strip_ansi(stdout), PROGRESS_CAP_BYTES, "...(truncated)")
+        };
+
+        let mut record = logger.create_log_record();
+        record.set_trace_context(
+            span_cx.trace_id(),
+            span_cx.span_id(),
+            Some(span_cx.trace_flags()),
+        );
+        record.set_severity_number(Severity::Info);
+        record.set_severity_text("INFO");
+        record.add_attribute("bazel.log.kind", AnyValue::String("progress".into()));
+
+        let stderr_len = stderr.len();
+        let stdout_len = stdout.len();
+        match (!stderr.is_empty(), !stdout.is_empty()) {
+            (true, true) => {
+                record.set_body(AnyValue::String(stderr.into()));
+                record.add_attribute(BAZEL_PROGRESS_STDOUT, AnyValue::String(stdout.into()));
+            }
+            (true, false) => record.set_body(AnyValue::String(stderr.into())),
+            (false, true) => record.set_body(AnyValue::String(stdout.into())),
+            (false, false) => return,
+        }
+
+        logger.emit(record);
+        debug!(
+            trace_id = %span_cx.trace_id(),
+            stderr_len,
+            stdout_len,
+            "Streamed bazel.progress log record"
+        );
     }
 
     // =====================================================================
@@ -2125,62 +2236,23 @@ impl OtelMapper {
             debug!("Ended 'external deps' span");
         }
 
-        // Flush accumulated progress text as an OTel log record correlated
-        // with the trace (much friendlier for large build output than a span
-        // event).  Falls back to a span event when no logger is available.
-        {
+        // No-logger fallback: progress was buffered, attach a single
+        // `build.log` span event before closing the root. With a logger
+        // configured, [`on_progress`] streams records and these buffers stay
+        // empty.
+        if self.logger.is_none() {
             let stderr = std::mem::take(&mut self.progress_stderr);
             let stdout = std::mem::take(&mut self.progress_stdout);
-            let has_content = !stderr.is_empty() || !stdout.is_empty();
-
-            if has_content {
-                if let (Some(logger), Some(cx)) = (&self.logger, &self.root_context) {
-                    let span_ref = cx.span();
-                    let span_cx = span_ref.span_context();
-
-                    let mut record = logger.create_log_record();
-                    record.set_trace_context(
-                        span_cx.trace_id(),
-                        span_cx.span_id(),
-                        Some(span_cx.trace_flags()),
-                    );
-                    record.set_severity_number(Severity::Info);
-                    record.set_severity_text("INFO");
-                    record.set_event_name("build.log");
-
-                    // Body = stderr (primary Bazel output); stdout as attribute
-                    // when both are present.
-                    debug_assert!(has_content, "expected non-empty stderr or stdout");
-                    match (!stderr.is_empty(), !stdout.is_empty()) {
-                        (true, true) => {
-                            record.set_body(AnyValue::String(stderr.into()));
-                            record.add_attribute(
-                                BAZEL_PROGRESS_STDOUT,
-                                AnyValue::String(stdout.into()),
-                            );
-                        }
-                        (true, false) => {
-                            record.set_body(AnyValue::String(stderr.into()));
-                        }
-                        (false, true) => {
-                            record.set_body(AnyValue::String(stdout.into()));
-                        }
-                        (false, false) => {}
-                    }
-
-                    logger.emit(record);
-                    debug!("Emitted build.log as OTel log record correlated with trace");
-                } else if let Some(cx) = &self.root_context {
-                    // Fallback: span event when no logger is available
-                    let mut attrs = Vec::new();
-                    if !stderr.is_empty() {
-                        attrs.push(KeyValue::new(BAZEL_PROGRESS_STDERR, stderr));
-                    }
-                    if !stdout.is_empty() {
-                        attrs.push(KeyValue::new(BAZEL_PROGRESS_STDOUT, stdout));
-                    }
+            if (!stderr.is_empty() || !stdout.is_empty()) && self.root_context.is_some() {
+                let mut attrs = Vec::new();
+                if !stderr.is_empty() {
+                    attrs.push(KeyValue::new(BAZEL_PROGRESS_STDERR, stderr));
+                }
+                if !stdout.is_empty() {
+                    attrs.push(KeyValue::new(BAZEL_PROGRESS_STDOUT, stdout));
+                }
+                if let Some(cx) = &self.root_context {
                     cx.span().add_event("build.log", attrs);
-                    debug!("Added build.log as span event (no logger available)");
                 }
             }
         }
@@ -2414,6 +2486,35 @@ mod tests {
         // 'é' is 2 bytes; cutting at 5 lands mid-char, must step back to 4.
         let out = truncate_to_byte_limit("café café", 5, "...");
         assert_eq!(out, "café...");
+    }
+
+    #[test]
+    fn clamp_to_invocation_ignores_unbounded() {
+        let mapper = test_mapper();
+        let (s, e) = mapper.clamp_to_invocation(Some(10), Some(20));
+        assert_eq!(s, Some(10));
+        assert_eq!(e, Some(20));
+    }
+
+    #[test]
+    fn clamp_to_invocation_uses_root_span_window() {
+        let mut mapper = test_mapper();
+        mapper.root_span_start_nanos = Some(1_000_000_000);
+        mapper.root_span_end_from_wall_nanos = Some(2_000_000_000);
+        // Cached-action style: start 5 weeks ago, end at invocation event_time.
+        let (s, e) = mapper.clamp_to_invocation(Some(1), Some(1_500_000_000));
+        assert_eq!(s, Some(1_000_000_000));
+        assert_eq!(e, Some(1_500_000_000));
+    }
+
+    #[test]
+    fn clamp_to_invocation_falls_back_to_finish_time() {
+        let mut mapper = test_mapper();
+        mapper.root_span_start_nanos = Some(1_000_000_000);
+        mapper.finish_time_nanos = Some(2_000_000_000);
+        let (s, e) = mapper.clamp_to_invocation(Some(500_000_000), Some(3_000_000_000));
+        assert_eq!(s, Some(1_000_000_000));
+        assert_eq!(e, Some(2_000_000_000));
     }
 
     #[test]

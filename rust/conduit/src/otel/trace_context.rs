@@ -78,9 +78,14 @@ fn build_tracer_provider(
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .build()?;
+            // 1 s scheduled_delay keeps live streaming snappy in `--serve`
+            // mode where the TracerProvider is rebuilt per invocation
+            // (Resource carries `bazel.invocation_id`). Default 5 s would
+            // delay the first batch noticeably for short builds.
             let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
                 .with_max_queue_size(65536)
                 .with_max_export_batch_size(*max_export_batch_size)
+                .with_scheduled_delay(std::time::Duration::from_secs(1))
                 .build();
             let batch_processor =
                 opentelemetry_sdk::trace::BatchSpanProcessor::builder(

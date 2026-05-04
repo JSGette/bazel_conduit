@@ -1,7 +1,10 @@
 use clap::Parser;
 use conduit_lib::bep::{BepDecoder, EventRouter};
 use conduit_lib::grpc::run_server;
-use conduit_lib::otel::{ExportConfig, init_logger_provider, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE};
+use conduit_lib::otel::{
+    init_logger_provider, ExportConfig, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE,
+    DEFAULT_REDACT_PATTERNS,
+};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -41,6 +44,31 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags
+    /// in command-line span attributes. Use only when the receiving backend
+    /// is fully trusted (or has its own scrubbing layer).
+    #[arg(long, default_value_t = false)]
+    no_redact: bool,
+
+    /// Case-insensitive substring(s) marking an env-var name as sensitive.
+    /// Repeatable. When omitted, conduit uses a built-in default list
+    /// (TOKEN, SECRET, PASSWORD, …). When provided at least once, the
+    /// supplied list fully replaces the default.
+    #[arg(long = "redact-name-pattern", value_name = "SUBSTR")]
+    redact_name_patterns: Vec<String>,
+}
+
+impl Args {
+    fn build_redactor(&self) -> Redactor {
+        if self.no_redact {
+            return Redactor::disabled();
+        }
+        if self.redact_name_patterns.is_empty() {
+            return Redactor::new(true, DEFAULT_REDACT_PATTERNS.iter().copied());
+        }
+        Redactor::new(true, self.redact_name_patterns.iter().map(String::as_str))
+    }
 }
 
 #[tokio::main]
@@ -80,7 +108,14 @@ async fn main() -> anyhow::Result<()> {
     // LoggerProvider for OTel logs (and for mapper when using with_export)
     let log_provider = init_logger_provider(&export_config)?;
 
-    let mut router = EventRouter::new();
+    let redactor = args.build_redactor();
+    if redactor.is_enabled() {
+        info!("Command-line redaction: enabled");
+    } else {
+        info!("Command-line redaction: DISABLED — secrets in --client_env may leak to traces");
+    }
+
+    let mut router = EventRouter::new().with_redactor(redactor);
     if !matches!(&export_config, ExportConfig::None) {
         let lp = log_provider.ok_or_else(|| anyhow::anyhow!("export enabled but LoggerProvider init failed"))?;
         router = router.with_export(export_config.clone(), lp);

@@ -20,7 +20,7 @@ use crate::build_event_stream::BuildEvent;
 use crate::build_event_stream::ActionExecuted;
 use crate::otel::{
     build_invocation_resource, init_tracer_provider_with_resource, ActionCompletedEvent,
-    ExportConfig, OtelMapper, TestResultEvent,
+    ExportConfig, OtelMapper, Redactor, TestResultEvent,
 };
 use crate::state::{ActionProcessingMode, BuildState};
 use opentelemetry::logs::LoggerProvider as _;
@@ -62,6 +62,9 @@ pub struct EventRouter {
     export_config: Option<ExportConfig>,
     logger_provider: Option<opentelemetry_sdk::logs::LoggerProvider>,
     tracer_provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+    /// Redactor applied to command-line attributes when the mapper is
+    /// created lazily on first Started.
+    redactor: Redactor,
 }
 
 impl EventRouter {
@@ -73,6 +76,7 @@ impl EventRouter {
             export_config: None,
             logger_provider: None,
             tracer_provider: None,
+            redactor: Redactor::default_enabled(),
         }
     }
 
@@ -87,25 +91,46 @@ impl EventRouter {
         self
     }
 
-    /// Attach an OTel mapper for span generation (legacy; use with_export for Resource attributes).
-    pub fn with_mapper(mut self, mapper: OtelMapper) -> Self {
-        self.mapper = Some(mapper);
+    /// Override the default command-line redactor.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor.clone();
+        if let Some(mapper) = self.mapper.take() {
+            self.mapper = Some(mapper.with_redactor(redactor));
+        }
         self
     }
 
-    /// Create tracer and mapper on first Started so Resource has invocation_id, command, etc.
+    /// Attach an OTel mapper for span generation (legacy; use with_export for Resource attributes).
+    pub fn with_mapper(mut self, mapper: OtelMapper) -> Self {
+        self.mapper = Some(mapper.with_redactor(self.redactor.clone()));
+        self
+    }
+
+    /// (Re)build tracer + mapper for the current Started so Resource carries the
+    /// active invocation_id / command / workspace. In `--serve` mode the router
+    /// outlives a single invocation, and Resource is baked into the
+    /// TracerProvider at construction; without a rebuild every later
+    /// invocation would export under the *first* invocation's Resource.
     fn ensure_mapper_for_started(
         &mut self,
         invocation_id: &str,
         command: &str,
         workspace_dir: Option<&str>,
     ) {
-        if self.mapper.is_some() {
-            return;
-        }
         let Some(config) = self.export_config.as_ref() else {
             return;
         };
+        // Drop the previous provider so its batched spans flush under the old
+        // Resource and the new one starts clean. The previous mapper has
+        // already been ended via `finish()` at end-of-stream by the gRPC
+        // worker; this is just the Resource swap.
+        if let Some(old) = self.tracer_provider.take() {
+            if let Err(e) = old.shutdown() {
+                tracing::warn!(error = ?e, "Previous TracerProvider shutdown reported error");
+            }
+        }
+        self.mapper = None;
+
         let resource = build_invocation_resource(invocation_id, command, workspace_dir);
         let Ok(Some(provider)) = init_tracer_provider_with_resource(config, resource) else {
             return;
@@ -114,7 +139,8 @@ impl EventRouter {
             .logger_provider
             .as_ref()
             .map(|lp| lp.logger("conduit"));
-        let mapper = OtelMapper::new(provider.tracer("conduit"), logger);
+        let mapper = OtelMapper::new(provider.tracer("conduit"), logger)
+            .with_redactor(self.redactor.clone());
         self.tracer_provider = Some(provider);
         self.mapper = Some(mapper);
     }
@@ -129,7 +155,16 @@ impl EventRouter {
         &mut self.state
     }
 
-    /// Finalize: drain remaining action buffers and end all open spans.
+    /// Finalize: drain remaining action buffers, end all open spans, and
+    /// force-flush the LoggerProvider.
+    ///
+    /// We intentionally do NOT call `tracer_provider.force_flush()` here.
+    /// `BatchSpanProcessor::force_flush` (with `runtime::Tokio`) is a sync
+    /// `block_on` that strangles the runtime when invoked from inside a
+    /// `tokio::spawn` task: the export and timeout-timer tasks share the
+    /// same workers, so a non-empty queue (large build) deadlocks.
+    /// Instead we rely on the BatchSpanProcessor's `scheduled_delay`
+    /// (configured to 1 s in `build_tracer_provider`) to drain naturally.
     pub fn finish(&mut self) {
         if let Some(mapper) = &mut self.mapper {
             let remaining = self.state.drain_remaining_action_buffers();
@@ -137,6 +172,13 @@ impl EventRouter {
                 mapper.drain_orphaned_actions(&label, earliest, latest, &actions);
             }
             mapper.finish();
+        }
+        if let Some(lp) = &self.logger_provider {
+            for res in lp.force_flush() {
+                if let Err(e) = res {
+                    tracing::warn!(error = ?e, "LoggerProvider force_flush reported error");
+                }
+            }
         }
     }
 

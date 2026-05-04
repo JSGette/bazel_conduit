@@ -73,6 +73,7 @@ bazel.invocation (root)
 | `otel/mapper.rs` | Creates and manages OTel spans for the build trace |
 | `otel/trace_context.rs` | UUID→TraceID conversion, TracerProvider/LoggerProvider init |
 | `otel/attributes.rs` | ~100 typed attribute key constants (`bazel.*` namespace) |
+| `otel/redact.rs` | In-process scrubber for `--client_env=NAME=VALUE` style flags |
 | `grpc/server.rs` | BES gRPC server implementation (`PublishBuildEvent` service) |
 | `exec_log.rs` | Parses `--execution_log_binary_file` and creates spawn child spans |
 | `state/build_state.rs` | Build lifecycle tracking, action buffering, named set cache |
@@ -118,6 +119,65 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 | `--export <MODE>` | Export mode: `none`, `stdout`, `otlp` | `none` |
 | `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
 | `--log-level <LEVEL>` | Log level (trace/debug/info/warn/error) | `info` |
+| `--no-redact` | Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags | off (scrubbing on) |
+| `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable) | built-in defaults |
+
+### Secret Redaction
+
+Bazel surfaces environment variables on the command line via flags like
+`--client_env=NAME=VALUE`, `--action_env=`, `--test_env=`, `--repo_env=`, and
+`--host_action_env=`. Without intervention, the *value* half of those flags
+(e.g. `--client_env=GITLAB_TOKEN=glpat-...`) ends up verbatim in the
+`bazel.command_line`, `bazel.explicit_cmd_line`, `bazel.startup_options`, and
+`bazel.action.command_line` span attributes — and from there into whatever
+backend the OTLP exporter is wired to.
+
+Conduit ships with an in-process scrubber (`rust/conduit/src/otel/redact.rs`)
+that runs **before** any attribute is set on a span. When the variable name
+matches a case-insensitive substring deny list, the value is replaced with
+`***`. The pass-through form `--client_env=NAME` (no `=VALUE`, inherits from
+the parent process env) is left untouched because no value is on the wire.
+
+Default sensitive-name substrings: `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+`CREDENTIAL`, `COOKIE`, `APIKEY`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`,
+`AUTH`. The list is intentionally narrow (e.g. plain `KEY` is excluded
+because it would match `MONKEY`). Override or extend it via
+`--redact-name-pattern` (repeatable, supplied list fully replaces the
+default). Disable entirely with `--no-redact` — only safe when the receiving
+backend is fully trusted or has its own scrubbing layer.
+
+```bash
+# Default list
+./conduit --serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
+
+# Custom list (replaces default)
+./conduit --serve \
+  --redact-name-pattern TOKEN --redact-name-pattern JIRA --redact-name-pattern AWS_
+
+# Disabled
+./conduit --serve --no-redact
+```
+
+#### Defense in depth: Datadog Agent server-side scrubbing
+
+For belt-and-braces protection, also configure the Datadog Agent's
+`apm_config.replace_tags` so a future call-site that forgets to route through
+the scrubber still cannot leak. Example `datadog.yaml`:
+
+```yaml
+apm_config:
+  replace_tags:
+    - name: "bazel.command_line"
+      pattern: "--client_env=([A-Z0-9_]*?(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*)=[^ ]+"
+      repl:    "--client_env=$1=***"
+    - name: "bazel.explicit_cmd_line"
+      pattern: "--client_env=([A-Z0-9_]*?(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*)=[^ ]+"
+      repl:    "--client_env=$1=***"
+```
+
+Equivalent functionality exists in the OpenTelemetry Collector's
+[`redactionprocessor`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/redactionprocessor)
+when traces transit a collector hop.
 
 ### Action Processing Modes
 
