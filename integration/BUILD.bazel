@@ -1,6 +1,8 @@
 # Integration tests for conduit: BEP -> trace, no performance regression.
 # Uses minimal BEP sample (no live Bazel build) for hermetic, fast test.
 
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 sh_test(
     name = "trace_test",
     srcs = ["trace_test.sh"],
