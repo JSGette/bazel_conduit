@@ -9,22 +9,18 @@
 //! - **JSON** (file / stdin): [`route`] receives [`BepJsonEvent`] objects
 //!   parsed from newline-delimited JSON BEP streams.
 //!
-//! The router owns deferred `TracerProvider` initialization so invocation-
-//! scoped resource attributes (invocation_id, command, workspace) are available
-//! on every span.
+//! Per-invocation attributes (`bazel.invocation_id`, `bazel.command`,
+//! `bazel.workspace.directory`) are set on the root span by [`OtelMapper`];
+//! the [`TracerProvider`] / [`LoggerProvider`] it uses are owned by `main`
+//! and live for the whole conduit process.
 
 use super::decoder::BepJsonEvent;
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
 use crate::build_event_stream::ActionExecuted;
-use crate::otel::{
-    build_invocation_resource, init_tracer_provider_with_resource, ActionCompletedEvent,
-    ExportConfig, OtelMapper, Redactor, TestResultEvent,
-};
+use crate::otel::{ActionCompletedEvent, OtelMapper, Redactor, TestResultEvent};
 use crate::state::{ActionProcessingMode, BuildState};
-use opentelemetry::logs::LoggerProvider as _;
-use opentelemetry::trace::TracerProvider;
 use prost::Message;
 use spawn_proto::tools::protos::SpawnExec;
 use std::path::PathBuf;
@@ -54,16 +50,14 @@ pub enum RouterError {
     HandlerError(String),
 }
 
-/// Event router that processes BEP events
+/// Event router that processes BEP events.
+///
+/// Holds an [`OtelMapper`] keyed to a long-lived `Tracer`/`Logger` pair;
+/// each `Started` event resets the mapper's per-invocation state without
+/// rebuilding any provider.
 pub struct EventRouter {
     state: BuildState,
     mapper: Option<OtelMapper>,
-    /// When set, tracer and mapper are created on first Started with invocation resource.
-    export_config: Option<ExportConfig>,
-    logger_provider: Option<opentelemetry_sdk::logs::LoggerProvider>,
-    tracer_provider: Option<opentelemetry_sdk::trace::TracerProvider>,
-    /// Redactor applied to command-line attributes when the mapper is
-    /// created lazily on first Started.
     redactor: Redactor,
 }
 
@@ -73,21 +67,23 @@ impl EventRouter {
         Self {
             state: BuildState::new(),
             mapper: None,
-            export_config: None,
-            logger_provider: None,
-            tracer_provider: None,
             redactor: Redactor::default_enabled(),
         }
     }
 
-    /// Use OTel export with invocation-scoped Resource (mapper created on first Started).
+    /// Attach OTel export. The router holds [`Tracer`]/[`Logger`] clones for
+    /// the lifetime of the process; the underlying providers are owned by
+    /// `main`. Per-invocation attributes are set on the root span (not on
+    /// `Resource`).
     pub fn with_export(
         mut self,
-        config: ExportConfig,
-        logger_provider: opentelemetry_sdk::logs::LoggerProvider,
+        tracer: opentelemetry_sdk::trace::Tracer,
+        logger: opentelemetry_sdk::logs::Logger,
     ) -> Self {
-        self.export_config = Some(config);
-        self.logger_provider = Some(logger_provider);
+        self.mapper = Some(
+            OtelMapper::new(tracer, Some(logger))
+                .with_redactor(self.redactor.clone()),
+        );
         self
     }
 
@@ -100,67 +96,11 @@ impl EventRouter {
         self
     }
 
-    /// Attach an OTel mapper for span generation (legacy; use with_export for Resource attributes).
+    /// Attach an OTel mapper directly (used by tests; production wires the
+    /// mapper through [`Self::with_export`]).
     pub fn with_mapper(mut self, mapper: OtelMapper) -> Self {
         self.mapper = Some(mapper.with_redactor(self.redactor.clone()));
         self
-    }
-
-    /// (Re)build tracer + mapper for the current Started so Resource carries the
-    /// active invocation_id / command / workspace. In `--serve` mode the router
-    /// outlives a single invocation, and Resource is baked into the
-    /// TracerProvider at construction; without a rebuild every later
-    /// invocation would export under the *first* invocation's Resource.
-    fn ensure_mapper_for_started(
-        &mut self,
-        invocation_id: &str,
-        command: &str,
-        workspace_dir: Option<&str>,
-    ) {
-        let Some(config) = self.export_config.as_ref() else {
-            return;
-        };
-        // Drop the previous provider so its batched spans flush under the old
-        // Resource and the new one starts clean. The previous mapper was
-        // already ended via `finish()` by the gRPC worker; this is just the
-        // Resource swap.
-        //
-        // shutdown() is a sync `block_on` against the BatchSpanProcessor's
-        // worker channel. Calling it from inside a `tokio::spawn`'d task
-        // (route worker) deadlocks the runtime when the queue is non-empty.
-        // Punt the call to the blocking pool so the route worker is never
-        // blocked. We do not await the JoinHandle: spans drain in the
-        // background and the provider drops when shutdown returns.
-        if let Some(old) = self.tracer_provider.take() {
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn_blocking(move || {
-                        if let Err(e) = old.shutdown() {
-                            tracing::warn!(error = ?e, "Previous TracerProvider shutdown reported error");
-                        }
-                    });
-                }
-                Err(_) => {
-                    if let Err(e) = old.shutdown() {
-                        tracing::warn!(error = ?e, "Previous TracerProvider shutdown reported error");
-                    }
-                }
-            }
-        }
-        self.mapper = None;
-
-        let resource = build_invocation_resource(invocation_id, command, workspace_dir);
-        let Ok(Some(provider)) = init_tracer_provider_with_resource(config, resource) else {
-            return;
-        };
-        let logger = self
-            .logger_provider
-            .as_ref()
-            .map(|lp| lp.logger("conduit"));
-        let mapper = OtelMapper::new(provider.tracer("conduit"), logger)
-            .with_redactor(self.redactor.clone());
-        self.tracer_provider = Some(provider);
-        self.mapper = Some(mapper);
     }
 
     /// Get a reference to the build state
@@ -173,7 +113,7 @@ impl EventRouter {
         &mut self.state
     }
 
-    /// Finalize: drain remaining action buffers and end all open spans.
+    /// Finalize: end all open spans on the current invocation.
     ///
     /// We intentionally do NOT call `force_flush()` on either provider here.
     /// Both `BatchSpanProcessor::force_flush` and `BatchLogProcessor::force_flush`
@@ -188,18 +128,6 @@ impl EventRouter {
         if let Some(mapper) = &mut self.mapper {
             mapper.finish();
         }
-    }
-
-    /// Shutdown tracer and logger providers (call after finish when using with_export).
-    pub fn shutdown_providers(&mut self) -> anyhow::Result<()> {
-        self.finish();
-        if let Some(p) = self.tracer_provider.take() {
-            p.shutdown()?;
-        }
-        if let Some(lp) = self.logger_provider.take() {
-            lp.shutdown()?;
-        }
-        Ok(())
     }
 }
 
@@ -295,11 +223,6 @@ impl EventRouter {
                     mapper.reset();
                 }
                 if let Some(BepPayload::Started(s)) = &event.payload {
-                    self.ensure_mapper_for_started(
-                        if s.uuid.is_empty() { "unknown" } else { &s.uuid },
-                        if s.command.is_empty() { "unknown" } else { &s.command },
-                        Some(s.workspace_directory.as_str()).filter(|d| !d.is_empty()),
-                    );
                     let start_time_nanos = s
                         .start_time
                         .as_ref()
@@ -805,12 +728,6 @@ impl EventRouter {
         if let Some(started) = payload {
             let uuid = started.get("uuid").and_then(|v| v.as_str());
             let command = started.get("command").and_then(|v| v.as_str());
-            let workspace_dir = started.get("workspaceDirectory").and_then(|v| v.as_str());
-            self.ensure_mapper_for_started(
-                uuid.unwrap_or("unknown"),
-                command.unwrap_or("unknown"),
-                workspace_dir,
-            );
             let start_time_millis = started.get("startTimeMillis").and_then(|v| v.as_i64());
             // Prefer the proto Timestamp field; do NOT fall back to the
             // deprecated start_time_millis — it can hold a stale Bazel-server
@@ -1715,27 +1632,6 @@ impl EventRouter {
 impl Default for EventRouter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for EventRouter {
-    /// Provider lifetime is owned by `main` via [`shutdown_providers`].
-    ///
-    /// We deliberately do NOT call `.shutdown()` from `Drop` here: when
-    /// `EventRouter` is dropped on a tokio worker thread (e.g. via
-    /// `Arc<Mutex<EventRouter>>` in the gRPC server), the SDK's sync
-    /// `block_on` deadlocks the runtime. If we get here with providers
-    /// still present, log a warning and leak them: the OS reclaims memory
-    /// at process exit, which is preferable to a hang.
-    fn drop(&mut self) {
-        if self.tracer_provider.is_some() || self.logger_provider.is_some() {
-            tracing::warn!(
-                "EventRouter dropped without explicit shutdown_providers(); \
-                 leaking OTel providers to avoid sync-from-async deadlock"
-            );
-            std::mem::forget(self.tracer_provider.take());
-            std::mem::forget(self.logger_provider.take());
-        }
     }
 }
 

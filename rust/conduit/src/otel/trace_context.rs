@@ -165,35 +165,7 @@ fn build_logger_provider(
     }
 }
 
-/// Build Resource attributes for an invocation (invariant for the trace).
-/// Used when creating the TracerProvider so these appear on every span via Resource.
-pub fn build_invocation_resource(
-    invocation_id: &str,
-    command: &str,
-    workspace_dir: Option<&str>,
-) -> Vec<KeyValue> {
-    let mut attrs = vec![
-        KeyValue::new("service.name", "bazel"),
-        KeyValue::new("telemetry.sdk.name", "conduit"),
-        KeyValue::new("telemetry.sdk.version", env!("CARGO_PKG_VERSION")),
-        KeyValue::new("bazel.invocation_id", invocation_id.to_string()),
-        KeyValue::new("bazel.command", command.to_string()),
-    ];
-    if let Some(d) = workspace_dir.filter(|s| !s.is_empty()) {
-        attrs.push(KeyValue::new("bazel.workspace.directory", d.to_string()));
-    }
-    attrs
-}
-
-/// Initialise a [`TracerProvider`] with the given resource attributes.
-pub fn init_tracer_provider_with_resource(
-    config: &ExportConfig,
-    resource_attrs: Vec<KeyValue>,
-) -> anyhow::Result<Option<TracerProvider>> {
-    build_tracer_provider(config, Resource::new(resource_attrs))
-}
-
-/// Initialise a [`TracerProvider`] with the default resource (no invocation attributes).
+/// Initialise a [`TracerProvider`] with the default resource.
 ///
 /// Returns `None` when `config` is [`ExportConfig::None`].
 pub fn init_tracer_provider(config: &ExportConfig) -> anyhow::Result<Option<TracerProvider>> {
@@ -231,28 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn build_invocation_resource_basic() {
-        let attrs = build_invocation_resource("abc-123", "build", None);
-        assert!(attrs.iter().any(|kv| kv.key.as_str() == "bazel.invocation_id"));
-        assert!(attrs.iter().any(|kv| kv.key.as_str() == "bazel.command"));
-        assert!(!attrs.iter().any(|kv| kv.key.as_str() == "bazel.workspace.directory"));
-    }
-
-    #[test]
-    fn build_invocation_resource_with_workspace() {
-        let attrs = build_invocation_resource("abc", "test", Some("/home/user/proj"));
-        assert!(attrs.iter().any(|kv| kv.key.as_str() == "bazel.workspace.directory"));
-    }
-
-    #[test]
     fn init_tracer_provider_none_returns_none() {
         let result = init_tracer_provider(&ExportConfig::None).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn init_tracer_provider_with_resource_none_returns_none() {
-        let result = init_tracer_provider_with_resource(&ExportConfig::None, vec![]).unwrap();
+    fn init_logger_provider_none_returns_none() {
+        let result = init_logger_provider(&ExportConfig::None).unwrap();
         assert!(result.is_none());
     }
 }

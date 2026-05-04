@@ -2,9 +2,11 @@ use clap::Parser;
 use conduit_lib::bep::{BepDecoder, EventRouter};
 use conduit_lib::grpc::run_server;
 use conduit_lib::otel::{
-    init_logger_provider, ExportConfig, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE,
-    DEFAULT_REDACT_PATTERNS,
+    init_logger_provider, init_tracer_provider, ExportConfig, Redactor,
+    DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
 };
+use opentelemetry::logs::LoggerProvider as _;
+use opentelemetry::trace::TracerProvider as _;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -105,8 +107,12 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Export mode: {:?}", export_config);
 
-    // LoggerProvider for OTel logs (and for mapper when using with_export)
-    let log_provider = init_logger_provider(&export_config)?;
+    // Build OTel providers exactly once, here. Resource carries only
+    // service.name + telemetry.sdk.* so spans can outlive a single
+    // invocation; per-invocation attrs (bazel.invocation_id, command,
+    // workspace.directory) are set on the root span instead.
+    let tracer_provider = init_tracer_provider(&export_config)?;
+    let logger_provider = init_logger_provider(&export_config)?;
 
     let redactor = args.build_redactor();
     if redactor.is_enabled() {
@@ -116,13 +122,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut router = EventRouter::new().with_redactor(redactor);
-    if let Some(lp) = log_provider {
-        router = router.with_export(export_config.clone(), lp);
+    if let (Some(tp), Some(lp)) = (&tracer_provider, &logger_provider) {
+        router = router.with_export(tp.tracer("conduit"), lp.logger("conduit"));
     }
 
     if let Some(input_path) = args.input {
         process_json_file(&input_path, &mut router)?;
-        router.shutdown_providers()?;
+        router.finish();
     } else if args.serve {
         let addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
         run_server(addr, router).await?;
@@ -132,6 +138,17 @@ async fn main() -> anyhow::Result<()> {
         info!("  Start gRPC server: conduit --serve [--port 8080] [--export stdout|otlp]");
         info!("");
         info!("For Bazel, use: bazel build //... --bes_backend=grpc://localhost:{}", args.port);
+    }
+
+    if let Some(tp) = tracer_provider {
+        if let Err(e) = tp.shutdown() {
+            error!("TracerProvider shutdown reported error: {e:?}");
+        }
+    }
+    if let Some(lp) = logger_provider {
+        if let Err(e) = lp.shutdown() {
+            error!("LoggerProvider shutdown reported error: {e:?}");
+        }
     }
 
     Ok(())
