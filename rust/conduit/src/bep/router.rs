@@ -121,12 +121,30 @@ impl EventRouter {
             return;
         };
         // Drop the previous provider so its batched spans flush under the old
-        // Resource and the new one starts clean. The previous mapper has
-        // already been ended via `finish()` at end-of-stream by the gRPC
-        // worker; this is just the Resource swap.
+        // Resource and the new one starts clean. The previous mapper was
+        // already ended via `finish()` by the gRPC worker; this is just the
+        // Resource swap.
+        //
+        // shutdown() is a sync `block_on` against the BatchSpanProcessor's
+        // worker channel. Calling it from inside a `tokio::spawn`'d task
+        // (route worker) deadlocks the runtime when the queue is non-empty.
+        // Punt the call to the blocking pool so the route worker is never
+        // blocked. We do not await the JoinHandle: spans drain in the
+        // background and the provider drops when shutdown returns.
         if let Some(old) = self.tracer_provider.take() {
-            if let Err(e) = old.shutdown() {
-                tracing::warn!(error = ?e, "Previous TracerProvider shutdown reported error");
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(move || {
+                        if let Err(e) = old.shutdown() {
+                            tracing::warn!(error = ?e, "Previous TracerProvider shutdown reported error");
+                        }
+                    });
+                }
+                Err(_) => {
+                    if let Err(e) = old.shutdown() {
+                        tracing::warn!(error = ?e, "Previous TracerProvider shutdown reported error");
+                    }
+                }
             }
         }
         self.mapper = None;
@@ -155,16 +173,17 @@ impl EventRouter {
         &mut self.state
     }
 
-    /// Finalize: drain remaining action buffers, end all open spans, and
-    /// force-flush the LoggerProvider.
+    /// Finalize: drain remaining action buffers and end all open spans.
     ///
-    /// We intentionally do NOT call `tracer_provider.force_flush()` here.
-    /// `BatchSpanProcessor::force_flush` (with `runtime::Tokio`) is a sync
-    /// `block_on` that strangles the runtime when invoked from inside a
-    /// `tokio::spawn` task: the export and timeout-timer tasks share the
-    /// same workers, so a non-empty queue (large build) deadlocks.
-    /// Instead we rely on the BatchSpanProcessor's `scheduled_delay`
-    /// (configured to 1 s in `build_tracer_provider`) to drain naturally.
+    /// We intentionally do NOT call `force_flush()` on either provider here.
+    /// Both `BatchSpanProcessor::force_flush` and `BatchLogProcessor::force_flush`
+    /// (with `runtime::Tokio`) are sync `block_on`s against their worker
+    /// channels. Calling them from inside a `tokio::spawn`'d task (the route
+    /// worker) deadlocks the runtime when the queue is non-empty: the export
+    /// and timeout-timer tasks share workers with us, so the worker we just
+    /// blocked is the one that would have driven the response back.
+    /// Instead we rely on the periodic `scheduled_delay` ticker to drain
+    /// (200 ms once Phase 1 lands; 1 s today for spans, 1 s default for logs).
     pub fn finish(&mut self) {
         if let Some(mapper) = &mut self.mapper {
             let remaining = self.state.drain_remaining_action_buffers();
@@ -172,13 +191,6 @@ impl EventRouter {
                 mapper.drain_orphaned_actions(&label, earliest, latest, &actions);
             }
             mapper.finish();
-        }
-        if let Some(lp) = &self.logger_provider {
-            for res in lp.force_flush() {
-                if let Err(e) = res {
-                    tracing::warn!(error = ?e, "LoggerProvider force_flush reported error");
-                }
-            }
         }
     }
 
@@ -1726,10 +1738,23 @@ impl Default for EventRouter {
 }
 
 impl Drop for EventRouter {
+    /// Provider lifetime is owned by `main` via [`shutdown_providers`].
+    ///
+    /// We deliberately do NOT call `.shutdown()` from `Drop` here: when
+    /// `EventRouter` is dropped on a tokio worker thread (e.g. via
+    /// `Arc<Mutex<EventRouter>>` in the gRPC server), the SDK's sync
+    /// `block_on` deadlocks the runtime. If we get here with providers
+    /// still present, log a warning and leak them: the OS reclaims memory
+    /// at process exit, which is preferable to a hang.
     fn drop(&mut self) {
-        self.finish();
-        let _ = self.tracer_provider.take().map(|p| p.shutdown());
-        let _ = self.logger_provider.take().map(|lp| lp.shutdown());
+        if self.tracer_provider.is_some() || self.logger_provider.is_some() {
+            tracing::warn!(
+                "EventRouter dropped without explicit shutdown_providers(); \
+                 leaking OTel providers to avoid sync-from-async deadlock"
+            );
+            std::mem::forget(self.tracer_provider.take());
+            std::mem::forget(self.logger_provider.take());
+        }
     }
 }
 
