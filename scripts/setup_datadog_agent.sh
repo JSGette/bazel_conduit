@@ -69,13 +69,13 @@ done
 case "$(uname -s)" in
   Darwin)
     DD_YAML="/opt/datadog-agent/etc/datadog.yaml"
-    RESTART_CMD=(datadog-agent restart-service)
-    NEEDS_SUDO=0
+    # User-level LaunchAgent. `kickstart -k` is the modern in-place restart
+    # (macOS 10.10+); requires the plist to be already loaded by launchd.
+    RESTART_CMD=(launchctl kickstart -k "gui/$(id -u)/com.datadoghq.agent")
     ;;
   Linux)
     DD_YAML="/etc/datadog-agent/datadog.yaml"
     RESTART_CMD=(sudo systemctl restart datadog-agent)
-    NEEDS_SUDO=1
     ;;
   *)
     err "unsupported OS: $(uname -s)"
@@ -186,10 +186,19 @@ awk -v key="$DD_API_KEY" -v site="$DD_SITE" -v has_otlp="$HAS_OTLP" \
   }
 ' "$DD_YAML" > "$TMP"
 
+# Idempotency: if the rendered file is byte-identical to what's already on
+# disk, skip both the rewrite and the agent restart.
+SKIP_WRITE=0
+if cmp -s "$DD_YAML" "$TMP"; then
+  SKIP_WRITE=1
+  log "datadog.yaml already matches dd-auth + otlp_config; skipping rewrite and restart"
+fi
+
 if (( DRY_RUN )); then
   log "dry-run: would write the following diff to $DD_YAML"
   diff -u "$DD_YAML" "$TMP" || true
-  log "dry-run: skipping restart and exit"
+elif (( SKIP_WRITE )); then
+  :
 else
   BACKUP="${DD_YAML}.bak.$(date +%Y%m%d-%H%M%S)"
   log "backing up $DD_YAML -> $BACKUP"
@@ -199,8 +208,10 @@ else
 fi
 
 # ---------- step 4: restart agent --------------------------------------------
-if (( NO_RESTART )) || (( DRY_RUN )); then
-  note "skipping restart (--no-restart or --dry-run)"
+if (( SKIP_WRITE )) || (( DRY_RUN )) || (( NO_RESTART )); then
+  (( SKIP_WRITE )) && note "skipping restart (config unchanged)"
+  (( DRY_RUN ))    && note "skipping restart (--dry-run)"
+  (( NO_RESTART )) && note "skipping restart (--no-restart)"
 else
   log "restarting agent: ${RESTART_CMD[*]}"
   if ! "${RESTART_CMD[@]}"; then
