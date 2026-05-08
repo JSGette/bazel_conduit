@@ -2,3 +2,4 @@ bazel-*
 .cursor/
 trace.json
 target/
+docs/

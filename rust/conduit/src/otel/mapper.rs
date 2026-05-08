@@ -319,14 +319,6 @@ struct ConfiguredTarget {
     test_size: Option<String>,
 }
 
-/// Target span kept open until output file sets are resolved so we can
-/// set output attributes on it before ending.
-struct PendingOutputResolution {
-    parent_cx: Context,
-    file_set_ids: Vec<String>,
-    event_time_nanos: Option<i64>,
-}
-
 /// Test result data buffered when root span is not yet created (replay in on_build_started).
 struct BufferedTestResult {
     label: String,
@@ -369,10 +361,6 @@ pub struct OtelMapper {
     /// Open target spans (created either lazily by an action or at
     /// `TargetCompleted` time), keyed by target label.
     target_contexts: HashMap<String, Context>,
-
-    /// Targets whose output file sets are not yet fully resolved; the target
-    /// span is still open.  Keyed by target label.
-    pending_output_resolutions: HashMap<String, PendingOutputResolution>,
 
     /// Single `fetches` parent span grouping all fetch child spans.
     /// Created lazily on first fetch event, ended in [`finish`].
@@ -439,9 +427,10 @@ pub struct OtelMapper {
     /// Replayed once `on_build_started` fires (BES can send test events before Started).
     pending_test_results: Vec<BufferedTestResult>,
 
-    /// Path to execution log binary file (from --execution_log_binary_file=).
-    /// Set in on_exec_log_detected, used in finish() for enrichment.
-    exec_log_path: Option<PathBuf>,
+    /// Execution log path + format detected from BEP `OptionsParsed`.
+    /// Set by [`Self::on_exec_log_detected`]; consumed in [`Self::finish`]
+    /// post-build to attach spawn child spans to their action parents.
+    exec_log: Option<(PathBuf, crate::exec_log::ExecLogFormat)>,
 
     /// Workspace directory from BuildStarted (for resolving relative exec log path).
     workspace_directory: Option<PathBuf>,
@@ -466,7 +455,6 @@ impl OtelMapper {
             root_context: None,
             configured_targets: HashMap::new(),
             target_contexts: HashMap::new(),
-            pending_output_resolutions: HashMap::new(),
             fetches_context: None,
             skipped_context: None,
             external_deps_context: None,
@@ -485,7 +473,7 @@ impl OtelMapper {
             named_set_cache: HashMap::new(),
             pending_fetches: Vec::new(),
             pending_test_results: Vec::new(),
-            exec_log_path: None,
+            exec_log: None,
             action_span_cache: HashMap::new(),
             workspace_directory: None,
             redactor: Redactor::default_enabled(),
@@ -746,10 +734,14 @@ impl OtelMapper {
         self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
     }
 
-    /// Execution log path detected (from --execution_log_binary_file=).
-    /// Stored for use in finish() to enrich the trace with spawn data.
-    pub fn on_exec_log_detected(&mut self, path: PathBuf) {
-        self.exec_log_path = Some(path);
+    /// Execution log path + format detected (binary or compact). Stored for
+    /// use in [`Self::finish`] to enrich the trace with spawn data.
+    pub fn on_exec_log_detected(
+        &mut self,
+        path: PathBuf,
+        format: crate::exec_log::ExecLogFormat,
+    ) {
+        self.exec_log = Some((path, format));
     }
 
     /// WorkspaceStatus → add workspace attributes to root span.
@@ -969,9 +961,7 @@ impl OtelMapper {
     /// When `action_start_nanos` is set (e.g. from ActionExecuted), the new span's
     /// start time is set so target timing reflects the action.
     fn ensure_target_span(&mut self, label: &str, action_start_nanos: Option<i64>) {
-        if self.target_contexts.contains_key(label)
-            || self.pending_output_resolutions.contains_key(label)
-        {
+        if self.target_contexts.contains_key(label) {
             return;
         }
         let parent = self.choose_parent_for_label(label);
@@ -1041,8 +1031,9 @@ impl OtelMapper {
     }
 
     /// TargetCompleted → create (or reuse) the target span, set attributes,
-    /// then either set output attributes and end (if file sets resolved), or
-    /// keep the span open for later resolution in [`on_named_set`] / [`finish`].
+    /// resolve output file sets from whatever's currently in the
+    /// `NamedSet` cache (`resolve_files` skips missing IDs), and end the
+    /// span synchronously.
     pub fn on_target_completed(
         &mut self,
         label: &str,
@@ -1095,38 +1086,13 @@ impl OtelMapper {
         };
         cx.span().set_status(status);
 
-        if file_set_ids.is_empty() {
-            if let Some(nanos) = effective_end {
-                cx.span().end_with_timestamp(nanos_to_system_time(nanos));
-            } else {
-                cx.span().end();
-            }
-            debug!("Ended target span for {label} (success={success})");
-            return;
-        }
-
-        let all_resolved =
-            Self::all_sets_resolved(&self.named_set_cache, file_set_ids);
-
-        if all_resolved {
-            Self::set_output_attributes_and_end_target_span(
-                &self.named_set_cache,
-                &cx,
-                file_set_ids,
-                effective_end,
-            );
-            debug!("Ended target span for {label} with output attributes (success={success})");
-        } else {
-            debug!("Deferring target span end for {label} (waiting for named sets)");
-            self.pending_output_resolutions.insert(
-                label.to_string(),
-                PendingOutputResolution {
-                    parent_cx: cx,
-                    file_set_ids: file_set_ids.to_vec(),
-                    event_time_nanos: effective_end,
-                },
-            );
-        }
+        Self::set_output_attributes_and_end_target_span(
+            &self.named_set_cache,
+            &cx,
+            file_set_ids,
+            effective_end,
+        );
+        debug!("Ended target span for {label} (success={success})");
     }
 
     /// TargetCompleted with `aborted` payload → create a brief span under
@@ -1145,12 +1111,6 @@ impl OtelMapper {
             existing.span().set_status(Status::Unset);
             existing.span().end();
             debug!("Ended leaked target span for {label} on skip");
-        }
-        // End any open span from pending_output_resolutions (deferred end).
-        if let Some(pending) = self.pending_output_resolutions.remove(label) {
-            pending.parent_cx.span().set_status(Status::Unset);
-            pending.parent_cx.span().end();
-            debug!("Ended pending output resolution span for {label} on skip");
         }
 
         Self::ensure_group_span(
@@ -1244,31 +1204,8 @@ impl OtelMapper {
     // NamedSet transitive helpers
     // -----------------------------------------------------------------
 
-    /// Check whether all NamedSets reachable from `set_ids` (transitively)
-    /// are present in the cache.
-    fn all_sets_resolved(
-        cache: &HashMap<String, NamedSetEntry>,
-        set_ids: &[String],
-    ) -> bool {
-        let mut stack: Vec<&str> = set_ids.iter().map(String::as_str).collect();
-        let mut visited = std::collections::HashSet::new();
-        while let Some(id) = stack.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            match cache.get(id) {
-                Some(entry) => {
-                    for child in &entry.child_set_ids {
-                        stack.push(child.as_str());
-                    }
-                }
-                None => return false,
-            }
-        }
-        true
-    }
-
     /// Recursively collect all files reachable from the given NamedSet IDs.
+    /// IDs missing from the cache are silently skipped.
     fn resolve_files(
         cache: &HashMap<String, NamedSetEntry>,
         set_ids: &[String],
@@ -1294,14 +1231,11 @@ impl OtelMapper {
     // Named set cache
     // =====================================================================
 
-    /// Cache a NamedSet so it can be resolved when targets complete.
+    /// Cache a NamedSet so its files can be resolved when targets complete.
     ///
     /// A NamedSet can contain direct `files` AND references to other
-    /// NamedSets (`child_set_ids`).  Both are stored so that
-    /// [`resolve_files`] can recursively collect the transitive closure.
-    ///
-    /// After caching, any pending target spans whose output file sets are now
-    /// fully resolved get output attributes set and are ended.
+    /// NamedSets (`child_set_ids`); both are stored so [`resolve_files`]
+    /// can collect the transitive closure.
     pub fn on_named_set(&mut self, set_id: &str, files: Vec<String>, child_set_ids: &[String]) {
         self.named_set_cache.insert(
             set_id.to_string(),
@@ -1310,27 +1244,6 @@ impl OtelMapper {
                 child_set_ids: child_set_ids.to_vec(),
             },
         );
-
-        let ready_labels: Vec<String> = self
-            .pending_output_resolutions
-            .iter()
-            .filter(|(_, pending)| {
-                Self::all_sets_resolved(&self.named_set_cache, &pending.file_set_ids)
-            })
-            .map(|(label, _)| label.clone())
-            .collect();
-
-        for label in ready_labels {
-            if let Some(pending) = self.pending_output_resolutions.remove(&label) {
-                debug!("Resolving deferred output attributes for target {label}");
-                Self::set_output_attributes_and_end_target_span(
-                    &self.named_set_cache,
-                    &pending.parent_cx,
-                    &pending.file_set_ids,
-                    pending.event_time_nanos,
-                );
-            }
-        }
     }
 
     // =====================================================================
@@ -1352,11 +1265,7 @@ impl OtelMapper {
 
         let parent = ev
             .label
-            .and_then(|l| {
-                self.target_contexts
-                    .get(l)
-                    .or_else(|| self.pending_output_resolutions.get(l).map(|p| &p.parent_cx))
-            })
+            .and_then(|l| self.target_contexts.get(l))
             .or(self.root_context.as_ref());
 
         let parent = match parent {
@@ -1571,7 +1480,6 @@ impl OtelMapper {
         let parent = self
             .target_contexts
             .get(ev.label)
-            .or_else(|| self.pending_output_resolutions.get(ev.label).map(|p| &p.parent_cx))
             .or(self.root_context.as_ref());
 
         let parent = match parent {
@@ -2023,9 +1931,6 @@ impl OtelMapper {
         for (_, cx) in self.target_contexts.drain() {
             cx.span().end();
         }
-        for (_, p) in self.pending_output_resolutions.drain() {
-            p.parent_cx.span().end();
-        }
         self.configured_targets.clear();
         self.configurations.clear();
         self.cached_command = None;
@@ -2041,7 +1946,7 @@ impl OtelMapper {
         self.named_set_cache.clear();
         self.pending_fetches.clear();
         self.pending_test_results.clear();
-        self.exec_log_path = None;
+        self.exec_log = None;
         self.action_span_cache.clear();
         self.workspace_directory = None;
     }
@@ -2052,8 +1957,9 @@ impl OtelMapper {
 
     /// End all remaining spans (call after last BEP event).
     pub fn finish(&mut self) {
-        // Enrich trace with execution log data if --execution_log_binary_file was set.
-        if let Some(ref path) = self.exec_log_path {
+        // Enrich trace with execution log data if a binary or compact log
+        // was discovered during options parsing.
+        if let Some((ref path, format)) = self.exec_log {
             let resolved = if path.is_relative() {
                 self.workspace_directory
                     .as_ref()
@@ -2069,6 +1975,7 @@ impl OtelMapper {
             let root_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
             crate::exec_log::enrich_trace(
                 &resolved,
+                format,
                 &self.action_span_cache,
                 &self.tracer,
                 root_cx.as_ref(),
@@ -2082,24 +1989,6 @@ impl OtelMapper {
             cx.span().set_status(Status::Ok);
             cx.span().end();
             debug!("Ended fetches span");
-        }
-
-        // Force-resolve any remaining pending target spans (set output attrs and end).
-        let pending_labels: Vec<String> = self
-            .pending_output_resolutions
-            .keys()
-            .cloned()
-            .collect();
-        for label in pending_labels {
-            if let Some(pending) = self.pending_output_resolutions.remove(&label) {
-                debug!("Force-ending target span for {label} at finish (with partial output data)");
-                Self::set_output_attributes_and_end_target_span(
-                    &self.named_set_cache,
-                    &pending.parent_cx,
-                    &pending.file_set_ids,
-                    pending.event_time_nanos,
-                );
-            }
         }
 
         // End any remaining target spans (lazily created but never completed).

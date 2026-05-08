@@ -18,23 +18,52 @@ use super::decoder::BepJsonEvent;
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
-use crate::build_event_stream::ActionExecuted;
+use crate::exec_log::ExecLogFormat;
 use crate::otel::{ActionCompletedEvent, OtelMapper, Redactor, TestResultEvent};
 use crate::state::{ActionProcessingMode, BuildState};
-use prost::Message;
-use spawn_proto::tools::protos::SpawnExec;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
-const EXEC_LOG_BINARY_FILE_PREFIX: &str = "--execution_log_binary_file=";
+const EXEC_LOG_BINARY_PREFIX: &str = "--execution_log_binary_file=";
+const EXEC_LOG_COMPACT_PREFIX: &str = "--execution_log_compact_file=";
+const EXEC_LOG_COMPACT_EXPERIMENTAL_PREFIX: &str = "--experimental_execution_log_compact_file=";
+const EXEC_LOG_JSON_PREFIX: &str = "--execution_log_json_file=";
 
-fn extract_exec_log_binary_path(options: &[&str]) -> Option<PathBuf> {
-    options
-        .iter()
-        .find_map(|opt| opt.strip_prefix(EXEC_LOG_BINARY_FILE_PREFIX))
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+/// Detect the execution log path and format from a flat options list.
+///
+/// Conduit recognises both `--execution_log_binary_file=` and the (compact,
+/// experimental_execution_log_compact) pair; JSON is reported as unsupported
+/// and not consumed. Bazel itself rejects multiple `--execution_log_*_file=`
+/// flags being set simultaneously, so we don't need a precedence rule here.
+fn extract_exec_log(options: &[&str]) -> Option<(PathBuf, ExecLogFormat)> {
+    for opt in options {
+        if let Some(p) = opt.strip_prefix(EXEC_LOG_COMPACT_PREFIX) {
+            if !p.is_empty() {
+                return Some((PathBuf::from(p), ExecLogFormat::Compact));
+            }
+        }
+        if let Some(p) = opt.strip_prefix(EXEC_LOG_COMPACT_EXPERIMENTAL_PREFIX) {
+            if !p.is_empty() {
+                return Some((PathBuf::from(p), ExecLogFormat::Compact));
+            }
+        }
+        if let Some(p) = opt.strip_prefix(EXEC_LOG_BINARY_PREFIX) {
+            if !p.is_empty() {
+                return Some((PathBuf::from(p), ExecLogFormat::Binary));
+            }
+        }
+        if let Some(p) = opt.strip_prefix(EXEC_LOG_JSON_PREFIX) {
+            if !p.is_empty() {
+                warn!(
+                    path = p,
+                    "--execution_log_json_file is not consumed by conduit; \
+                     use --execution_log_compact_file or --execution_log_binary_file instead"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Errors that can occur during event routing
@@ -289,10 +318,10 @@ impl EventRouter {
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_action_mode(self.state.action_mode());
                     }
-                    if let Some(path) = extract_exec_log_binary_path(&all_options) {
-                        self.state.set_exec_log_path(Some(path.clone()));
+                    if let Some((path, format)) = extract_exec_log(&all_options) {
+                        self.state.set_exec_log(Some((path.clone(), format)));
                         if let Some(mapper) = &mut self.mapper {
-                            mapper.on_exec_log_detected(path);
+                            mapper.on_exec_log_detected(path, format);
                         }
                     }
                     self.state.set_startup_options(o.startup_options.clone());
@@ -512,8 +541,6 @@ impl EventRouter {
                         let end_nanos = act.end_time.as_ref().map(|ts| {
                             ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
                         });
-                        let (cached_from_spawn, runner_from_spawn) =
-                            extract_spawn_exec_from_action(act);
                         mapper.on_action_completed(&ActionCompletedEvent {
                             label: Some(&label),
                             mnemonic: Some(&act.r#type),
@@ -527,10 +554,10 @@ impl EventRouter {
                             stderr_path: stderr_uri.as_deref(),
                             start_time_nanos: start_nanos,
                             end_time_nanos: end_nanos,
-                            cached: cached_from_spawn,
+                            cached: None,
                             hostname: None,
                             cached_remotely: None,
-                            runner: runner_from_spawn.as_deref(),
+                            runner: None,
                         });
                     }
                 }
@@ -833,10 +860,10 @@ impl EventRouter {
                 mapper.on_action_mode(self.state.action_mode());
             }
 
-            if let Some(path) = extract_exec_log_binary_path(&all_options) {
-                self.state.set_exec_log_path(Some(path.clone()));
+            if let Some((path, format)) = extract_exec_log(&all_options) {
+                self.state.set_exec_log(Some((path.clone(), format)));
                 if let Some(mapper) = &mut self.mapper {
-                    mapper.on_exec_log_detected(path);
+                    mapper.on_exec_log_detected(path, format);
                 }
             }
 
@@ -1689,20 +1716,4 @@ fn bep_event_type_name(id: &crate::build_event_stream::build_event_id::Id) -> &'
         Id::ExecRequest(_) => "ExecRequest",
         Id::Unknown(_) => "Unknown",
     }
-}
-
-/// Extract SpawnExec from ActionExecuted.strategy_details (first successful decode).
-/// Returns (cached, runner) for use on action spans.
-fn extract_spawn_exec_from_action(act: &ActionExecuted) -> (Option<bool>, Option<String>) {
-    for any in &act.strategy_details {
-        if let Ok(exec) = SpawnExec::decode(any.value.as_ref()) {
-            let runner = if exec.runner.is_empty() {
-                None
-            } else {
-                Some(exec.runner.clone())
-            };
-            return (Some(exec.cache_hit), runner);
-        }
-    }
-    (None, None)
 }
