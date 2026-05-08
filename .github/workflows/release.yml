@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release as (e.g. v0.0.0). Must already exist on the repo."
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-14
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: release-${{ matrix.platform }}
+          repository-cache: true
+
+      - name: build
+        run: bazel build -c opt //rust/conduit:conduit
+
+      - name: package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp -L bazel-bin/rust/conduit/conduit out/conduit-${{ matrix.platform }}
+          chmod +x out/conduit-${{ matrix.platform }}
+          (cd out && shasum -a 256 conduit-${{ matrix.platform }} > conduit-${{ matrix.platform }}.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conduit-${{ matrix.platform }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - run: ls -la artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          prerelease: true
+          generate_release_notes: true
+          files: artifacts/*
