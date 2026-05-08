@@ -24,6 +24,7 @@ DOMAIN="app.datadoghq.com"
 NO_RESTART=0
 NO_CONDUIT=0
 DRY_RUN=0
+REFRESH_TOKEN=0
 CONDUIT_BES_PORT="${CONDUIT_BES_PORT:-8080}"
 CONDUIT_EXEC_LOG="${CONDUIT_EXEC_LOG:-/tmp/conduit-exec.log}"
 CONDUIT_TARGET="${CONDUIT_TARGET:-//rust/conduit:conduit}"
@@ -42,6 +43,7 @@ usage() {
 Usage: setup_datadog_agent.sh [--domain DOMAIN] [--no-restart] [--no-conduit] [--dry-run]
 
   --domain DOMAIN   Datadog org domain passed to dd-auth (default: app.datadoghq.com)
+  --refresh-token   Pass --no-cache to dd-auth to force a fresh PAT/key fetch
   --no-restart      Skip restarting the agent
   --no-conduit      Don't exec into `bazel run` for conduit at the end
   --dry-run         Print actions without modifying files, restarting, or running conduit
@@ -56,12 +58,13 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --domain)     DOMAIN="$2"; shift 2 ;;
-    --no-restart) NO_RESTART=1; shift ;;
-    --no-conduit) NO_CONDUIT=1; shift ;;
-    --dry-run)    DRY_RUN=1; shift ;;
-    -h|--help)    usage; exit 0 ;;
-    *)            err "unknown flag: $1 (try --help)" ;;
+    --domain)        DOMAIN="$2"; shift 2 ;;
+    --refresh-token) REFRESH_TOKEN=1; shift ;;
+    --no-restart)    NO_RESTART=1; shift ;;
+    --no-conduit)    NO_CONDUIT=1; shift ;;
+    --dry-run)       DRY_RUN=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               err "unknown flag: $1 (try --help)" ;;
   esac
 done
 
@@ -98,10 +101,13 @@ run_priv() {
 # ---------- step 1: dd-auth --------------------------------------------------
 command -v dd-auth >/dev/null || err "dd-auth not found in PATH"
 
-log "fetching credentials via dd-auth (--domain $DOMAIN)"
+DD_AUTH_FLAGS=(--domain "$DOMAIN" -o)
+(( REFRESH_TOKEN )) && DD_AUTH_FLAGS+=(--no-cache)
+
+log "fetching credentials via dd-auth ${DD_AUTH_FLAGS[*]}"
 # `dd-auth -o` prints DD_API_KEY=..., DD_APP_KEY=..., DD_SITE=... -- one per line.
-DD_AUTH_OUT="$(dd-auth --domain "$DOMAIN" -o)" \
-  || err "dd-auth failed; run 'dd-auth --domain $DOMAIN -o' manually to debug"
+DD_AUTH_OUT="$(dd-auth "${DD_AUTH_FLAGS[@]}")" \
+  || err "dd-auth failed; run 'dd-auth ${DD_AUTH_FLAGS[*]}' manually to debug"
 
 # Parse without exporting DD_APP_KEY into our env (we don't need it).
 DD_API_KEY="$(printf '%s\n' "$DD_AUTH_OUT" | awk -F= '$1=="DD_API_KEY"{print $2; exit}')"
