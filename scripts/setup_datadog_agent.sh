@@ -10,20 +10,25 @@
 #      - Otherwise a `# >>> conduit-managed >>>` block is appended, using
 #        the first free port from {4317, 14317, 24317, ...}.
 #   5. Restarts the agent (skip with --no-restart).
-#   6. Prints what to add to user.bazelrc and the conduit launch command.
+#   6. Prints what to add to user.bazelrc.
+#   7. Execs `bazel run //rust/conduit:conduit` so the terminal becomes
+#      the conduit process (skip with --no-conduit).
 #
 # Tested on macOS (launchctl) and Linux (systemctl). No extra deps beyond
-# `bash`, `awk`, `grep`, `sed`, `lsof` (or /dev/tcp), `dd-auth`.
+# `bash`, `awk`, `grep`, `sed`, `lsof` (or /dev/tcp), `dd-auth`, `bazel`.
 
 set -euo pipefail
 
 # ---------- defaults ---------------------------------------------------------
 DOMAIN="app.datadoghq.com"
 NO_RESTART=0
+NO_CONDUIT=0
 DRY_RUN=0
 CONDUIT_BES_PORT="${CONDUIT_BES_PORT:-8080}"
 CONDUIT_EXEC_LOG="${CONDUIT_EXEC_LOG:-/tmp/conduit-exec.log}"
+CONDUIT_TARGET="${CONDUIT_TARGET:-//rust/conduit:conduit}"
 PORT_CANDIDATES=(4317 14317 24317 34317 44317 54317)
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---------- helpers ----------------------------------------------------------
 err()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -34,16 +39,18 @@ usage() {
   sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
-Usage: setup_datadog_agent.sh [--domain DOMAIN] [--no-restart] [--dry-run]
+Usage: setup_datadog_agent.sh [--domain DOMAIN] [--no-restart] [--no-conduit] [--dry-run]
 
   --domain DOMAIN   Datadog org domain passed to dd-auth (default: app.datadoghq.com)
-  --no-restart      Skip restarting the agent at the end
-  --dry-run         Print actions without modifying files or restarting
+  --no-restart      Skip restarting the agent
+  --no-conduit      Don't exec into `bazel run` for conduit at the end
+  --dry-run         Print actions without modifying files, restarting, or running conduit
   -h, --help        Show this help
 
 Env overrides:
   CONDUIT_BES_PORT       Port conduit listens on for BES        (default: 8080)
   CONDUIT_EXEC_LOG       Path for --execution_log_compact_file= (default: /tmp/conduit-exec.log)
+  CONDUIT_TARGET         Bazel target for the conduit binary    (default: //rust/conduit:conduit)
 EOF
 }
 
@@ -51,6 +58,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)     DOMAIN="$2"; shift 2 ;;
     --no-restart) NO_RESTART=1; shift ;;
+    --no-conduit) NO_CONDUIT=1; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            err "unknown flag: $1 (try --help)" ;;
@@ -204,20 +212,35 @@ fi
 cat <<EOF
 
 ==================================================================
-Done. Add the following to your user.bazelrc (or .bazelrc):
+Add the following to your user.bazelrc (or .bazelrc):
 ------------------------------------------------------------------
 common --bes_backend=grpc://localhost:${CONDUIT_BES_PORT}
 common --execution_log_compact_file=${CONDUIT_EXEC_LOG}
 # Optional: emit BEP for every action, not just the failing/test ones.
 build  --build_event_publish_all_actions
 
-Launch conduit (in a separate terminal) with:
-------------------------------------------------------------------
-bazel run //rust/conduit:conduit -c opt -- \\
-  --serve --port ${CONDUIT_BES_PORT} \\
-  --export otlp --otlp-endpoint http://localhost:${OTLP_GRPC_PORT}
-
 Then run any bazel build/test as usual; traces and logs will land in
 your Datadog org via the local agent (site: ${DD_SITE}).
 ==================================================================
 EOF
+
+# ---------- step 6: launch conduit -------------------------------------------
+CONDUIT_ARGS=(--serve --port "${CONDUIT_BES_PORT}"
+              --export otlp --otlp-endpoint "http://localhost:${OTLP_GRPC_PORT}")
+
+if (( NO_CONDUIT )) || (( DRY_RUN )); then
+  cat <<EOF
+
+To launch conduit yourself, run:
+  cd ${REPO_ROOT} && bazel run ${CONDUIT_TARGET} -c opt -- ${CONDUIT_ARGS[*]}
+EOF
+  exit 0
+fi
+
+command -v bazel >/dev/null \
+  || err "bazel not found in PATH; install bazelisk or rerun with --no-conduit"
+
+log "launching conduit: bazel run ${CONDUIT_TARGET} -c opt -- ${CONDUIT_ARGS[*]}"
+note "press Ctrl-C to stop"
+cd "$REPO_ROOT"
+exec bazel run "$CONDUIT_TARGET" -c opt -- "${CONDUIT_ARGS[@]}"
