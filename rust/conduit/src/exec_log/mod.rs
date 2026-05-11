@@ -40,6 +40,7 @@ use crate::otel::attributes::*;
 use crate::otel::mapper::{
     ActionSpanInfo, ActionSpanKey, clamp_time_range, truncate_to_byte_limit,
 };
+use crate::otel::Redactor;
 use spawn_proto::tools::protos::SpawnExec;
 
 pub mod binary;
@@ -347,6 +348,7 @@ fn duration_to_ms_raw(seconds: i64, nanos: i32) -> i64 {
 ///
 /// `root_start_nanos` / `root_end_nanos` are the root span's time bounds,
 /// used to clamp synthetic target spans so they don't escape the build window.
+#[allow(clippy::too_many_arguments)]
 pub fn enrich_trace(
     path: &Path,
     format: ExecLogFormat,
@@ -357,6 +359,7 @@ pub fn enrich_trace(
     root_end_nanos: Option<i64>,
     max_message_bytes: usize,
     max_decompressed_bytes: usize,
+    redactor: &Redactor,
 ) {
     let spawns = match format {
         ExecLogFormat::Binary => binary::read_all(path, max_message_bytes),
@@ -399,7 +402,7 @@ pub fn enrich_trace(
     let total = matched.len() + unmatched.len();
 
     for (parent_info, entry) in &matched {
-        emit_spawn_span(tracer, parent_info, entry);
+        emit_spawn_span(tracer, parent_info, entry, redactor);
     }
 
     let unmatched_count = unmatched.len();
@@ -411,6 +414,7 @@ pub fn enrich_trace(
                 unmatched,
                 root_start_nanos,
                 root_end_nanos,
+                redactor,
             );
         } else {
             debug!(
@@ -439,6 +443,7 @@ fn emit_unmatched_under_synthetic_targets(
     entries: Vec<SpawnExec>,
     root_start_nanos: Option<i64>,
     root_end_nanos: Option<i64>,
+    redactor: &Redactor,
 ) {
     let mut by_target: HashMap<String, Vec<SpawnExec>> = HashMap::new();
     for entry in entries {
@@ -482,7 +487,7 @@ fn emit_unmatched_under_synthetic_targets(
         };
 
         for entry in spawns {
-            emit_spawn_span(tracer, &target_info, entry);
+            emit_spawn_span(tracer, &target_info, entry, redactor);
         }
 
         if let Some(end) = clamped_end {
@@ -525,11 +530,12 @@ fn emit_spawn_span(
     tracer: &opentelemetry_sdk::trace::Tracer,
     parent_info: &ActionSpanInfo,
     s: &SpawnExec,
+    redactor: &Redactor,
 ) {
     let parent_ctx = Context::new().with_remote_span_context(parent_info.span_context.clone());
     let name = spawn_operation_name(s);
 
-    let attrs = build_spawn_attributes(s);
+    let attrs = build_spawn_attributes(s, redactor);
 
     let (raw_start, raw_end) = extract_timing(s);
     let (start_time, end_time) = clamp_time_range(
@@ -564,8 +570,11 @@ fn emit_spawn_span(
     }
 }
 
-/// Build the full attribute set from a SpawnExec.
-fn build_spawn_attributes(s: &SpawnExec) -> Vec<KeyValue> {
+/// Build the full attribute set from a SpawnExec. `redactor` is applied to
+/// `s.command_args` before it is joined into the `bazel.spawn.command`
+/// attribute -- defence in depth for rules that smuggle a Bazel-style
+/// `--client_env=NAME=VALUE` flag into the spawned process argv.
+fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
     let mut attrs = Vec::with_capacity(32);
 
     if !s.target_label.is_empty() {
@@ -628,7 +637,7 @@ fn build_spawn_attributes(s: &SpawnExec) -> Vec<KeyValue> {
     }
 
     if !s.command_args.is_empty() {
-        let cmd = s.command_args.join(" ");
+        let cmd = redactor.scrub_args(&s.command_args).join(" ");
         attrs.push(KeyValue::new(
             BAZEL_SPAWN_COMMAND,
             truncate_to_byte_limit(&cmd, SPAWN_ATTR_CAP_BYTES, "..."),

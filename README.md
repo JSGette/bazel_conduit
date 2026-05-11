@@ -127,18 +127,33 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 
 ### Secret Redaction
 
-Bazel surfaces environment variables on the command line via flags like
-`--client_env=NAME=VALUE`, `--action_env=`, `--test_env=`, `--repo_env=`, and
-`--host_action_env=`. Without intervention, the *value* half of those flags
-(e.g. `--client_env=GITLAB_TOKEN=glpat-...`) ends up verbatim in the
-`bazel.command_line`, `bazel.explicit_cmd_line`, `bazel.startup_options`, and
-`bazel.action.command_line` span attributes — and from there into whatever
+Bazel surfaces environment variables and user-defined values on the command
+line via flags like `--client_env=NAME=VALUE`, `--action_env=`, `--test_env=`,
+`--repo_env=`, `--host_action_env=`, and `--define=NAME=VALUE`. Workspace
+status entries produced by `--workspace_status_command` (`STABLE_*` keys)
+routinely carry CI-injected tokens. Progress stdout/stderr can echo any of
+the above. Without intervention all of these end up verbatim in the
+`bazel.command_line`, `bazel.explicit_cmd_line`, `bazel.startup_options`,
+`bazel.action.command_line`, `bazel.spawn.command`, `bazel.workspace.*`,
+and `bazel.progress.*` span attributes — and from there into whatever
 backend the OTLP exporter is wired to.
 
 Conduit ships with an in-process scrubber (`rust/conduit/src/otel/redact.rs`)
-that runs **before** any attribute is set on a span. When the variable name
-matches a case-insensitive substring deny list, the value is replaced with
-`***`. The pass-through form `--client_env=NAME` (no `=VALUE`, inherits from
+that runs **before** any attribute is set on a span. Three scrubbing
+surfaces are used:
+
+- **Argv tokens** (`scrub_arg` / `scrub_args`) — applied to
+  `command_line`, `explicit_cmd_line`, `startup_options`, ActionExecuted
+  command lines, and SpawnExec command_args. The `VALUE` half of a
+  recognized `--flag=NAME=VALUE` is replaced with `***` when `NAME` matches.
+- **`(name, value)` pairs** (`scrub_value_by_name`) — applied to
+  `workspaceStatus` entries. Replaces VALUE with `***` when the key name
+  matches.
+- **Free-form text** (`scrub_text`) — applied to progress stdout/stderr.
+  Tokenises on whitespace, runs each token through `scrub_arg`, preserves
+  whitespace runs.
+
+The pass-through form `--client_env=NAME` (no `=VALUE`, inherits from
 the parent process env) is left untouched because no value is on the wire.
 
 Default sensitive-name substrings: `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,

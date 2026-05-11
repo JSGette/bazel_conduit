@@ -785,6 +785,11 @@ impl OtelMapper {
     /// WorkspaceStatus → add workspace attributes to root span.
     /// BUILD_USER and BUILD_HOST are mapped to bazel.user/bazel.host directly
     /// (same semantic as the BuildStarted fields) to avoid duplication.
+    ///
+    /// `STABLE_*` keys produced by `--workspace_status_command` routinely
+    /// carry CI-injected secrets (`STABLE_CI_JOB_TOKEN`, `STABLE_GIT_TOKEN`,
+    /// etc.), so each value is run through the redactor's name-based
+    /// scrubber before it lands on the root span.
     pub fn on_workspace_status(&mut self, items: &HashMap<String, String>) {
         for (key, value) in items {
             let attr_key = match key.as_str() {
@@ -792,7 +797,8 @@ impl OtelMapper {
                 "BUILD_HOST" => BAZEL_WORKSPACE_HOST.to_string(),
                 _ => format!("bazel.workspace.{}", key.to_lowercase()),
             };
-            self.set_root_attr(KeyValue::new(attr_key, value.clone()));
+            let scrubbed = self.redactor.scrub_value_by_name(key, value).into_owned();
+            self.set_root_attr(KeyValue::new(attr_key, scrubbed));
         }
     }
 
@@ -1674,12 +1680,13 @@ impl OtelMapper {
             return;
         }
 
-        // No logger → buffer for the fallback span event in finish().
         if !stderr.is_empty() {
-            append_progress_capped(&mut self.progress_stderr, &strip_ansi(stderr));
+            let cleaned = self.redactor.scrub_text(&strip_ansi(stderr)).into_owned();
+            append_progress_capped(&mut self.progress_stderr, &cleaned);
         }
         if !stdout.is_empty() {
-            append_progress_capped(&mut self.progress_stdout, &strip_ansi(stdout));
+            let cleaned = self.redactor.scrub_text(&strip_ansi(stdout)).into_owned();
+            append_progress_capped(&mut self.progress_stdout, &cleaned);
         }
     }
 
@@ -1695,12 +1702,14 @@ impl OtelMapper {
         let stderr = if stderr.is_empty() {
             String::new()
         } else {
-            truncate_to_byte_limit(&strip_ansi(stderr), PROGRESS_CAP_BYTES, "...(truncated)")
+            let scrubbed = self.redactor.scrub_text(&strip_ansi(stderr)).into_owned();
+            truncate_to_byte_limit(&scrubbed, PROGRESS_CAP_BYTES, "...(truncated)")
         };
         let stdout = if stdout.is_empty() {
             String::new()
         } else {
-            truncate_to_byte_limit(&strip_ansi(stdout), PROGRESS_CAP_BYTES, "...(truncated)")
+            let scrubbed = self.redactor.scrub_text(&strip_ansi(stdout)).into_owned();
+            truncate_to_byte_limit(&scrubbed, PROGRESS_CAP_BYTES, "...(truncated)")
         };
 
         let mut record = logger.create_log_record();
@@ -2021,6 +2030,7 @@ impl OtelMapper {
                 root_end,
                 self.exec_log_max_message_bytes,
                 self.exec_log_max_decompressed_bytes,
+                &self.redactor,
             );
         }
 
