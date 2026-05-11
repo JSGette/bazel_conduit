@@ -48,6 +48,14 @@ pub mod compact;
 /// command args) so a single span can't single-handedly blow the OTLP payload.
 const SPAWN_ATTR_CAP_BYTES: usize = 4096;
 
+/// Per-message cap on length-delimited entries in the binary and compact
+/// execution log formats. Without this, a malformed (or hostile) varint
+/// length prefix would be fed straight to `Vec::resize`, OOM'ing the
+/// process before any payload is read. 64 MiB is roughly 10x the largest
+/// realistic entry observed in Bazel exec logs (a `SpawnExec` with
+/// thousands of input files and a long argv).
+pub(super) const MAX_EXECLOG_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Which on-disk format the execution log uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecLogFormat {

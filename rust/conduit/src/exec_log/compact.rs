@@ -28,6 +28,8 @@ use spawn_proto::tools::protos::exec_log_entry::{
 };
 use spawn_proto::tools::protos::{Digest, ExecLogEntry, File as ProtoFile, SpawnExec};
 
+use super::MAX_EXECLOG_MESSAGE_BYTES;
+
 /// One entry from the dedup table, keyed by [`ExecLogEntry::id`]. Only the
 /// variants the spawn reconstructor reads back through `output_id` are kept;
 /// `input_set_id`, symlink-entry-set, and the invocation envelope are
@@ -68,9 +70,15 @@ pub fn read_all(path: &Path) -> std::io::Result<Vec<SpawnExec>> {
             Some(l) => l,
             None => break,
         };
-        let len_usize = len.try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
-        })?;
+        if len > MAX_EXECLOG_MESSAGE_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "execlog message length {len} exceeds {MAX_EXECLOG_MESSAGE_BYTES} byte cap"
+                ),
+            ));
+        }
+        let len_usize = len as usize;
         buf.resize(len_usize, 0);
         reader.read_exact(&mut buf)?;
         let entry = ExecLogEntry::decode(buf.as_slice())
@@ -383,6 +391,24 @@ mod tests {
                 "bazel-out/k8/bin/tree/a.txt".to_string(),
                 "bazel-out/k8/bin/tree/b.txt".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_message_length_exceeding_cap() {
+        let f = NamedTempFile::new().unwrap();
+        let mut enc = zstd::Encoder::new(f.reopen().unwrap(), 0).unwrap();
+        let mut tmp = [0u8; 10];
+        let oversize = (MAX_EXECLOG_MESSAGE_BYTES as u64) + 1;
+        let n = encode_varint(oversize, &mut tmp);
+        enc.write_all(&tmp[..n]).unwrap();
+        enc.finish().unwrap();
+
+        let err = read_all(f.path()).expect_err("oversize message length must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
         );
     }
 

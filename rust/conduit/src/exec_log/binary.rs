@@ -12,6 +12,8 @@ use std::path::Path;
 use prost::Message;
 use spawn_proto::tools::protos::SpawnExec;
 
+use super::MAX_EXECLOG_MESSAGE_BYTES;
+
 /// Default buffer size for chunked reading of the exec log file (64 KiB).
 const DEFAULT_READER_CAPACITY: usize = 64 * 1024;
 
@@ -64,9 +66,15 @@ impl ExecLogParser {
             Some(l) => l,
             None => return Ok(None),
         };
-        let len_usize = len.try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
-        })?;
+        if len > MAX_EXECLOG_MESSAGE_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "execlog message length {len} exceeds {MAX_EXECLOG_MESSAGE_BYTES} byte cap"
+                ),
+            ));
+        }
+        let len_usize = len as usize;
         self.buffer.resize(len_usize, 0);
         self.reader.read_exact(&mut self.buffer)?;
         let msg = SpawnExec::decode(self.buffer.as_slice())
@@ -84,4 +92,37 @@ pub fn read_all(path: &Path) -> std::io::Result<Vec<SpawnExec>> {
         out.push(entry);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn encode_varint(mut value: u64, buf: &mut [u8; 10]) -> usize {
+        let mut i = 0;
+        while value >= 0x80 {
+            buf[i] = (value as u8) | 0x80;
+            value >>= 7;
+            i += 1;
+        }
+        buf[i] = value as u8;
+        i + 1
+    }
+
+    #[test]
+    fn rejects_message_length_exceeding_cap() {
+        let f = NamedTempFile::new().unwrap();
+        let mut tmp = [0u8; 10];
+        let oversize = (MAX_EXECLOG_MESSAGE_BYTES as u64) + 1;
+        let n = encode_varint(oversize, &mut tmp);
+        std::fs::write(f.path(), &tmp[..n]).unwrap();
+
+        let err = read_all(f.path()).expect_err("oversize message length must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
 }
