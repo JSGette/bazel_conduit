@@ -443,6 +443,11 @@ pub struct OtelMapper {
     /// Scrubs sensitive values out of command-line attributes before they
     /// hit the exporter. See [`crate::otel::redact`].
     redactor: Redactor,
+
+    /// Per-message cap applied when parsing the execution log. Initialised
+    /// from [`crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES`]; the CLI
+    /// can override via `--exec-log-max-message-mib`.
+    exec_log_max_message_bytes: usize,
 }
 
 impl OtelMapper {
@@ -477,6 +482,7 @@ impl OtelMapper {
             action_span_cache: HashMap::new(),
             workspace_directory: None,
             redactor: Redactor::default_enabled(),
+            exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
         }
     }
 
@@ -484,6 +490,17 @@ impl OtelMapper {
     /// supply a custom name pattern list from the CLI).
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    /// Override the per-message cap used when parsing the execution log.
+    /// `0` is rejected silently (kept at default) -- the parser uses
+    /// `Vec::resize` against this value, so an explicit floor avoids
+    /// surprising allocations for misconfigured callers.
+    pub fn with_exec_log_max_message_bytes(mut self, bytes: usize) -> Self {
+        if bytes > 0 {
+            self.exec_log_max_message_bytes = bytes;
+        }
         self
     }
 
@@ -1981,6 +1998,7 @@ impl OtelMapper {
                 root_cx.as_ref(),
                 self.root_span_start_nanos,
                 root_end,
+                self.exec_log_max_message_bytes,
             );
         }
 

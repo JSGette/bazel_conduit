@@ -28,6 +28,7 @@
 //! everything under the root invocation.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,13 +49,59 @@ pub mod compact;
 /// command args) so a single span can't single-handedly blow the OTLP payload.
 const SPAWN_ATTR_CAP_BYTES: usize = 4096;
 
-/// Per-message cap on length-delimited entries in the binary and compact
-/// execution log formats. Without this, a malformed (or hostile) varint
-/// length prefix would be fed straight to `Vec::resize`, OOM'ing the
+/// Default per-message cap on length-delimited entries in the binary and
+/// compact execution log formats. Without this, a malformed (or hostile)
+/// varint length prefix would be fed straight to `Vec::resize`, OOM'ing the
 /// process before any payload is read. 64 MiB is roughly 10x the largest
 /// realistic entry observed in Bazel exec logs (a `SpawnExec` with
-/// thousands of input files and a long argv).
-pub(super) const MAX_EXECLOG_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// thousands of input files and a long argv); operators can override via
+/// `--exec-log-max-message-mib` when they ingest truly pathological logs.
+pub const DEFAULT_EXECLOG_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read a varint-encoded message length and validate it against `max_bytes`.
+/// `Ok(None)` is returned on a clean EOF at a message boundary (no bytes
+/// consumed yet); a length exceeding the cap or a varint that fails to
+/// terminate within 10 bytes returns an `InvalidData` error before any
+/// payload allocation is attempted.
+fn read_message_len<R: Read>(r: &mut R, max_bytes: usize) -> std::io::Result<Option<usize>> {
+    let Some(len) = read_varint(r)? else {
+        return Ok(None);
+    };
+    if len > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("execlog message length {len} exceeds {max_bytes} byte cap"),
+        ));
+    }
+    Ok(Some(len as usize))
+}
+
+/// Read an unsigned LEB128 varint (protobuf wire format). `Ok(None)` on a
+/// clean EOF at a message boundary. Truncated mid-varint reads return the
+/// bytes accumulated so far, which the message-len wrapper then rejects
+/// either via the cap or via the subsequent `read_exact` failing.
+fn read_varint<R: Read>(r: &mut R) -> std::io::Result<Option<u64>> {
+    let mut buf = [0u8; 1];
+    let mut n: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        if r.read(&mut buf)? == 0 {
+            return Ok(if shift == 0 { None } else { Some(n) });
+        }
+        let b = buf[0];
+        n |= u64::from(b & 0x7F) << shift;
+        shift += 7;
+        if (b & 0x80) == 0 {
+            return Ok(Some(n));
+        }
+        if shift >= 64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "varint overflow",
+            ));
+        }
+    }
+}
 
 /// Which on-disk format the execution log uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,10 +345,11 @@ pub fn enrich_trace(
     root_span_context: Option<&SpanContext>,
     root_start_nanos: Option<i64>,
     root_end_nanos: Option<i64>,
+    max_message_bytes: usize,
 ) {
     let spawns = match format {
-        ExecLogFormat::Binary => binary::read_all(path),
-        ExecLogFormat::Compact => compact::read_all(path),
+        ExecLogFormat::Binary => binary::read_all(path, max_message_bytes),
+        ExecLogFormat::Compact => compact::read_all(path, max_message_bytes),
     };
     let spawns = match spawns {
         Ok(v) => v,

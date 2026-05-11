@@ -88,6 +88,7 @@ pub struct EventRouter {
     state: BuildState,
     mapper: Option<OtelMapper>,
     redactor: Redactor,
+    exec_log_max_message_bytes: usize,
 }
 
 impl EventRouter {
@@ -97,6 +98,7 @@ impl EventRouter {
             state: BuildState::new(),
             mapper: None,
             redactor: Redactor::default_enabled(),
+            exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
         }
     }
 
@@ -111,7 +113,8 @@ impl EventRouter {
     ) -> Self {
         self.mapper = Some(
             OtelMapper::new(tracer, Some(logger))
-                .with_redactor(self.redactor.clone()),
+                .with_redactor(self.redactor.clone())
+                .with_exec_log_max_message_bytes(self.exec_log_max_message_bytes),
         );
         self
     }
@@ -121,6 +124,17 @@ impl EventRouter {
         self.redactor = redactor.clone();
         if let Some(mapper) = self.mapper.take() {
             self.mapper = Some(mapper.with_redactor(redactor));
+        }
+        self
+    }
+
+    /// Override the per-message cap used when parsing the execution log.
+    /// Stored on the router so a later `with_export()` call can propagate
+    /// it to a freshly-built [`OtelMapper`].
+    pub fn with_exec_log_max_message_bytes(mut self, bytes: usize) -> Self {
+        self.exec_log_max_message_bytes = bytes;
+        if let Some(mapper) = self.mapper.take() {
+            self.mapper = Some(mapper.with_exec_log_max_message_bytes(bytes));
         }
         self
     }

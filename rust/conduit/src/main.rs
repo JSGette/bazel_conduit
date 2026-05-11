@@ -68,6 +68,14 @@ struct Args {
     /// supplied list fully replaces the default.
     #[arg(long = "redact-name-pattern", value_name = "SUBSTR")]
     redact_name_patterns: Vec<String>,
+
+    /// Per-message cap (in MiB) on length-delimited entries in Bazel's
+    /// `--execution_log_{binary,compact}_file`. A malformed varint length
+    /// prefix would otherwise be fed straight to `Vec::resize`. The default
+    /// (64 MiB) is ~10x the largest realistic entry; bump it only when
+    /// ingesting pathological logs.
+    #[arg(long, value_name = "MIB", default_value_t = 64)]
+    exec_log_max_message_mib: u32,
 }
 
 impl Args {
@@ -130,7 +138,16 @@ async fn main() -> anyhow::Result<()> {
         info!("Command-line redaction: DISABLED — secrets in --client_env may leak to traces");
     }
 
-    let mut router = EventRouter::new().with_redactor(redactor);
+    let exec_log_max_message_bytes =
+        (args.exec_log_max_message_mib as usize).saturating_mul(1024 * 1024);
+    info!(
+        "Execution log per-message cap: {} MiB",
+        args.exec_log_max_message_mib
+    );
+
+    let mut router = EventRouter::new()
+        .with_redactor(redactor)
+        .with_exec_log_max_message_bytes(exec_log_max_message_bytes);
     if let (Some(tp), Some(lp)) = (&tracer_provider, &logger_provider) {
         router = router.with_export(tp.tracer("conduit"), lp.logger("conduit"));
     }

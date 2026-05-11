@@ -12,70 +12,35 @@ use std::path::Path;
 use prost::Message;
 use spawn_proto::tools::protos::SpawnExec;
 
-use super::MAX_EXECLOG_MESSAGE_BYTES;
+use super::read_message_len;
 
 /// Default buffer size for chunked reading of the exec log file (64 KiB).
 const DEFAULT_READER_CAPACITY: usize = 64 * 1024;
-
-/// Read a varint encoding a non-negative `u64` from the stream. Returns
-/// `Ok(None)` on a clean EOF before any bytes were consumed (i.e. at message
-/// boundaries) so callers can distinguish end-of-stream from a truncated
-/// length prefix.
-fn read_varint<R: Read>(r: &mut R) -> std::io::Result<Option<u64>> {
-    let mut buf = [0u8; 1];
-    let mut n: u64 = 0;
-    let mut shift: u32 = 0;
-    loop {
-        if r.read(&mut buf)? == 0 {
-            return Ok(if shift == 0 { None } else { Some(n) });
-        }
-        let b = buf[0];
-        n |= u64::from(b & 0x7F) << shift;
-        shift += 7;
-        if (b & 0x80) == 0 {
-            return Ok(Some(n));
-        }
-        if shift >= 64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "varint overflow",
-            ));
-        }
-    }
-}
 
 /// Chunked parser for the binary execution log.
 pub struct ExecLogParser {
     reader: BufReader<File>,
     buffer: Vec<u8>,
+    max_message_bytes: usize,
 }
 
 impl ExecLogParser {
-    pub fn open(path: &Path) -> std::io::Result<Self> {
+    pub fn open(path: &Path, max_message_bytes: usize) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::with_capacity(DEFAULT_READER_CAPACITY, file);
         Ok(Self {
             reader,
             buffer: Vec::new(),
+            max_message_bytes,
         })
     }
 
     /// Read the next [`SpawnExec`] message. Returns `Ok(None)` at EOF.
     pub fn next_entry(&mut self) -> std::io::Result<Option<SpawnExec>> {
-        let len = match read_varint(&mut self.reader)? {
-            Some(l) => l,
-            None => return Ok(None),
+        let Some(len) = read_message_len(&mut self.reader, self.max_message_bytes)? else {
+            return Ok(None);
         };
-        if len > MAX_EXECLOG_MESSAGE_BYTES as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "execlog message length {len} exceeds {MAX_EXECLOG_MESSAGE_BYTES} byte cap"
-                ),
-            ));
-        }
-        let len_usize = len as usize;
-        self.buffer.resize(len_usize, 0);
+        self.buffer.resize(len, 0);
         self.reader.read_exact(&mut self.buffer)?;
         let msg = SpawnExec::decode(self.buffer.as_slice())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -84,9 +49,10 @@ impl ExecLogParser {
 }
 
 /// Read every [`SpawnExec`] in the file. Stops at the first I/O or decode
-/// error and returns it; partial results are discarded.
-pub fn read_all(path: &Path) -> std::io::Result<Vec<SpawnExec>> {
-    let mut parser = ExecLogParser::open(path)?;
+/// error and returns it; partial results are discarded. `max_message_bytes`
+/// caps the per-message size to prevent OOM from a malformed varint prefix.
+pub fn read_all(path: &Path, max_message_bytes: usize) -> std::io::Result<Vec<SpawnExec>> {
+    let mut parser = ExecLogParser::open(path, max_message_bytes)?;
     let mut out = Vec::new();
     while let Some(entry) = parser.next_entry()? {
         out.push(entry);
@@ -97,6 +63,7 @@ pub fn read_all(path: &Path) -> std::io::Result<Vec<SpawnExec>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES;
     use tempfile::NamedTempFile;
 
     fn encode_varint(mut value: u64, buf: &mut [u8; 10]) -> usize {
@@ -114,11 +81,12 @@ mod tests {
     fn rejects_message_length_exceeding_cap() {
         let f = NamedTempFile::new().unwrap();
         let mut tmp = [0u8; 10];
-        let oversize = (MAX_EXECLOG_MESSAGE_BYTES as u64) + 1;
+        let oversize = (DEFAULT_EXECLOG_MAX_MESSAGE_BYTES as u64) + 1;
         let n = encode_varint(oversize, &mut tmp);
         std::fs::write(f.path(), &tmp[..n]).unwrap();
 
-        let err = read_all(f.path()).expect_err("oversize message length must be rejected");
+        let err = read_all(f.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES)
+            .expect_err("oversize message length must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("exceeds"),

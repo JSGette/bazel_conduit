@@ -28,7 +28,7 @@ use spawn_proto::tools::protos::exec_log_entry::{
 };
 use spawn_proto::tools::protos::{Digest, ExecLogEntry, File as ProtoFile, SpawnExec};
 
-use super::MAX_EXECLOG_MESSAGE_BYTES;
+use super::read_message_len;
 
 /// One entry from the dedup table, keyed by [`ExecLogEntry::id`]. Only the
 /// variants the spawn reconstructor reads back through `output_id` are kept;
@@ -56,7 +56,9 @@ impl Stored {
 }
 
 /// Read every spawn from a compact execution log, expanded to [`SpawnExec`].
-pub fn read_all(path: &Path) -> std::io::Result<Vec<SpawnExec>> {
+/// `max_message_bytes` caps the per-message size to prevent OOM from a
+/// malformed varint prefix inside the zstd frame.
+pub fn read_all(path: &Path, max_message_bytes: usize) -> std::io::Result<Vec<SpawnExec>> {
     let file = FsFile::open(path)?;
     let decoder = zstd::Decoder::new(BufReader::new(file))?;
     let mut reader = BufReader::with_capacity(64 * 1024, decoder);
@@ -65,21 +67,8 @@ pub fn read_all(path: &Path) -> std::io::Result<Vec<SpawnExec>> {
     let mut spawns = Vec::new();
     let mut buf = Vec::new();
 
-    loop {
-        let len = match read_varint(&mut reader)? {
-            Some(l) => l,
-            None => break,
-        };
-        if len > MAX_EXECLOG_MESSAGE_BYTES as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "execlog message length {len} exceeds {MAX_EXECLOG_MESSAGE_BYTES} byte cap"
-                ),
-            ));
-        }
-        let len_usize = len as usize;
-        buf.resize(len_usize, 0);
+    while let Some(len) = read_message_len(&mut reader, max_message_bytes)? {
+        buf.resize(len, 0);
         reader.read_exact(&mut buf)?;
         let entry = ExecLogEntry::decode(buf.as_slice())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -247,6 +236,7 @@ fn symlink_to_proto_file(entry: SymlinkEntry) -> ProtoFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES;
     use prost::Message;
     use spawn_proto::tools::protos::exec_log_entry::{
         File as FileEntryProto, Invocation, Output, Type as EntryType,
@@ -327,7 +317,8 @@ mod tests {
             ),
         ]);
 
-        let spawns = read_all(log.path()).expect("compact log parses");
+        let spawns = read_all(log.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES)
+            .expect("compact log parses");
         assert_eq!(spawns.len(), 1);
         let s = &spawns[0];
         assert_eq!(s.target_label, "//pkg:foo");
@@ -380,7 +371,7 @@ mod tests {
             ),
         ]);
 
-        let spawns = read_all(log.path()).unwrap();
+        let spawns = read_all(log.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES).unwrap();
         assert_eq!(spawns.len(), 1);
         let s = &spawns[0];
         assert_eq!(s.listed_outputs, vec!["bazel-out/k8/bin/tree".to_string()]);
@@ -399,12 +390,13 @@ mod tests {
         let f = NamedTempFile::new().unwrap();
         let mut enc = zstd::Encoder::new(f.reopen().unwrap(), 0).unwrap();
         let mut tmp = [0u8; 10];
-        let oversize = (MAX_EXECLOG_MESSAGE_BYTES as u64) + 1;
+        let oversize = (DEFAULT_EXECLOG_MAX_MESSAGE_BYTES as u64) + 1;
         let n = encode_varint(oversize, &mut tmp);
         enc.write_all(&tmp[..n]).unwrap();
         enc.finish().unwrap();
 
-        let err = read_all(f.path()).expect_err("oversize message length must be rejected");
+        let err = read_all(f.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES)
+            .expect_err("oversize message length must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("exceeds"),
@@ -439,7 +431,7 @@ mod tests {
             ),
         ]);
 
-        let spawns = read_all(log.path()).unwrap();
+        let spawns = read_all(log.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES).unwrap();
         assert_eq!(spawns.len(), 1);
         assert_eq!(
             spawns[0].listed_outputs,
@@ -449,27 +441,3 @@ mod tests {
     }
 }
 
-/// Read a varint encoding a non-negative `u64`. `Ok(None)` on a clean EOF at
-/// a message boundary (no bytes consumed yet).
-fn read_varint<R: Read>(r: &mut R) -> std::io::Result<Option<u64>> {
-    let mut buf = [0u8; 1];
-    let mut n: u64 = 0;
-    let mut shift: u32 = 0;
-    loop {
-        if r.read(&mut buf)? == 0 {
-            return Ok(if shift == 0 { None } else { Some(n) });
-        }
-        let b = buf[0];
-        n |= u64::from(b & 0x7F) << shift;
-        shift += 7;
-        if (b & 0x80) == 0 {
-            return Ok(Some(n));
-        }
-        if shift >= 64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "varint overflow",
-            ));
-        }
-    }
-}
