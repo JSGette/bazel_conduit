@@ -13,6 +13,7 @@ use crate::bes_proto::{
 use crate::proto_types::Empty;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -178,6 +179,30 @@ impl PublishBuildEvent for BesServer {
 /// Bound on the receive→worker hand-off; sized to match the OTel batch queue
 /// so even a fully-cached giant build never backpressures the BES ACK path.
 const ROUTE_CHANNEL_CAPACITY: usize = 65536;
+
+/// Per-message cap for inbound BES events. BEP `BuildMetrics`, action stderr,
+/// or fat `OptionsParsed` blobs occasionally reach hundreds of KiB; 8 MiB
+/// leaves an order of magnitude of headroom while preventing a single
+/// hostile / malformed event from OOM'ing the process via tonic's decode path.
+const MAX_INCOMING_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// HTTP/2 hard cap on concurrent streams per TCP connection. Bazel uses a
+/// single streaming RPC for the whole build plus the occasional lifecycle
+/// unary RPC, so 64 covers any realistic workload while bounding fanout
+/// from a misbehaving / malicious peer.
+const MAX_CONCURRENT_STREAMS: u32 = 64;
+
+/// Tower-level cap on concurrently executing RPCs per connection. Pairs
+/// with [`MAX_CONCURRENT_STREAMS`] to also bound work performed by
+/// long-running handlers (the streaming routing worker holds the mutex).
+const CONCURRENCY_LIMIT_PER_CONNECTION: usize = 32;
+
+/// HTTP/2 keepalive interval. Combined with [`KEEPALIVE_TIMEOUT`], this
+/// detects half-open / slow-loris clients without forcing a request-level
+/// deadline on the long-lived BES stream (which can legitimately run for
+/// hours on big builds).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Extract a BEP event from a PublishBuildToolEventStreamRequest.
 ///
@@ -504,8 +529,15 @@ pub async fn run_server(addr: SocketAddr, router: EventRouter) -> anyhow::Result
         addr.port()
     );
 
+    let service = PublishBuildEventServer::new(server)
+        .max_decoding_message_size(MAX_INCOMING_MESSAGE_BYTES);
+
     tonic::transport::Server::builder()
-        .add_service(PublishBuildEventServer::new(server))
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
+        .concurrency_limit_per_connection(CONCURRENCY_LIMIT_PER_CONNECTION)
+        .add_service(service)
         .serve(addr)
         .await?;
 
