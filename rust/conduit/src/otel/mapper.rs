@@ -448,6 +448,14 @@ pub struct OtelMapper {
     /// from [`crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES`]; the CLI
     /// can override via `--exec-log-max-message-mib`.
     exec_log_max_message_bytes: usize,
+
+    /// Total decompressed-bytes cap applied to the compact execution log.
+    /// Initialised from
+    /// [`crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES`]; the CLI
+    /// can override via `--exec-log-max-decompressed-mib`. Defends against
+    /// a zstd zip-bomb whose payload count would OOM the in-memory
+    /// `Vec<SpawnExec>` even after the per-message cap is enforced.
+    exec_log_max_decompressed_bytes: usize,
 }
 
 impl OtelMapper {
@@ -483,6 +491,8 @@ impl OtelMapper {
             workspace_directory: None,
             redactor: Redactor::default_enabled(),
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            exec_log_max_decompressed_bytes:
+                crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
         }
     }
 
@@ -500,6 +510,17 @@ impl OtelMapper {
     pub fn with_exec_log_max_message_bytes(mut self, bytes: usize) -> Self {
         if bytes > 0 {
             self.exec_log_max_message_bytes = bytes;
+        }
+        self
+    }
+
+    /// Override the decompressed-bytes cap used when parsing the compact
+    /// execution log. `0` is rejected silently (kept at default) for the
+    /// same reason as [`Self::with_exec_log_max_message_bytes`]: a
+    /// zero-budget reader would error immediately on the first byte.
+    pub fn with_exec_log_max_decompressed_bytes(mut self, bytes: usize) -> Self {
+        if bytes > 0 {
+            self.exec_log_max_decompressed_bytes = bytes;
         }
         self
     }
@@ -1999,6 +2020,7 @@ impl OtelMapper {
                 self.root_span_start_nanos,
                 root_end,
                 self.exec_log_max_message_bytes,
+                self.exec_log_max_decompressed_bytes,
             );
         }
 

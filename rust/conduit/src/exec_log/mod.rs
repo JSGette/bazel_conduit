@@ -58,6 +58,16 @@ const SPAWN_ATTR_CAP_BYTES: usize = 4096;
 /// `--exec-log-max-message-mib` when they ingest truly pathological logs.
 pub const DEFAULT_EXECLOG_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default cap on total **decompressed** bytes pulled out of a
+/// `--execution_log_compact_file` zstd frame. The per-message cap above
+/// only bounds one entry; without this second cap, a hostile sender could
+/// pack millions of valid-but-bogus small messages into a tiny zstd frame
+/// (zstd routinely hits 100:1 ratios on repetitive protobufs) and OOM us
+/// via the in-memory `Vec<SpawnExec>`. 2 GiB is ~4x the largest realistic
+/// decompressed compact log (kernel-monorepo-sized builds: ~500 MiB);
+/// override via `--exec-log-max-decompressed-mib`.
+pub const DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 /// Read a varint-encoded message length and validate it against `max_bytes`.
 /// `Ok(None)` is returned on a clean EOF at a message boundary (no bytes
 /// consumed yet); a length exceeding the cap or a varint that fails to
@@ -346,10 +356,13 @@ pub fn enrich_trace(
     root_start_nanos: Option<i64>,
     root_end_nanos: Option<i64>,
     max_message_bytes: usize,
+    max_decompressed_bytes: usize,
 ) {
     let spawns = match format {
         ExecLogFormat::Binary => binary::read_all(path, max_message_bytes),
-        ExecLogFormat::Compact => compact::read_all(path, max_message_bytes),
+        ExecLogFormat::Compact => {
+            compact::read_all(path, max_message_bytes, max_decompressed_bytes)
+        }
     };
     let spawns = match spawns {
         Ok(v) => v,

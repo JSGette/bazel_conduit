@@ -89,6 +89,7 @@ pub struct EventRouter {
     mapper: Option<OtelMapper>,
     redactor: Redactor,
     exec_log_max_message_bytes: usize,
+    exec_log_max_decompressed_bytes: usize,
 }
 
 impl EventRouter {
@@ -99,6 +100,8 @@ impl EventRouter {
             mapper: None,
             redactor: Redactor::default_enabled(),
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            exec_log_max_decompressed_bytes:
+                crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
         }
     }
 
@@ -114,7 +117,8 @@ impl EventRouter {
         self.mapper = Some(
             OtelMapper::new(tracer, Some(logger))
                 .with_redactor(self.redactor.clone())
-                .with_exec_log_max_message_bytes(self.exec_log_max_message_bytes),
+                .with_exec_log_max_message_bytes(self.exec_log_max_message_bytes)
+                .with_exec_log_max_decompressed_bytes(self.exec_log_max_decompressed_bytes),
         );
         self
     }
@@ -135,6 +139,17 @@ impl EventRouter {
         self.exec_log_max_message_bytes = bytes;
         if let Some(mapper) = self.mapper.take() {
             self.mapper = Some(mapper.with_exec_log_max_message_bytes(bytes));
+        }
+        self
+    }
+
+    /// Override the decompressed-bytes cap used when parsing the compact
+    /// execution log. Same propagation pattern as
+    /// [`Self::with_exec_log_max_message_bytes`].
+    pub fn with_exec_log_max_decompressed_bytes(mut self, bytes: usize) -> Self {
+        self.exec_log_max_decompressed_bytes = bytes;
+        if let Some(mapper) = self.mapper.take() {
+            self.mapper = Some(mapper.with_exec_log_max_decompressed_bytes(bytes));
         }
         self
     }

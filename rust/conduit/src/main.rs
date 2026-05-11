@@ -76,6 +76,14 @@ struct Args {
     /// ingesting pathological logs.
     #[arg(long, value_name = "MIB", default_value_t = 64)]
     exec_log_max_message_mib: u32,
+
+    /// Cap (in MiB) on total *decompressed* bytes pulled out of a compact
+    /// execution log's zstd frame. The per-message cap above only bounds
+    /// one entry; this one bounds the overall stream so a tiny malicious
+    /// frame can't expand to GiB of valid-but-bogus messages. Default
+    /// (2 GiB) is ~4x the largest realistic decompressed compact log.
+    #[arg(long, value_name = "MIB", default_value_t = 2048)]
+    exec_log_max_decompressed_mib: u32,
 }
 
 impl Args {
@@ -140,14 +148,17 @@ async fn main() -> anyhow::Result<()> {
 
     let exec_log_max_message_bytes =
         (args.exec_log_max_message_mib as usize).saturating_mul(1024 * 1024);
+    let exec_log_max_decompressed_bytes =
+        (args.exec_log_max_decompressed_mib as usize).saturating_mul(1024 * 1024);
     info!(
-        "Execution log per-message cap: {} MiB",
-        args.exec_log_max_message_mib
+        "Execution log caps: {} MiB per message, {} MiB decompressed total",
+        args.exec_log_max_message_mib, args.exec_log_max_decompressed_mib
     );
 
     let mut router = EventRouter::new()
         .with_redactor(redactor)
-        .with_exec_log_max_message_bytes(exec_log_max_message_bytes);
+        .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
+        .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes);
     if let (Some(tp), Some(lp)) = (&tracer_provider, &logger_provider) {
         router = router.with_export(tp.tracer("conduit"), lp.logger("conduit"));
     }

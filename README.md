@@ -123,6 +123,7 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 | `--no-redact` | Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags | off (scrubbing on) |
 | `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable) | built-in defaults |
 | `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_{binary,compact}_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
+| `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
 
 ### Secret Redaction
 

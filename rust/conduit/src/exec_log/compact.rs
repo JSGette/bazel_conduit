@@ -56,12 +56,22 @@ impl Stored {
 }
 
 /// Read every spawn from a compact execution log, expanded to [`SpawnExec`].
-/// `max_message_bytes` caps the per-message size to prevent OOM from a
-/// malformed varint prefix inside the zstd frame.
-pub fn read_all(path: &Path, max_message_bytes: usize) -> std::io::Result<Vec<SpawnExec>> {
+///
+/// * `max_message_bytes` caps a single length-delimited entry, preventing
+///   OOM from a malformed varint prefix.
+/// * `max_decompressed_bytes` caps the total number of bytes pulled out of
+///   the zstd frame, preventing a small malicious file from inflating into
+///   GiB worth of valid-but-bogus messages (zstd's `Decoder` is otherwise
+///   unbounded).
+pub fn read_all(
+    path: &Path,
+    max_message_bytes: usize,
+    max_decompressed_bytes: usize,
+) -> std::io::Result<Vec<SpawnExec>> {
     let file = FsFile::open(path)?;
     let decoder = zstd::Decoder::new(BufReader::new(file))?;
-    let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+    let limited = LimitedReader::new(decoder, max_decompressed_bytes);
+    let mut reader = BufReader::with_capacity(64 * 1024, limited);
 
     let mut state = State::default();
     let mut spawns = Vec::new();
@@ -77,6 +87,40 @@ pub fn read_all(path: &Path, max_message_bytes: usize) -> std::io::Result<Vec<Sp
         }
     }
     Ok(spawns)
+}
+
+/// `Read` adapter that errors with `InvalidData` once `max_bytes` total
+/// bytes have been delivered to the consumer. The internal budget is
+/// `max_bytes + 1` so that a stream of exactly `max_bytes` reads cleanly
+/// (final inner `Ok(0)` propagates as a clean EOF); the +1 byte is only
+/// ever consumed when the underlying stream is actually larger.
+struct LimitedReader<R: Read> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> LimitedReader<R> {
+    fn new(inner: R, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            remaining: (max_bytes as u64).saturating_add(1),
+        }
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "execlog decompressed payload exceeds cap",
+            ));
+        }
+        let cap = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
 }
 
 #[derive(Default)]
@@ -236,7 +280,9 @@ fn symlink_to_proto_file(entry: SymlinkEntry) -> ProtoFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES;
+    use crate::exec_log::{
+        DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES, DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+    };
     use prost::Message;
     use spawn_proto::tools::protos::exec_log_entry::{
         File as FileEntryProto, Invocation, Output, Type as EntryType,
@@ -317,8 +363,12 @@ mod tests {
             ),
         ]);
 
-        let spawns = read_all(log.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES)
-            .expect("compact log parses");
+        let spawns = read_all(
+            log.path(),
+            DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
+        )
+        .expect("compact log parses");
         assert_eq!(spawns.len(), 1);
         let s = &spawns[0];
         assert_eq!(s.target_label, "//pkg:foo");
@@ -371,7 +421,12 @@ mod tests {
             ),
         ]);
 
-        let spawns = read_all(log.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES).unwrap();
+        let spawns = read_all(
+            log.path(),
+            DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
         assert_eq!(spawns.len(), 1);
         let s = &spawns[0];
         assert_eq!(s.listed_outputs, vec!["bazel-out/k8/bin/tree".to_string()]);
@@ -395,11 +450,36 @@ mod tests {
         enc.write_all(&tmp[..n]).unwrap();
         enc.finish().unwrap();
 
-        let err = read_all(f.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES)
-            .expect_err("oversize message length must be rejected");
+        let err = read_all(
+            f.path(),
+            DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
+        )
+        .expect_err("oversize message length must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_decompressed_payload_exceeding_cap() {
+        // Pack 64 KiB of zero bytes (highly compressible) into a zstd frame
+        // that on-disk is well under 1 KiB, then read it back with a 1 KiB
+        // decompressed cap. The reader should error before exhausting the
+        // frame -- this is the zip-bomb defence.
+        let f = NamedTempFile::new().unwrap();
+        let mut enc = zstd::Encoder::new(f.reopen().unwrap(), 0).unwrap();
+        let payload = vec![0u8; 64 * 1024];
+        enc.write_all(&payload).unwrap();
+        enc.finish().unwrap();
+
+        let err = read_all(f.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES, 1024)
+            .expect_err("decompressed bomb must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("decompressed"),
             "unexpected error: {err}"
         );
     }
@@ -431,7 +511,12 @@ mod tests {
             ),
         ]);
 
-        let spawns = read_all(log.path(), DEFAULT_EXECLOG_MAX_MESSAGE_BYTES).unwrap();
+        let spawns = read_all(
+            log.path(),
+            DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
         assert_eq!(spawns.len(), 1);
         assert_eq!(
             spawns[0].listed_outputs,
