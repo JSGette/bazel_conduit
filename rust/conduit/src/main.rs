@@ -8,9 +8,9 @@ use conduit_lib::otel::{
 use opentelemetry::logs::LoggerProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use std::fs::File;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// BEP to OpenTelemetry trace converter
@@ -29,6 +29,15 @@ struct Args {
     /// gRPC server port
     #[arg(short = 'p', long, default_value = "8080")]
     port: u16,
+
+    /// Bind address for the BES gRPC server. Defaults to loopback
+    /// (`127.0.0.1`) because conduit has no auth or TLS — exposing
+    /// it to other hosts is an explicit, deliberate choice that
+    /// must be paired with external access control (firewall,
+    /// sidecar mTLS, etc.). Use `0.0.0.0` to listen on all
+    /// interfaces, or a specific host IP to restrict to one NIC.
+    #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    listen_addr: IpAddr,
 
     /// Export mode: none, stdout, otlp
     #[arg(long, default_value = "none")]
@@ -130,7 +139,14 @@ async fn main() -> anyhow::Result<()> {
         process_json_file(&input_path, &mut router)?;
         router.finish();
     } else if args.serve {
-        let addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
+        let addr = SocketAddr::new(args.listen_addr, args.port);
+        if !args.listen_addr.is_loopback() {
+            warn!(
+                %addr,
+                "Binding gRPC server to a non-loopback address. Conduit has no auth or TLS; \
+                 ensure access is restricted via firewall / sidecar / network policy."
+            );
+        }
         run_server(addr, router).await?;
     } else {
         info!("Usage:");

@@ -115,6 +115,7 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 |------|-------------|---------|
 | `--input <FILE>` | Read BEP from NDJSON file | - |
 | `--serve` | Start BES gRPC server | false |
+| `--listen-addr <IP>` | Bind address for the BES gRPC server. Defaults to loopback; pass `0.0.0.0` only when external access is intentionally needed (conduit has no auth/TLS). | `127.0.0.1` |
 | `--port <PORT>` | gRPC server port | 8080 |
 | `--export <MODE>` | Export mode: `none`, `stdout`, `otlp` | `none` |
 | `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |

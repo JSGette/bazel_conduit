@@ -3,3 +3,4 @@ bazel-*
 trace.json
 target/
 docs/
+security-report/
