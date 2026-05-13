@@ -4,3 +4,4 @@ trace.json
 target/
 docs/
 security-report/
+.vscode/
