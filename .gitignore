@@ -6,3 +6,5 @@ docs/
 security-report/
 .vscode/
 user.bazelrc
+.DS_Store
+proto/.DS_Store
