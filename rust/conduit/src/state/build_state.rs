@@ -3,7 +3,6 @@
 //! Maintains state throughout a build invocation.
 
 use super::ActionProcessingMode;
-use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -49,10 +48,10 @@ pub struct BuildState {
     patterns: Vec<String>,
 
     // Targets (label -> TargetState)
-    targets: DashMap<String, TargetState>,
+    targets: HashMap<String, TargetState>,
 
     // Named sets cache (set_id -> files)
-    named_sets: DashMap<String, Vec<String>>,
+    named_sets: HashMap<String, Vec<String>>,
 
     // Actions (failed in lightweight mode, all in full mode)
     actions: Vec<ActionState>,
@@ -79,8 +78,8 @@ impl BuildState {
             action_mode: ActionProcessingMode::default(),
             workspace_status: HashMap::new(),
             patterns: Vec::new(),
-            targets: DashMap::new(),
-            named_sets: DashMap::new(),
+            targets: HashMap::new(),
+            named_sets: HashMap::new(),
             actions: Vec::new(),
             build_metrics: None,
             exec_log_path: None,
@@ -200,7 +199,7 @@ impl BuildState {
     // =========================================================================
 
     pub fn start_target(
-        &self,
+        &mut self,
         label: String,
         kind: Option<String>,
         start_time: Option<String>,
@@ -219,13 +218,13 @@ impl BuildState {
     }
 
     pub fn complete_target(
-        &self,
+        &mut self,
         label: String,
         success: bool,
         file_sets: Vec<String>,
         end_time: Option<String>,
     ) {
-        if let Some(mut target) = self.targets.get_mut(&label) {
+        if let Some(target) = self.targets.get_mut(&label) {
             target.success = Some(success);
             target.end_time = end_time;
             target.output_file_sets = file_sets;
@@ -233,7 +232,7 @@ impl BuildState {
     }
 
     pub fn targets(&self) -> Vec<TargetState> {
-        self.targets.iter().map(|r| r.value().clone()).collect()
+        self.targets.values().cloned().collect()
     }
 
     pub fn targets_count(&self) -> usize {
@@ -244,12 +243,12 @@ impl BuildState {
     // Named sets (output file cache)
     // =========================================================================
 
-    pub fn cache_named_set(&self, id: String, files: Vec<String>) {
+    pub fn cache_named_set(&mut self, id: String, files: Vec<String>) {
         self.named_sets.insert(id, files);
     }
 
     pub fn get_named_set(&self, id: &str) -> Option<Vec<String>> {
-        self.named_sets.get(id).map(|r| r.value().clone())
+        self.named_sets.get(id).cloned()
     }
 
     // =========================================================================
@@ -301,12 +300,12 @@ impl BuildState {
     pub fn summary(&self) -> BuildSummary {
         let successful_targets = self
             .targets
-            .iter()
+            .values()
             .filter(|t| t.success == Some(true))
             .count();
         let failed_targets = self
             .targets
-            .iter()
+            .values()
             .filter(|t| t.success == Some(false))
             .count();
         let failed_actions = self.actions.iter().filter(|a| !a.success).count();

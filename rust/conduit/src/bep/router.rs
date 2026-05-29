@@ -90,6 +90,42 @@ pub enum RouterError {
     HandlerError(String),
 }
 
+struct StartedEventArgs {
+    uuid: String,
+    command: String,
+    start_time_nanos: Option<i64>,
+    start_time_millis: Option<i64>,
+    event_time_nanos: Option<i64>,
+    workspace_dir: Option<String>,
+    working_dir: Option<String>,
+    build_tool_version: Option<String>,
+    server_pid: Option<i64>,
+    host: Option<String>,
+    user: Option<String>,
+}
+
+struct OptionsParsedArgs {
+    cmd_line: Vec<String>,
+    explicit_cmd_line: Vec<String>,
+    startup_options: Vec<String>,
+    tool_tag: Option<String>,
+}
+
+struct ActionCompletedArgs {
+    label: Option<String>,
+    primary_output: Option<String>,
+    configuration: Option<String>,
+    success: bool,
+    mnemonic: Option<String>,
+    exit_code: Option<i32>,
+    exit_code_name: Option<String>,
+    command_line: Vec<String>,
+    stdout_path: Option<String>,
+    stderr_path: Option<String>,
+    start_time_nanos: Option<i64>,
+    end_time_nanos: Option<i64>,
+}
+
 /// Event router that processes BEP events.
 ///
 /// Holds an [`OtelMapper`] keyed to a long-lived `Tracer`/`Logger` pair;
@@ -201,6 +237,45 @@ impl EventRouter {
 }
 
 impl EventRouter {
+    fn apply_started_event(&mut self, args: StartedEventArgs) {
+        let carry_exec_log_path = if self.state.invocation_id().is_none() {
+            self.state.exec_log_path().cloned()
+        } else {
+            None
+        };
+        self.state.reset();
+        if let Some(mapper) = &mut self.mapper {
+            mapper.reset();
+        }
+        if let Some(path) = carry_exec_log_path {
+            self.state.set_exec_log_path(Some(path));
+        }
+
+        self.state.set_invocation_id(args.uuid.clone());
+        self.state.set_command(args.command.clone());
+        if let Some(millis) = args.start_time_millis {
+            self.state.set_start_time_millis(millis);
+        }
+
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_build_started(
+                &args.uuid,
+                &args.command,
+                args.start_time_nanos,
+                args.event_time_nanos,
+            );
+            mapper.on_build_started_extended(
+                args.workspace_dir.as_deref(),
+                args.working_dir.as_deref(),
+                args.build_tool_version.as_deref(),
+                args.server_pid,
+                args.host.as_deref(),
+                args.user.as_deref(),
+            );
+        }
+        self.retry_pending_exec_log_on_started();
+    }
+
     fn retry_pending_exec_log_on_started(&mut self) {
         let Some(path) = self.state.exec_log_path().cloned() else {
             return;
@@ -212,6 +287,78 @@ impl EventRouter {
         }
         if let Some(mapper) = &mut self.mapper {
             mapper.on_exec_log_detected(path);
+        }
+    }
+
+    fn apply_options_parsed_event(&mut self, args: OptionsParsedArgs) {
+        let all_options: Vec<&str> = args
+            .cmd_line
+            .iter()
+            .chain(&args.explicit_cmd_line)
+            .map(String::as_str)
+            .collect();
+        let has_all_actions = has_publish_all_actions_flag(&all_options);
+        self.state.set_action_mode(if has_all_actions {
+            ActionProcessingMode::Full
+        } else {
+            ActionProcessingMode::Lightweight
+        });
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_action_mode(self.state.action_mode());
+        }
+
+        if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
+            self.state.set_exec_log_path(Some(path.clone()));
+            if let Some(mapper) = &mut self.mapper {
+                mapper.on_exec_log_detected(path);
+            }
+        }
+
+        self.state.set_startup_options(args.startup_options.clone());
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_options_parsed(&args.startup_options, &args.explicit_cmd_line);
+            if let Some(tool_tag) = args.tool_tag.filter(|s| !s.is_empty()) {
+                mapper.on_tool_tag(&tool_tag);
+            }
+        }
+    }
+
+    fn apply_action_completed_event(&mut self, args: ActionCompletedArgs) {
+        let should_process = self
+            .state
+            .action_mode()
+            .should_create_span(args.success);
+        if !should_process {
+            return;
+        }
+
+        self.state.record_action(
+            args.label.clone(),
+            args.mnemonic.clone(),
+            args.primary_output.clone(),
+            args.success,
+            args.exit_code,
+        );
+
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_action_completed(&ActionCompletedEvent {
+                label: args.label.as_deref(),
+                mnemonic: args.mnemonic.as_deref(),
+                success: args.success,
+                exit_code: args.exit_code,
+                exit_code_name: args.exit_code_name.as_deref(),
+                primary_output: args.primary_output.as_deref(),
+                configuration: args.configuration.as_deref(),
+                command_line: &args.command_line,
+                stdout_path: args.stdout_path.as_deref(),
+                stderr_path: args.stderr_path.as_deref(),
+                start_time_nanos: args.start_time_nanos,
+                end_time_nanos: args.end_time_nanos,
+                cached: None,
+                hostname: None,
+                cached_remotely: None,
+                runner: None,
+            });
         }
     }
 
@@ -301,54 +448,37 @@ impl EventRouter {
 
         match id {
             BepId::Started(_) => {
-                let carry_exec_log_path = if self.state.invocation_id().is_none() {
-                    self.state.exec_log_path().cloned()
-                } else {
-                    None
-                };
-                self.state.reset();
-                if let Some(mapper) = &mut self.mapper {
-                    mapper.reset();
-                }
-                if let Some(path) = carry_exec_log_path {
-                    self.state.set_exec_log_path(Some(path));
-                }
                 if let Some(BepPayload::Started(s)) = &event.payload {
                     let start_time_nanos = s
                         .start_time
                         .as_ref()
                         .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
-                    if !s.uuid.is_empty() {
-                        self.state.set_invocation_id(s.uuid.clone());
-                    }
-                    if !s.command.is_empty() {
-                        self.state.set_command(s.command.clone());
-                    }
                     #[allow(deprecated)]
-                    if s.start_time_millis != 0 {
-                        self.state.set_start_time_millis(s.start_time_millis);
-                    }
-                    if let Some(mapper) = &mut self.mapper {
-                        mapper.on_build_started(
-                            if s.uuid.is_empty() { "unknown" } else { &s.uuid },
-                            if s.command.is_empty() { "unknown" } else { &s.command },
-                            start_time_nanos,
-                            event_time_nanos,
-                        );
-                        mapper.on_build_started_extended(
-                            Some(s.workspace_directory.as_str()),
-                            Some(s.working_directory.as_str()),
-                            Some(s.build_tool_version.as_str()),
-                            if s.server_pid != 0 {
-                                Some(s.server_pid)
-                            } else {
-                                None
-                            },
-                            Some(s.host.as_str()),
-                            Some(s.user.as_str()),
-                        );
-                    }
-                    self.retry_pending_exec_log_on_started();
+                    let start_time_millis = (s.start_time_millis != 0).then_some(s.start_time_millis);
+                    self.apply_started_event(StartedEventArgs {
+                        uuid: if s.uuid.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            s.uuid.clone()
+                        },
+                        command: if s.command.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            s.command.clone()
+                        },
+                        start_time_nanos,
+                        start_time_millis,
+                        event_time_nanos,
+                        workspace_dir: (!s.workspace_directory.is_empty())
+                            .then_some(s.workspace_directory.clone()),
+                        working_dir: (!s.working_directory.is_empty())
+                            .then_some(s.working_directory.clone()),
+                        build_tool_version: (!s.build_tool_version.is_empty())
+                            .then_some(s.build_tool_version.clone()),
+                        server_pid: (s.server_pid != 0).then_some(s.server_pid),
+                        host: (!s.host.is_empty()).then_some(s.host.clone()),
+                        user: (!s.user.is_empty()).then_some(s.user.clone()),
+                    });
                 }
                 Ok(())
             }
@@ -366,35 +496,12 @@ impl EventRouter {
             }
             BepId::OptionsParsed(_) => {
                 if let Some(BepPayload::OptionsParsed(o)) = &event.payload {
-                    let all_options: Vec<&str> = o
-                        .cmd_line
-                        .iter()
-                        .chain(&o.explicit_cmd_line)
-                        .map(String::as_str)
-                        .collect();
-                    let has_all_actions = has_publish_all_actions_flag(&all_options);
-                    self.state.set_action_mode(if has_all_actions {
-                        ActionProcessingMode::Full
-                    } else {
-                        ActionProcessingMode::Lightweight
+                    self.apply_options_parsed_event(OptionsParsedArgs {
+                        cmd_line: o.cmd_line.clone(),
+                        explicit_cmd_line: o.explicit_cmd_line.clone(),
+                        startup_options: o.startup_options.clone(),
+                        tool_tag: (!o.tool_tag.is_empty()).then_some(o.tool_tag.clone()),
                     });
-                    if let Some(mapper) = &mut self.mapper {
-                        mapper.on_action_mode(self.state.action_mode());
-                    }
-                    if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
-                        self.state.set_exec_log_path(Some(path.clone()));
-                        if let Some(mapper) = &mut self.mapper {
-                            mapper.on_exec_log_detected(path);
-                        }
-                    }
-                    self.state.set_startup_options(o.startup_options.clone());
-                    let explicit = o.explicit_cmd_line.clone();
-                    if let Some(mapper) = &mut self.mapper {
-                        mapper.on_options_parsed(&o.startup_options, &explicit);
-                        if !o.tool_tag.is_empty() {
-                            mapper.on_tool_tag(&o.tool_tag);
-                        }
-                    }
                 }
                 Ok(())
             }
@@ -569,60 +676,38 @@ impl EventRouter {
             }
             BepId::ActionCompleted(a) => {
                 if let Some(BepPayload::Action(act)) = &event.payload {
-                    let label = a.label.clone();
-                    let primary_output = a.primary_output.clone();
                     let configuration = a
                         .configuration
                         .as_ref()
                         .map(|c| c.id.clone());
-                    let should_process = self
-                        .state
-                        .action_mode()
-                        .should_create_span(act.success);
-                    if !should_process {
-                        return Ok(());
-                    }
-                    self.state.record_action(
-                        Some(label.clone()),
-                        Some(act.r#type.clone()),
-                        Some(primary_output.clone()),
-                        act.success,
-                        Some(act.exit_code),
-                    );
-                    if let Some(mapper) = &mut self.mapper {
-                        let stdout_uri = act
-                            .stdout
-                            .as_ref()
-                            .and_then(crate::grpc::server::bep_file_uri);
-                        let stderr_uri = act
-                            .stderr
-                            .as_ref()
-                            .and_then(crate::grpc::server::bep_file_uri);
-                        let start_nanos = act.start_time.as_ref().map(|ts| {
-                            ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
-                        });
-                        let end_nanos = act.end_time.as_ref().map(|ts| {
-                            ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
-                        });
-                        mapper.on_action_completed(&ActionCompletedEvent {
-                            label: Some(&label),
-                            mnemonic: Some(&act.r#type),
-                            success: act.success,
-                            exit_code: Some(act.exit_code),
-                            exit_code_name: None,
-                            primary_output: Some(&primary_output),
-                            configuration: configuration.as_deref(),
-                            command_line: &act.command_line,
-                            stdout_path: stdout_uri.as_deref(),
-                            stderr_path: stderr_uri.as_deref(),
-                            start_time_nanos: start_nanos,
-                            end_time_nanos: end_nanos,
-                            cached: None,
-                            hostname: None,
-                            cached_remotely: None,
-                            runner: None,
-                        });
-                    }
+                    let stdout_uri = act
+                        .stdout
+                        .as_ref()
+                        .and_then(crate::grpc::server::bep_file_uri);
+                    let stderr_uri = act
+                        .stderr
+                        .as_ref()
+                        .and_then(crate::grpc::server::bep_file_uri);
+                    let start_nanos = act.start_time.as_ref().map(|ts| {
+                        ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
+                    });
+                    let end_nanos = act.end_time.as_ref().map(|ts| {
+                        ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
+                    });
+                    self.apply_action_completed_event(ActionCompletedArgs {
+                        label: Some(a.label.clone()),
+                        primary_output: Some(a.primary_output.clone()),
+                        configuration,
+                        success: act.success,
+                        mnemonic: Some(act.r#type.clone()),
+                        exit_code: Some(act.exit_code),
+                        exit_code_name: None,
+                        command_line: act.command_line.clone(),
+                        stdout_path: stdout_uri,
+                        stderr_path: stderr_uri,
+                        start_time_nanos: start_nanos,
+                        end_time_nanos: end_nanos,
+                    });
                 }
                 Ok(())
             }
@@ -808,19 +893,6 @@ impl EventRouter {
     // =========================================================================
 
     fn handle_started(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
-        let carry_exec_log_path = if self.state.invocation_id().is_none() {
-            self.state.exec_log_path().cloned()
-        } else {
-            None
-        };
-        self.state.reset();
-        if let Some(mapper) = &mut self.mapper {
-            mapper.reset();
-        }
-        if let Some(path) = carry_exec_log_path {
-            self.state.set_exec_log_path(Some(path));
-        }
-
         let payload = event.get_payload("started");
 
         if let Some(started) = payload {
@@ -844,16 +916,6 @@ impl EventRouter {
                 "Build started"
             );
 
-            if let Some(uuid) = uuid {
-                self.state.set_invocation_id(uuid.to_string());
-            }
-            if let Some(cmd) = command {
-                self.state.set_command(cmd.to_string());
-            }
-            if let Some(millis) = start_time_millis {
-                self.state.set_start_time_millis(millis);
-            }
-
             // Extended fields from BuildStarted
             let workspace_dir = started.get("workspaceDirectory").and_then(|v| v.as_str());
             let working_dir = started.get("workingDirectory").and_then(|v| v.as_str());
@@ -862,23 +924,19 @@ impl EventRouter {
             let host = started.get("host").and_then(|v| v.as_str());
             let user = started.get("user").and_then(|v| v.as_str());
 
-            if let Some(mapper) = &mut self.mapper {
-                mapper.on_build_started(
-                    uuid.unwrap_or("unknown"),
-                    command.unwrap_or("unknown"),
-                    start_time_nanos,
-                    event_time_nanos,
-                );
-                mapper.on_build_started_extended(
-                    workspace_dir,
-                    working_dir,
-                    build_tool_version,
-                    server_pid,
-                    host,
-                    user,
-                );
-            }
-            self.retry_pending_exec_log_on_started();
+            self.apply_started_event(StartedEventArgs {
+                uuid: uuid.unwrap_or("unknown").to_string(),
+                command: command.unwrap_or("unknown").to_string(),
+                start_time_nanos,
+                start_time_millis,
+                event_time_nanos,
+                workspace_dir: workspace_dir.map(str::to_string),
+                working_dir: working_dir.map(str::to_string),
+                build_tool_version: build_tool_version.map(str::to_string),
+                server_pid,
+                host: host.map(str::to_string),
+                user: user.map(str::to_string),
+            });
         }
 
         Ok(())
@@ -905,41 +963,6 @@ impl EventRouter {
 
     fn handle_options_parsed(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         if let Some(payload) = event.get_payload("optionsParsed") {
-            // Detect action processing mode from options
-            let cmd_line = payload.get("cmdLine").and_then(|v| v.as_array());
-            let explicit_cmd_line = payload.get("explicitCmdLine").and_then(|v| v.as_array());
-
-            let all_options: Vec<&str> = cmd_line
-                .into_iter()
-                .chain(explicit_cmd_line)
-                .flatten()
-                .filter_map(|v| v.as_str())
-                .collect();
-
-            let has_all_actions = has_publish_all_actions_flag(&all_options);
-
-            if has_all_actions {
-                info!("Detected --build_event_publish_all_actions → full action processing");
-                self.state.set_action_mode(ActionProcessingMode::Full);
-            } else {
-                info!("Lightweight action processing (failed actions only)");
-                self.state
-                    .set_action_mode(ActionProcessingMode::Lightweight);
-            }
-
-            // OTel: record action mode on root span
-            if let Some(mapper) = &mut self.mapper {
-                mapper.on_action_mode(self.state.action_mode());
-            }
-
-            if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
-                self.state.set_exec_log_path(Some(path.clone()));
-                if let Some(mapper) = &mut self.mapper {
-                    mapper.on_exec_log_detected(path);
-                }
-            }
-
-            // Extract startup options
             let startup_opts: Vec<String> = payload
                 .get("startupOptions")
                 .and_then(|v| v.as_array())
@@ -949,7 +972,6 @@ impl EventRouter {
                         .collect()
                 })
                 .unwrap_or_default();
-            self.state.set_startup_options(startup_opts.clone());
 
             let explicit: Vec<String> = payload
                 .get("explicitCmdLine")
@@ -961,17 +983,26 @@ impl EventRouter {
                 })
                 .unwrap_or_default();
 
-            if let Some(mapper) = &mut self.mapper {
-                mapper.on_options_parsed(&startup_opts, &explicit);
+            let cmd_line: Vec<String> = payload
+                .get("cmdLine")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tool_tag = payload
+                .get("toolTag")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
 
-                let tool_tag = payload
-                    .get("toolTag")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !tool_tag.is_empty() {
-                    mapper.on_tool_tag(tool_tag);
-                }
-            }
+            self.apply_options_parsed_event(OptionsParsedArgs {
+                cmd_line,
+                explicit_cmd_line: explicit,
+                startup_options: startup_opts,
+                tool_tag,
+            });
         }
         Ok(())
     }
@@ -1344,8 +1375,6 @@ impl EventRouter {
                 .and_then(|a| a.get("exitCode"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
-
-            // Full-mode fields (may be absent in lightweight mode)
             let command_line: Vec<String> = payload
                 .and_then(|a| a.get("commandLine"))
                 .and_then(|v| v.as_array())
@@ -1368,17 +1397,6 @@ impl EventRouter {
                 .and_then(|a| a.get("endTimeNanos"))
                 .and_then(|v| v.as_i64());
 
-            // Check if we should process this action based on mode
-            let should_process = self.state.action_mode().should_create_span(success);
-            if !should_process {
-                trace!(
-                    label,
-                    mnemonic,
-                    "Skipping successful action (lightweight mode)"
-                );
-                return Ok(());
-            }
-
             debug!(
                 label,
                 mnemonic,
@@ -1388,40 +1406,25 @@ impl EventRouter {
                 "Action completed"
             );
 
-            self.state.record_action(
-                label.map(String::from),
-                mnemonic.map(String::from),
-                primary_output.map(String::from),
-                success,
-                exit_code,
-            );
-
             let exit_code_name = payload
                 .and_then(|a| a.get("failureDetail"))
                 .and_then(|f| f.get("message"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
-
-            if let Some(mapper) = &mut self.mapper {
-                mapper.on_action_completed(&ActionCompletedEvent {
-                    label,
-                    mnemonic,
-                    success,
-                    exit_code,
-                    exit_code_name,
-                    primary_output,
-                    configuration,
-                    command_line: &command_line,
-                    stdout_path,
-                    stderr_path,
-                    start_time_nanos,
-                    end_time_nanos,
-                    cached: None,
-                    hostname: None,
-                    cached_remotely: None,
-                    runner: None,
-                });
-            }
+            self.apply_action_completed_event(ActionCompletedArgs {
+                label: label.map(String::from),
+                primary_output: primary_output.map(String::from),
+                configuration: configuration.map(String::from),
+                success,
+                mnemonic: mnemonic.map(String::from),
+                exit_code,
+                exit_code_name: exit_code_name.map(String::from),
+                command_line,
+                stdout_path: stdout_path.map(String::from),
+                stderr_path: stderr_path.map(String::from),
+                start_time_nanos,
+                end_time_nanos,
+            });
         }
         Ok(())
     }
