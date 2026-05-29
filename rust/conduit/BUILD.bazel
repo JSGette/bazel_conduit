@@ -9,16 +9,72 @@ exports_files([
 ])
 
 rust_library(
+    name = "conduit_state",
+    crate_name = "conduit_state",
+    crate_root = "src/state/mod.rs",
+    srcs = [
+        "src/state/action_mode.rs",
+        "src/state/build_state.rs",
+        "src/state/mod.rs",
+    ],
+    deps = [
+        "@crates//:dashmap",
+        "@crates//:serde_json",
+    ],
+)
+
+rust_library(
+    name = "conduit_otel_attributes",
+    crate_name = "conduit_otel_attributes",
+    crate_root = "src/otel/attributes.rs",
+    srcs = ["src/otel/attributes.rs"],
+)
+
+rust_library(
+    name = "conduit_otel_redact",
+    crate_name = "conduit_otel_redact",
+    crate_root = "src/otel/redact.rs",
+    srcs = ["src/otel/redact.rs"],
+)
+
+rust_library(
+    name = "conduit_otel_trace_context",
+    crate_name = "conduit_otel_trace_context",
+    crate_root = "src/otel/trace_context.rs",
+    srcs = ["src/otel/trace_context.rs"],
+    deps = [
+        "@crates//:anyhow",
+        "@crates//:opentelemetry",
+        "@crates//:opentelemetry-otlp",
+        "@crates//:opentelemetry-stdout",
+        "@crates//:opentelemetry_sdk",
+        "@crates//:uuid",
+    ],
+)
+
+rust_library(
     name = "conduit_lib",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = [
+            "src/main.rs",
+            "src/state/**/*.rs",
+            "src/otel/attributes.rs",
+            "src/otel/redact.rs",
+            "src/otel/trace_context.rs",
+        ],
+    ),
     deps = [
         "//proto/build_event_stream:build_event_stream_rust_proto",
         "//proto/google/devtools/build/v1:publish_build_event_rust_proto",
         "//proto/spawn:spawn_rust_proto",
+        ":conduit_otel_attributes",
+        ":conduit_otel_redact",
+        ":conduit_otel_trace_context",
+        ":conduit_state",
         "@crates//:anyhow",
         "@crates//:bytes",
         "@crates//:clap",
-        "@crates//:dashmap",
         "@crates//:opentelemetry",
         "@crates//:opentelemetry-otlp",
         "@crates//:opentelemetry-stdout",

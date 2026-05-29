@@ -7,7 +7,9 @@ pub mod bep;
 pub mod exec_log;
 pub mod grpc;
 pub mod otel;
-pub mod state;
+pub mod state {
+    pub use conduit_state::*;
+}
 
 // Re-export BEP proto types
 pub use build_event_stream_proto::build_event_stream;

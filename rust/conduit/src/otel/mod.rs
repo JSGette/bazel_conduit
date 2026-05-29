@@ -1,9 +1,15 @@
 //! OTel mapper – BEP events → OpenTelemetry spans.
 
-pub mod attributes;
 pub mod mapper;
-pub mod redact;
-pub mod trace_context;
+pub mod attributes {
+    pub use conduit_otel_attributes::*;
+}
+pub mod redact {
+    pub use conduit_otel_redact::*;
+}
+pub mod trace_context {
+    pub use conduit_otel_trace_context::*;
+}
 
 pub use mapper::{ActionCompletedEvent, OtelMapper, TestResultEvent};
 pub use redact::{Redactor, DEFAULT_REDACT_PATTERNS};
