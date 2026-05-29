@@ -3,7 +3,6 @@
 //! Maintains state throughout a build invocation.
 
 use super::ActionProcessingMode;
-use crate::exec_log::ExecLogFormat;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,8 +60,8 @@ pub struct BuildState {
     // Build metrics (stored as JSON for now)
     build_metrics: Option<serde_json::Value>,
 
-    // Execution log path + format (from --execution_log_{binary,compact}_file=).
-    exec_log: Option<(PathBuf, ExecLogFormat)>,
+    // Compact execution log path (from --execution_log_compact_file=).
+    exec_log_path: Option<PathBuf>,
 }
 
 impl BuildState {
@@ -84,7 +83,7 @@ impl BuildState {
             named_sets: DashMap::new(),
             actions: Vec::new(),
             build_metrics: None,
-            exec_log: None,
+            exec_log_path: None,
         }
     }
 
@@ -168,12 +167,12 @@ impl BuildState {
         self.action_mode
     }
 
-    pub fn set_exec_log(&mut self, exec_log: Option<(PathBuf, ExecLogFormat)>) {
-        self.exec_log = exec_log;
+    pub fn set_exec_log_path(&mut self, path: Option<PathBuf>) {
+        self.exec_log_path = path;
     }
 
-    pub fn exec_log(&self) -> Option<&(PathBuf, ExecLogFormat)> {
-        self.exec_log.as_ref()
+    pub fn exec_log_path(&self) -> Option<&PathBuf> {
+        self.exec_log_path.as_ref()
     }
 
     // =========================================================================
@@ -342,7 +341,7 @@ impl BuildState {
         self.named_sets.clear();
         self.actions.clear();
         self.build_metrics = None;
-        self.exec_log = None;
+        self.exec_log_path = None;
     }
 }
 

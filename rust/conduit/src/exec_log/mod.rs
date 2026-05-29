@@ -1,57 +1,35 @@
-//! Execution log parsing and trace enrichment.
+//! Compact execution-log helpers shared by the live tailer and mapper.
 //!
-//! Bazel emits a separate execution log when one of these flags is set:
+//! Conduit only consumes `--execution_log_compact_file` (and the experimental
+//! alias). The compact format stores deduped `ExecLogEntry` records in a zstd
+//! frame; the tailer decodes entries incrementally and emits reconstructed
+//! [`SpawnExec`] messages to the mapper.
 //!
-//! | Flag | Format |
-//! |------|--------|
-//! | `--execution_log_binary_file=<path>` | length-delimited [`SpawnExec`] |
-//! | `--execution_log_compact_file=<path>` (also `--experimental_execution_log_compact_file=`) | zstd-compressed length-delimited [`ExecLogEntry`] with a dedup table |
-//! | `--execution_log_json_file=<path>` | NDJSON of [`SpawnExec`] |
-//!
-//! Conduit consumes the binary and compact formats. JSON is intentionally not
-//! supported -- it is strictly more expensive to produce and parse than the
-//! binary format and Bazel itself nudges users toward compact.
-//!
-//! The log is processed **post-build** in [`crate::otel::OtelMapper::finish`]:
-//! Bazel buffers the file via `BufferedOutputStream(100 KiB)` and the compact
-//! format is a single zstd frame finalized only on close, so a "live"
-//! tail-follow returns nothing useful for typical builds (verified against
-//! `bazel/src/main/java/com/google/devtools/build/lib/exec/CompactSpawnLogContext.java`).
-//! BuildBuddy and EngFlow consume the log post-build for the same reason.
-//!
-//! Both formats are normalized into a stream of [`SpawnExec`] records and run
-//! through the same matching / synthesis / span-emission pipeline below.
-//!
-//! Spawns are linked to their BEP action span when possible. Unmatched spawns
-//! are grouped under synthetic target spans derived from the spawn's
-//! `target_label`, preserving the logical structure rather than dumping
-//! everything under the root invocation.
+//! The mapper matches each spawn to an action span by
+//! `(target_label, mnemonic, primary_output)`, emits a child `spawn {mnemonic}`
+//! span, and synthesizes orphan parent actions for unmatched spawns at
+//! `finish()`.
 
-use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use opentelemetry::trace::{Span, SpanContext, SpanKind, TraceContextExt, Tracer};
+use opentelemetry::trace::{Span, SpanKind, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
-use tracing::{debug, info, warn};
 
 use crate::otel::attributes::*;
-use crate::otel::mapper::{
-    ActionSpanInfo, ActionSpanKey, clamp_time_range, truncate_to_byte_limit,
-};
+use crate::otel::mapper::{ActionSpanInfo, ActionSpanKey, clamp_time_range, truncate_to_byte_limit};
 use crate::otel::Redactor;
 use spawn_proto::tools::protos::SpawnExec;
 
-pub mod binary;
 pub mod compact;
+pub mod tailer;
 
 /// Cap for string attributes built from variable-length lists (listed_outputs,
 /// command args) so a single span can't single-handedly blow the OTLP payload.
 const SPAWN_ATTR_CAP_BYTES: usize = 4096;
 
-/// Default per-message cap on length-delimited entries in the binary and
-/// compact execution log formats. Without this, a malformed (or hostile)
+/// Default per-message cap on length-delimited compact-log entries.
+/// Without this, a malformed (or hostile)
 /// varint length prefix would be fed straight to `Vec::resize`, OOM'ing the
 /// process before any payload is read. 64 MiB is roughly 10x the largest
 /// realistic entry observed in Bazel exec logs (a `SpawnExec` with
@@ -74,7 +52,7 @@ pub const DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024 * 1024
 /// consumed yet); a length exceeding the cap or a varint that fails to
 /// terminate within 10 bytes returns an `InvalidData` error before any
 /// payload allocation is attempted.
-fn read_message_len<R: Read>(r: &mut R, max_bytes: usize) -> std::io::Result<Option<usize>> {
+pub fn read_message_len<R: Read>(r: &mut R, max_bytes: usize) -> std::io::Result<Option<usize>> {
     let Some(len) = read_varint(r)? else {
         return Ok(None);
     };
@@ -114,24 +92,6 @@ fn read_varint<R: Read>(r: &mut R) -> std::io::Result<Option<u64>> {
     }
 }
 
-/// Which on-disk format the execution log uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecLogFormat {
-    /// `--execution_log_binary_file=` (length-delimited [`SpawnExec`]).
-    Binary,
-    /// `--execution_log_compact_file=` (zstd, [`ExecLogEntry`] with dedup table).
-    Compact,
-}
-
-impl ExecLogFormat {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ExecLogFormat::Binary => "binary",
-            ExecLogFormat::Compact => "compact",
-        }
-    }
-}
-
 fn nanos_to_system_time(nanos: i64) -> SystemTime {
     if nanos >= 0 {
         UNIX_EPOCH + Duration::from_nanos(nanos as u64)
@@ -148,7 +108,7 @@ fn normalize_label(s: &str) -> &str {
 
 /// Candidate keys for cache lookup: (target_label, mnemonic, output) for each
 /// output in listed_outputs and actual_outputs.
-fn spawn_exec_candidate_keys(s: &SpawnExec) -> Vec<ActionSpanKey> {
+pub(crate) fn spawn_exec_candidate_keys(s: &SpawnExec) -> Vec<ActionSpanKey> {
     let label = normalize_label(s.target_label.as_str());
     let mnemonic = s.mnemonic.as_str();
     let mut keys = Vec::new();
@@ -168,108 +128,6 @@ fn spawn_exec_candidate_keys(s: &SpawnExec) -> Vec<ActionSpanKey> {
         keys.push(ActionSpanKey::new(Some(label), Some(mnemonic), Some("")));
     }
     keys
-}
-
-/// (normalized_label, mnemonic) -> list of (primary_output, ActionSpanInfo).
-fn build_label_mnemonic_index(
-    cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
-) -> HashMap<(String, String), Vec<(String, ActionSpanInfo)>> {
-    let mut index: HashMap<(String, String), Vec<(String, ActionSpanInfo)>> = HashMap::new();
-    for (k, info) in cache {
-        let key = (k.target_label.clone(), k.mnemonic.clone());
-        index
-            .entry(key)
-            .or_default()
-            .push((k.primary_output.clone(), info.clone()));
-    }
-    index
-}
-
-/// output_path -> ActionSpanInfo, for matching by output alone when labels diverge.
-fn build_output_index(
-    cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
-) -> HashMap<String, ActionSpanInfo> {
-    let mut index = HashMap::new();
-    for (k, info) in cache {
-        if !k.primary_output.is_empty() {
-            index.insert(k.primary_output.clone(), info.clone());
-        }
-    }
-    index
-}
-
-/// Parent directory of a path (everything before the last `/`). Empty if no slash.
-fn output_dir(path: &str) -> &str {
-    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
-}
-
-/// Find a parent ActionSpanInfo for this SpawnExec.
-///
-/// Strategy (in order):
-///   1. Exact ActionSpanKey match (label + mnemonic + output)
-///   2. Output-only match (handles label mismatches across targets)
-///   3. (label, mnemonic) fuzzy output match (exact / ends_with)
-///   4. (label, mnemonic) match by output directory (e.g. TestRunner: test.log vs test.xml)
-fn find_parent_for_spawn(
-    cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
-    label_mnemonic_index: &HashMap<(String, String), Vec<(String, ActionSpanInfo)>>,
-    output_index: &HashMap<String, ActionSpanInfo>,
-    s: &SpawnExec,
-) -> Option<ActionSpanInfo> {
-    for k in spawn_exec_candidate_keys(s) {
-        if let Some(info) = cache.get(&k) {
-            return Some(info.clone());
-        }
-    }
-
-    for out in &s.listed_outputs {
-        if let Some(info) = output_index.get(out.as_str()) {
-            return Some(info.clone());
-        }
-    }
-    for f in &s.actual_outputs {
-        if let Some(info) = output_index.get(f.path.as_str()) {
-            return Some(info.clone());
-        }
-    }
-
-    let label = normalize_label(s.target_label.as_str()).to_string();
-    let mnemonic = s.mnemonic.to_string();
-    let candidates = label_mnemonic_index.get(&(label, mnemonic))?;
-    if candidates.len() == 1 {
-        return Some(candidates[0].1.clone());
-    }
-    let outputs: Vec<&str> = s
-        .listed_outputs
-        .iter()
-        .map(String::as_str)
-        .chain(s.actual_outputs.iter().map(|f| f.path.as_str()))
-        .collect();
-    for out in &outputs {
-        for (cached_out, info) in candidates {
-            if cached_out == *out
-                || cached_out.ends_with(out)
-                || out.ends_with(cached_out.as_str())
-            {
-                return Some(info.clone());
-            }
-        }
-    }
-
-    if !outputs.is_empty() {
-        for out in &outputs {
-            let spawn_dir = output_dir(out);
-            if spawn_dir.is_empty() {
-                continue;
-            }
-            for (cached_out, info) in candidates {
-                if !cached_out.is_empty() && output_dir(cached_out) == spawn_dir {
-                    return Some(info.clone());
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Build a descriptive operation name from the SpawnExec.
@@ -335,198 +193,58 @@ fn duration_to_ms_raw(seconds: i64, nanos: i32) -> i64 {
     seconds * 1000 + i64::from(nanos) / 1_000_000
 }
 
-// ---------------------------------------------------------------------------
-// Enrichment entry point
-// ---------------------------------------------------------------------------
-
-/// Enrich the trace by parsing the exec log and creating spawn child spans.
+/// Backfill curated spawn-derived attributes onto the parent action span.
 ///
-/// Two-pass approach:
-///   1. Parse all entries, attempt to match each to a BEP action span.
-///   2. For unmatched entries, create synthetic target spans grouped by
-///      target_label, then emit spawn spans under them.
-///
-/// `root_start_nanos` / `root_end_nanos` are the root span's time bounds,
-/// used to clamp synthetic target spans so they don't escape the build window.
-#[allow(clippy::too_many_arguments)]
-pub fn enrich_trace(
-    path: &Path,
-    format: ExecLogFormat,
-    action_span_cache: &HashMap<ActionSpanKey, ActionSpanInfo>,
-    tracer: &opentelemetry_sdk::trace::Tracer,
-    root_span_context: Option<&SpanContext>,
-    root_start_nanos: Option<i64>,
-    root_end_nanos: Option<i64>,
-    max_message_bytes: usize,
-    max_decompressed_bytes: usize,
-    redactor: &Redactor,
+/// Only called for the **first** matching [`SpawnExec`] per action — subsequent
+/// spawns (retries, dynamic-exec races) only emit child spans. The set is a
+/// summary mirror of [`build_spawn_attributes`]: the fields engineers reach
+/// for first when triaging a slow action (which runner ran it, was it a
+/// cache hit, where did the time go).
+pub(crate) fn apply_spawn_attrs_to_action(
+    span: &mut opentelemetry_sdk::trace::Span,
+    s: &SpawnExec,
 ) {
-    let spawns = match format {
-        ExecLogFormat::Binary => binary::read_all(path, max_message_bytes),
-        ExecLogFormat::Compact => {
-            compact::read_all(path, max_message_bytes, max_decompressed_bytes)
-        }
-    };
-    let spawns = match spawns {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                path = %path.display(),
-                format = format.as_str(),
-                error = %e,
-                "Failed to parse execution log"
-            );
-            return;
-        }
-    };
-
-    let label_mnemonic_index = build_label_mnemonic_index(action_span_cache);
-    let output_index = build_output_index(action_span_cache);
-
-    let mut matched: Vec<(ActionSpanInfo, SpawnExec)> = Vec::new();
-    let mut unmatched: Vec<SpawnExec> = Vec::new();
-
-    for entry in spawns {
-        let parent = find_parent_for_spawn(
-            action_span_cache,
-            &label_mnemonic_index,
-            &output_index,
-            &entry,
-        );
-        match parent {
-            Some(info) => matched.push((info, entry)),
-            None => unmatched.push(entry),
+    if !s.runner.is_empty() {
+        span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_RUNNER, s.runner.clone()));
+    }
+    span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_CACHE_HIT, s.cache_hit));
+    span.set_attribute(KeyValue::new(
+        BAZEL_ACTION_SPAWN_REMOTE_CACHEABLE,
+        s.remote_cacheable,
+    ));
+    if let Some(d) = s.digest.as_ref() {
+        if !d.hash.is_empty() {
+            span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_DIGEST, d.hash.clone()));
         }
     }
-
-    let total = matched.len() + unmatched.len();
-
-    for (parent_info, entry) in &matched {
-        emit_spawn_span(tracer, parent_info, entry, redactor);
-    }
-
-    let unmatched_count = unmatched.len();
-    if !unmatched.is_empty() {
-        if let Some(root_cx) = root_span_context {
-            emit_unmatched_under_synthetic_targets(
-                tracer,
-                root_cx,
-                unmatched,
-                root_start_nanos,
-                root_end_nanos,
-                redactor,
-            );
-        } else {
-            debug!(
-                count = unmatched_count,
-                "Dropping unmatched exec log entries (no root span)"
-            );
-        }
-    }
-
-    info!(
-        format = format.as_str(),
-        total = total,
-        matched = matched.len(),
-        unmatched = unmatched_count,
-        cache_size = action_span_cache.len(),
-        "Exec log enrichment complete"
-    );
-}
-
-/// Group unmatched spawns by target_label and emit under synthetic target spans.
-/// Timing is clamped to root span bounds to prevent synthetic targets from
-/// escaping the build time window (e.g. cached actions with old timestamps).
-fn emit_unmatched_under_synthetic_targets(
-    tracer: &opentelemetry_sdk::trace::Tracer,
-    root_cx: &SpanContext,
-    entries: Vec<SpawnExec>,
-    root_start_nanos: Option<i64>,
-    root_end_nanos: Option<i64>,
-    redactor: &Redactor,
-) {
-    let mut by_target: HashMap<String, Vec<SpawnExec>> = HashMap::new();
-    for entry in entries {
-        let label = normalize_label(&entry.target_label).to_string();
-        let label = if label.is_empty() {
-            "(unknown)".to_string()
-        } else {
-            label
-        };
-        by_target.entry(label).or_default().push(entry);
-    }
-
-    let root_ctx = Context::new().with_remote_span_context(root_cx.clone());
-
-    for (label, spawns) in &by_target {
-        let (raw_start, raw_end) = compute_time_bounds(spawns);
-        let (clamped_start, clamped_end) =
-            clamp_time_range(raw_start, raw_end, root_start_nanos, root_end_nanos);
-
-        let span_name = format!("target {}", shorten_label(label));
-        let attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.clone()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
-            KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
-        ];
-
-        let mut builder = tracer
-            .span_builder(span_name)
-            .with_kind(SpanKind::Internal)
-            .with_attributes(attrs);
-        if let Some(start) = clamped_start {
-            builder = builder.with_start_time(nanos_to_system_time(start));
-        }
-
-        let mut target_span = tracer.build_with_context(builder, &root_ctx);
-        let target_cx = target_span.span_context().clone();
-        let target_info = ActionSpanInfo {
-            span_context: target_cx,
-            start_nanos: clamped_start,
-            end_nanos: clamped_end,
-        };
-
-        for entry in spawns {
-            emit_spawn_span(tracer, &target_info, entry, redactor);
-        }
-
-        if let Some(end) = clamped_end {
-            target_span.end_with_timestamp(nanos_to_system_time(end));
-        } else {
-            target_span.end();
-        }
-    }
-}
-
-/// Compute (min_start_nanos, max_end_nanos) across a set of SpawnExec entries.
-fn compute_time_bounds(spawns: &[SpawnExec]) -> (Option<i64>, Option<i64>) {
-    let mut min_start: Option<i64> = None;
-    let mut max_end: Option<i64> = None;
-
-    for s in spawns {
-        if let Some(ref m) = s.metrics {
-            if let Some(ref t) = m.start_time {
-                let start = t.seconds * 1_000_000_000 + i64::from(t.nanos);
-                min_start = Some(min_start.map_or(start, |cur: i64| cur.min(start)));
-
-                let total = m
-                    .total_time
-                    .as_ref()
-                    .map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos))
-                    .unwrap_or(0);
-                let end = start + total;
-                max_end = Some(max_end.map_or(end, |cur: i64| cur.max(end)));
+    if let Some(m) = s.metrics.as_ref() {
+        for (key, dur) in [
+            (BAZEL_ACTION_SPAWN_EXEC_WALL_TIME_MS, &m.execution_wall_time),
+            (BAZEL_ACTION_SPAWN_QUEUE_TIME_MS, &m.queue_time),
+            (BAZEL_ACTION_SPAWN_FETCH_TIME_MS, &m.fetch_time),
+            (BAZEL_ACTION_SPAWN_NETWORK_TIME_MS, &m.network_time),
+            (BAZEL_ACTION_SPAWN_UPLOAD_TIME_MS, &m.upload_time),
+            (BAZEL_ACTION_SPAWN_SETUP_TIME_MS, &m.setup_time),
+            (
+                BAZEL_ACTION_SPAWN_PROCESS_OUTPUTS_TIME_MS,
+                &m.process_outputs_time,
+            ),
+        ] {
+            if let Some(d) = dur.as_ref() {
+                let ms = duration_to_ms_raw(d.seconds, d.nanos);
+                if ms > 0 {
+                    span.set_attribute(KeyValue::new(key, ms));
+                }
             }
         }
     }
-    (min_start, max_end)
 }
 
 /// Create a spawn child span under the given parent action.
 /// Spawn timing from the exec log is clamped to the parent action's bounds
 /// so child spans don't start before or end after their parent (required by
 /// Datadog's flame graph, which uses temporal containment for nesting).
-fn emit_spawn_span(
+pub(crate) fn emit_spawn_span(
     tracer: &opentelemetry_sdk::trace::Tracer,
     parent_info: &ActionSpanInfo,
     s: &SpawnExec,

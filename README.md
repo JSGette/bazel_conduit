@@ -75,7 +75,8 @@ bazel.invocation (root)
 | `otel/attributes.rs` | ~100 typed attribute key constants (`bazel.*` namespace) |
 | `otel/redact.rs` | In-process scrubber for `--client_env=NAME=VALUE` style flags |
 | `grpc/server.rs` | BES gRPC server implementation (`PublishBuildEvent` service) |
-| `exec_log.rs` | Parses `--execution_log_binary_file` and creates spawn child spans |
+| `exec_log/tailer.rs` | Live tail-follows `--execution_log_compact_file`, decodes zstd, ships `SpawnExec`s to the mapper via mpsc |
+| `exec_log/compact.rs` | Incremental decoder state (dedup table + `SpawnExec` reconstruction) shared by tailer and tests |
 | `state/build_state.rs` | Build lifecycle tracking, action buffering, named set cache |
 | `state/action_mode.rs` | Lightweight vs full action processing mode detection |
 
@@ -122,7 +123,7 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 | `--log-level <LEVEL>` | Log level (trace/debug/info/warn/error) | `info` |
 | `--no-redact` | Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags | off (scrubbing on) |
 | `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable) | built-in defaults |
-| `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_{binary,compact}_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
+| `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_compact_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
 | `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
 
 ### Secret Redaction
@@ -204,17 +205,62 @@ when traces transit a collector hop.
 | **Lightweight** | Default (no flag) | Only failed actions create spans |
 | **Full** | `--build_event_publish_all_actions` | Every action gets a span with accurate start/end timestamps |
 
-### Execution Log Enrichment
+### Execution Log Enrichment (live tailed)
 
-When Bazel is run with `--execution_log_binary_file=exec.bin`, conduit automatically detects the flag in `OptionsParsed` and after the build finishes, parses the binary exec log to create spawn child spans with:
+When Bazel is run with `--execution_log_compact_file=exec.compact`, conduit
+detects the flag in `OptionsParsed`, opens the file as it's being written,
+and **tail-follows** it in a dedicated blocking thread for the rest of the
+build. Each `SpawnExec` it decodes:
 
-- Full command lines (capped at 4 KB)
-- Runner, cache hit/miss, remotable/cacheable flags
-- Timing breakdown: wall time, queue time, network time, setup, fetch, upload, parse, retry
-- I/O metrics: input bytes/files, output count, memory estimate
-- Digest hash and size
+1. Looks up its parent action span in conduit's cache by
+   `(target_label, mnemonic, primary_output)`.
+2. On the **first** matching spawn for an action, backfills a curated set of
+   attributes onto the action span (`bazel.action.spawn.runner`,
+   `bazel.action.spawn.cache_hit`, the `SpawnMetrics.*_time_ms` breakdown).
+   Subsequent spawns for the same action (retries, dynamic-exec races) only
+   bump `bazel.action.spawn.count` and emit their own child span.
+3. Always emits a `spawn {mnemonic}` child span under the action span with
+   the full `bazel.spawn.*` attribute set (command, digest, cache flags,
+   per-stage timings, I/O metrics).
 
-Spawn matching uses a multi-tier strategy: exact `(label, mnemonic, output)` key → output-only match → `(label, mnemonic)` fuzzy match → output directory match.
+If a spawn arrives **before** its `ActionExecuted` BEP event (the compact
+log flushes every ~128 KiB of uncompressed input, asynchronously to BEP),
+it's buffered briefly and flushed onto the action span the moment it
+arrives. Spawns that never match anything by the end of the build are
+grouped by `(label, mnemonic, primary_output)` and emitted under
+synthesised parent action spans (`bazel.target.synthetic = true`); action
+spans with no matching spawn pick up `bazel.action.spawn.missing = true`.
+
+**Format support.** Only `--execution_log_compact_file` (and its
+`--experimental_execution_log_compact_file` alias) is consumed.
+`--execution_log_binary_file` and `--execution_log_json_file` lack the
+dedup table that makes streaming feasible — conduit logs a warning and
+records a `bazel.exec_log.unsupported_format` event on the root span when
+it sees them.
+
+**Streaming semantics (best-effort live tail).** Bazel writes the compact
+log through `AsynchronousMessageOutputStream → ZstdOutputStream →
+BufferedOutputStream → FileOutputStream`. `ZstdOutputStream` only emits a
+compressed block once it has accumulated 128 KiB of uncompressed proto,
+and Bazel doesn't call `flush()` until `close()` at the end of the build.
+In practice this means the tailer sees a chunk every ~200–600 spawns on
+big builds, and the final <128 KiB of input is only visible after
+`close()`. Conduit waits up to 2 s for that final chunk to drain through
+`finish()` before sealing the trace.
+
+**Why not stream from `bytestream://`?** Bazel uploads the spawn log to the
+remote cache only **after** `close()` (post-build), so the bytestream
+endpoint cannot be used as a live source.
+
+#### Exec log source comparison
+
+| Source | Live streaming? | Dedup table? | Conduit support |
+|---|---|---|---|
+| `--execution_log_compact_file=<path>` | Yes (best-effort, 128 KiB chunks) | Yes | **Live tailed, default path** |
+| `--experimental_execution_log_compact_file=<path>` (alias) | Yes | Yes | Live tailed |
+| `--execution_log_binary_file=<path>` | No (would need full buffer) | No | Warned, ignored |
+| `--execution_log_json_file=<path>` | No | No | Warned, ignored |
+| `bytestream://…/spawn_log` (remote cache) | No (uploaded post-`close()`) | Yes | Not consumed |
 
 ## Integration Tests
 
@@ -232,9 +278,9 @@ This project was developed iteratively over ~13 sessions. The journey from initi
 
 ### Lesson 1: Bazel's BEP Does Not Report Transitive Dependency Actions
 
-BEP only emits `TargetConfigured`/`TargetCompleted`/`ActionCompleted` events for **directly requested targets**. If you build `//my:app` and it depends on `@zlib//:zlib`, the zlib actions won't appear in BEP at all. The execution log (`--execution_log_binary_file`) is the only way to get full coverage of what Bazel actually spawned.
+BEP only emits `TargetConfigured`/`TargetCompleted`/`ActionCompleted` events for **directly requested targets**. If you build `//my:app` and it depends on `@zlib//:zlib`, the zlib actions won't appear in BEP at all. The compact execution log (`--execution_log_compact_file`) is the only way to get full coverage of what Bazel actually spawned.
 
-This is why conduit has the exec log enrichment pass: it catches all the "invisible" work and groups unmatched spawns under synthetic target spans.
+This is why conduit live-tails the compact log: spawns that don't match any BEP-visible action are buffered and emitted at `finish()` under synthesised parent action spans tagged `bazel.target.synthetic = true`.
 
 ### Lesson 2: Datadog and Jaeger Interpret Traces Differently
 
@@ -268,7 +314,11 @@ In gRPC serve mode, `router.finish()` emits OTel log records to the batch proces
 
 ### Lesson 9: Not All BEP Actions Appear in the Execution Log
 
-The binary execution log only records **spawned processes** (actual `execve` calls). Internal Bazel actions like `FileWrite`, `TemplateExpand`, and `SymlinkTree` are not spawns and won't appear. This means some BEP actions will never have matching exec log entries — by design.
+The execution log only records **spawned processes** (actual `execve` calls). Internal Bazel actions like `FileWrite`, `TemplateExpand`, and `SymlinkTree` are not spawns and won't appear. This means some BEP actions will never have matching exec log entries — by design. Action spans for those carry `bazel.action.spawn.missing = true` at the end of the build.
+
+### Lesson 11: ZstdOutputStream Buffers 128 KiB Before Flushing
+
+Bazel's compact exec log goes through `ZstdOutputStream` (zstd-jni) which buffers **128 KiB of uncompressed input** before emitting a compressed block, and Bazel never calls `flush()`. The only way to live-tail is to keep the reader blocked on EOF rather than propagating `Ok(0)` to the zstd decoder, and accept that the trailing &lt;128 KiB of input is only visible after `close()`. Conduit's tailer (`exec_log/tailer.rs`) sleeps 100 ms on EOF and resumes when more bytes appear; `finish()` budgets up to 2 s for the post-`close()` final chunk.
 
 ### Lesson 10: BES Progress Event `children` Are Misleading
 
@@ -282,7 +332,7 @@ The `children` field on Progress events is for BEP DAG ordering (announcing whic
 - **Protobuf compilation**: BEP proto has deep import chains (`failure_details.proto` → `descriptor.proto`). Proto targets use `rules_rust_prost` with `rules_rs` for crate resolution.
 
 ### Runtime
-- **Co-location requirement**: Exec log enrichment requires conduit to run on the same machine as Bazel (it reads a local file path from `OptionsParsed`).
+- **Co-location requirement**: Exec log enrichment requires conduit to run on the same machine as Bazel (it tail-follows the local file path from `OptionsParsed`; the `bytestream://` upload that goes to the remote cache only happens after `close()` and isn't a live source).
 - **Non-standard OTLP ports**: The Datadog Agent often uses `14317`/`14318` instead of the OTel-default `4317`/`4318`. Configure `--otlp-endpoint` accordingly.
 - **API key vs environment variable**: `dd-auth` sets `DD_API_KEY` as an env var, but the Datadog Agent reads its `api_key` from its config file at startup. These are separate mechanisms.
 
@@ -309,7 +359,7 @@ All OTel span attributes follow the `bazel.<component>.<field>` naming conventio
 3. **No span links / DAG representation**: BEP's DAG structure (secondary parents) is not represented as OTel span links. All relationships are parent-child.
 4. **No sampling policies**: All qualifying events produce spans. There is no configurable top-N-slowest or probabilistic sampling.
 5. **Single invocation at a time**: The gRPC server processes one build stream at a time (sequential invocations via `Arc<Mutex<EventRouter>>`).
-6. **Exec log is post-hoc**: Spawn enrichment happens after `BuildFinished`, not during streaming. This means spawn data isn't available until the build completes.
+6. **Exec log streaming is best-effort, not "live per spawn"**: Bazel flushes the compact log every ~128 KiB of uncompressed input (200–600 spawns on big builds), and the final &lt;128 KiB is only visible after `close()` at `BuildCompleteEvent`. Spawn enrichment lands on action spans in those chunk-sized bursts, with a final post-`close()` drain at `finish()`.
 7. **`TestProgress` and `ExecRequest` are no-ops**: These event types are received but not mapped to any OTel construct.
 
 ## Directory Structure
@@ -334,7 +384,7 @@ bazel_conduit/
 │   │   ├── bep/                  # BEP decoder + event router
 │   │   ├── otel/                 # OTel mapper, trace context, attributes
 │   │   ├── grpc/                 # BES gRPC server
-│   │   ├── exec_log.rs           # Execution log parser + enrichment
+│   │   ├── exec_log/             # Compact exec log live-tail + enrichment
 │   │   └── state/                # Build state tracking
 │   └── tests/                    # Unit tests (decoder, action_mode, router)
 ├── integration/                  # Integration tests + full scenario script

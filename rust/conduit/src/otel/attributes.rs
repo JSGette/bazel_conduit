@@ -57,6 +57,31 @@ pub const BAZEL_ACTION_LABEL: &str = "bazel.action.label";
 pub const BAZEL_ACTION_LABEL_SHORT: &str = "bazel.action.label_short";
 pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
 
+// Action span: spawn-derived backfill from compact exec log.
+// The first SpawnExec for an action backfills `runner` / `cache_hit` /
+// SpawnMetrics onto the parent action span, mirroring the per-spawn
+// `bazel.spawn.*` keys. Multi-spawn actions (retries, dynamic-exec races)
+// only bump `bazel.action.spawn.count`; their attrs land on the per-spawn
+// child spans. `bazel.action.spawn.missing` is set when no SpawnExec
+// matched by the time `finish()` ends the action — useful signal for
+// action-cache-only hits, --build_event_publish_all_actions=false orphans
+// (when matched, the synthesised action carries the attrs instead), or
+// genuine plumbing bugs.
+pub const BAZEL_ACTION_SPAWN_COUNT: &str = "bazel.action.spawn.count";
+pub const BAZEL_ACTION_SPAWN_MISSING: &str = "bazel.action.spawn.missing";
+pub const BAZEL_ACTION_SPAWN_RUNNER: &str = "bazel.action.spawn.runner";
+pub const BAZEL_ACTION_SPAWN_CACHE_HIT: &str = "bazel.action.spawn.cache_hit";
+pub const BAZEL_ACTION_SPAWN_REMOTE_CACHEABLE: &str = "bazel.action.spawn.remote_cacheable";
+pub const BAZEL_ACTION_SPAWN_DIGEST: &str = "bazel.action.spawn.digest";
+pub const BAZEL_ACTION_SPAWN_EXEC_WALL_TIME_MS: &str = "bazel.action.spawn.execution_wall_time_ms";
+pub const BAZEL_ACTION_SPAWN_QUEUE_TIME_MS: &str = "bazel.action.spawn.queue_time_ms";
+pub const BAZEL_ACTION_SPAWN_FETCH_TIME_MS: &str = "bazel.action.spawn.fetch_time_ms";
+pub const BAZEL_ACTION_SPAWN_NETWORK_TIME_MS: &str = "bazel.action.spawn.network_time_ms";
+pub const BAZEL_ACTION_SPAWN_UPLOAD_TIME_MS: &str = "bazel.action.spawn.upload_time_ms";
+pub const BAZEL_ACTION_SPAWN_SETUP_TIME_MS: &str = "bazel.action.spawn.setup_time_ms";
+pub const BAZEL_ACTION_SPAWN_PROCESS_OUTPUTS_TIME_MS: &str =
+    "bazel.action.spawn.process_outputs_time_ms";
+
 // Spawn span (exec log enrichment)
 pub const BAZEL_SPAWN_RUNNER: &str = "bazel.spawn.runner";
 pub const BAZEL_SPAWN_CACHE_HIT: &str = "bazel.spawn.cache_hit";
@@ -94,6 +119,14 @@ pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
 pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";
 pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
 pub const BAZEL_SERVER_PID: &str = "bazel.server_pid";
+
+// VCS / repository identity. Set once on the root span from the Bazel
+// workspace name — read out of `module(name = ...)` in MODULE.bazel,
+// `workspace(name = ...)` in WORKSPACE(.bazel), or the basename of
+// `workspace_directory` as a fallback. Uses the OTel VCS semantic
+// convention name so trace UIs (Datadog, Jaeger) that already know the
+// `vcs.*` registry pick it up without conduit-specific filters.
+pub const VCS_REPOSITORY_NAME: &str = "vcs.repository.name";
 
 // Fetch span
 pub const BAZEL_FETCH_URL: &str = "bazel.fetch.url";

@@ -18,7 +18,6 @@ use super::decoder::BepJsonEvent;
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
-use crate::exec_log::ExecLogFormat;
 use crate::otel::{ActionCompletedEvent, OtelMapper, Redactor, TestResultEvent};
 use crate::state::{ActionProcessingMode, BuildState};
 use std::path::PathBuf;
@@ -30,40 +29,52 @@ const EXEC_LOG_COMPACT_PREFIX: &str = "--execution_log_compact_file=";
 const EXEC_LOG_COMPACT_EXPERIMENTAL_PREFIX: &str = "--experimental_execution_log_compact_file=";
 const EXEC_LOG_JSON_PREFIX: &str = "--execution_log_json_file=";
 
-/// Detect the execution log path and format from a flat options list.
+/// Detect the **compact** execution log path from a flat options list.
 ///
-/// Conduit recognises both `--execution_log_binary_file=` and the (compact,
-/// experimental_execution_log_compact) pair; JSON is reported as unsupported
-/// and not consumed. Bazel itself rejects multiple `--execution_log_*_file=`
-/// flags being set simultaneously, so we don't need a precedence rule here.
-fn extract_exec_log(options: &[&str]) -> Option<(PathBuf, ExecLogFormat)> {
+/// Only `--execution_log_compact_file=` and its `--experimental_*` alias are
+/// supported: live tailing needs the dedup-table format. The binary and JSON
+/// formats produce a warning on the root span (via the mapper) but no log is
+/// consumed; users who hit this should switch to the compact flag.
+fn extract_exec_log(options: &[&str], mapper: Option<&mut OtelMapper>) -> Option<PathBuf> {
+    let mut compact: Option<PathBuf> = None;
+    let mut unsupported: Vec<(&'static str, String)> = Vec::new();
     for opt in options {
-        if let Some(p) = opt.strip_prefix(EXEC_LOG_COMPACT_PREFIX) {
-            if !p.is_empty() {
-                return Some((PathBuf::from(p), ExecLogFormat::Compact));
+        if let Some(p) = opt
+            .strip_prefix(EXEC_LOG_COMPACT_PREFIX)
+            .or_else(|| opt.strip_prefix(EXEC_LOG_COMPACT_EXPERIMENTAL_PREFIX))
+        {
+            if !p.is_empty() && compact.is_none() {
+                compact = Some(PathBuf::from(p));
             }
-        }
-        if let Some(p) = opt.strip_prefix(EXEC_LOG_COMPACT_EXPERIMENTAL_PREFIX) {
+        } else if let Some(p) = opt.strip_prefix(EXEC_LOG_BINARY_PREFIX) {
             if !p.is_empty() {
-                return Some((PathBuf::from(p), ExecLogFormat::Compact));
+                unsupported.push(("--execution_log_binary_file", p.to_string()));
             }
-        }
-        if let Some(p) = opt.strip_prefix(EXEC_LOG_BINARY_PREFIX) {
+        } else if let Some(p) = opt.strip_prefix(EXEC_LOG_JSON_PREFIX) {
             if !p.is_empty() {
-                return Some((PathBuf::from(p), ExecLogFormat::Binary));
-            }
-        }
-        if let Some(p) = opt.strip_prefix(EXEC_LOG_JSON_PREFIX) {
-            if !p.is_empty() {
-                warn!(
-                    path = p,
-                    "--execution_log_json_file is not consumed by conduit; \
-                     use --execution_log_compact_file or --execution_log_binary_file instead"
-                );
+                unsupported.push(("--execution_log_json_file", p.to_string()));
             }
         }
     }
-    None
+
+    if !unsupported.is_empty() {
+        for (flag, path) in &unsupported {
+            warn!(
+                flag = %flag,
+                path = %path,
+                "Unsupported execution log format; only --execution_log_compact_file enables conduit's spawn enrichment",
+            );
+        }
+        if let Some(mapper) = mapper {
+            let flags = unsupported
+                .iter()
+                .map(|(f, _)| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            mapper.on_unsupported_exec_log_flag(&flags);
+        }
+    }
+    compact
 }
 
 /// Errors that can occur during event routing
@@ -190,6 +201,20 @@ impl EventRouter {
 }
 
 impl EventRouter {
+    fn retry_pending_exec_log_on_started(&mut self) {
+        let Some(path) = self.state.exec_log_path().cloned() else {
+            return;
+        };
+        // Absolute paths are already actionable from OptionsParsed; retry only
+        // relative paths that may have been skipped while workspace was unknown.
+        if !path.is_relative() {
+            return;
+        }
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_exec_log_detected(path);
+        }
+    }
+
     /// Route a BEP JSON event to the appropriate handler
     pub fn route(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
         let event_type = event.event_type().ok_or(RouterError::MissingEventId)?;
@@ -276,9 +301,17 @@ impl EventRouter {
 
         match id {
             BepId::Started(_) => {
+                let carry_exec_log_path = if self.state.invocation_id().is_none() {
+                    self.state.exec_log_path().cloned()
+                } else {
+                    None
+                };
                 self.state.reset();
                 if let Some(mapper) = &mut self.mapper {
                     mapper.reset();
+                }
+                if let Some(path) = carry_exec_log_path {
+                    self.state.set_exec_log_path(Some(path));
                 }
                 if let Some(BepPayload::Started(s)) = &event.payload {
                     let start_time_nanos = s
@@ -315,6 +348,7 @@ impl EventRouter {
                             Some(s.user.as_str()),
                         );
                     }
+                    self.retry_pending_exec_log_on_started();
                 }
                 Ok(())
             }
@@ -347,10 +381,10 @@ impl EventRouter {
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_action_mode(self.state.action_mode());
                     }
-                    if let Some((path, format)) = extract_exec_log(&all_options) {
-                        self.state.set_exec_log(Some((path.clone(), format)));
+                    if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
+                        self.state.set_exec_log_path(Some(path.clone()));
                         if let Some(mapper) = &mut self.mapper {
-                            mapper.on_exec_log_detected(path, format);
+                            mapper.on_exec_log_detected(path);
                         }
                     }
                     self.state.set_startup_options(o.startup_options.clone());
@@ -774,9 +808,17 @@ impl EventRouter {
     // =========================================================================
 
     fn handle_started(&mut self, event: &BepJsonEvent) -> Result<(), RouterError> {
+        let carry_exec_log_path = if self.state.invocation_id().is_none() {
+            self.state.exec_log_path().cloned()
+        } else {
+            None
+        };
         self.state.reset();
         if let Some(mapper) = &mut self.mapper {
             mapper.reset();
+        }
+        if let Some(path) = carry_exec_log_path {
+            self.state.set_exec_log_path(Some(path));
         }
 
         let payload = event.get_payload("started");
@@ -836,6 +878,7 @@ impl EventRouter {
                     user,
                 );
             }
+            self.retry_pending_exec_log_on_started();
         }
 
         Ok(())
@@ -889,10 +932,10 @@ impl EventRouter {
                 mapper.on_action_mode(self.state.action_mode());
             }
 
-            if let Some((path, format)) = extract_exec_log(&all_options) {
-                self.state.set_exec_log(Some((path.clone(), format)));
+            if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
+                self.state.set_exec_log_path(Some(path.clone()));
                 if let Some(mapper) = &mut self.mapper {
-                    mapper.on_exec_log_detected(path, format);
+                    mapper.on_exec_log_detected(path);
                 }
             }
 

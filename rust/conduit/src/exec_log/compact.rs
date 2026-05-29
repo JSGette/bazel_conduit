@@ -94,13 +94,13 @@ pub fn read_all(
 /// `max_bytes + 1` so that a stream of exactly `max_bytes` reads cleanly
 /// (final inner `Ok(0)` propagates as a clean EOF); the +1 byte is only
 /// ever consumed when the underlying stream is actually larger.
-struct LimitedReader<R: Read> {
+pub(super) struct LimitedReader<R: Read> {
     inner: R,
     remaining: u64,
 }
 
 impl<R: Read> LimitedReader<R> {
-    fn new(inner: R, max_bytes: usize) -> Self {
+    pub(super) fn new(inner: R, max_bytes: usize) -> Self {
         Self {
             inner,
             remaining: (max_bytes as u64).saturating_add(1),
@@ -123,16 +123,26 @@ impl<R: Read> Read for LimitedReader<R> {
     }
 }
 
+/// Incremental decoder state. Owns the dedup table built up as
+/// [`ExecLogEntry::File`] / [`ExecLogEntry::Directory`] / ... entries flow in,
+/// and turns each [`ExecLogEntry::Spawn`] into a [`SpawnExec`] using the
+/// entries it has seen so far. Drive it with [`Self::ingest`] from any source
+/// that produces `ExecLogEntry`s in order — the post-build batch reader
+/// ([`read_all`]) and the live tail-follow ([`crate::exec_log::tailer`]) both
+/// share this code path.
 #[derive(Default)]
-struct State {
-    /// Entry ID is non-zero and unique-per-log but not necessarily
-    /// contiguous, so we use a HashMap rather than a Vec.
+pub struct State {
     table: HashMap<u32, Stored>,
     hash_function_name: String,
 }
 
 impl State {
-    fn ingest(&mut self, entry: ExecLogEntry) -> std::io::Result<Option<SpawnExec>> {
+    /// Consume one [`ExecLogEntry`]. Returns `Ok(Some(SpawnExec))` when the
+    /// entry was a [`exec_log_entry::Type::Spawn`] that we successfully
+    /// resolved against the dedup table; otherwise `Ok(None)`. An error here
+    /// means the log is corrupt (e.g. a spawn references an unknown output id)
+    /// — callers should warn and abort, not skip the entry.
+    pub fn ingest(&mut self, entry: ExecLogEntry) -> std::io::Result<Option<SpawnExec>> {
         let id = entry.id;
         let Some(payload) = entry.r#type else {
             return Ok(None);

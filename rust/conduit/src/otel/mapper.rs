@@ -30,13 +30,16 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};
 use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
+use spawn_proto::tools::protos::SpawnExec;
 use tracing::{debug, info, warn};
+
+use crate::exec_log::tailer::TailerHandle;
 
 use super::attributes::*;
 use super::redact::Redactor;
@@ -168,6 +171,64 @@ pub struct ActionSpanInfo {
     pub span_context: SpanContext,
     pub start_nanos: Option<i64>,
     pub end_nanos: Option<i64>,
+}
+
+/// Live compact-exec-log tailer state.
+///
+/// Owned by [`OtelMapper`] while a compact log is being tailed. Dropping it
+/// implicitly signals the tailer to shut down (via the `mpsc::Sender` drop),
+/// but `finish()` does an orderly shutdown with a 2 s drain window first so
+/// the post-`close()` final chunk + frame terminator make it through.
+pub(crate) struct ExecLogState {
+    /// Filesystem path of the compact log, retained for diagnostic logging
+    /// in case the tailer aborts mid-build and we need to point a human at
+    /// the file.
+    #[allow(dead_code)]
+    pub(crate) path: PathBuf,
+    /// Handle to the blocking-thread tailer task plus its mpsc receiver.
+    pub(crate) handle: TailerHandle,
+}
+
+/// Action span kept alive (`span: Some`) when the compact exec log is enabled
+/// so that arriving [`SpawnExec`] entries can backfill spawn-derived attrs
+/// onto it before it ends. When the compact log is disabled, the span is
+/// ended in `on_action_completed` and `span` is `None`; the cache entry then
+/// only carries the `SpanContext` + bounds that the (soon-to-be-deleted)
+/// post-build [`crate::exec_log::enrich_trace`] still consumes.
+///
+/// End triggers when `span` is `Some`:
+///   1. `TargetCompleted` for `target_label` — deterministic boundary, Bazel
+///      guarantees no more `ActionExecuted` events for that target after.
+///   2. `OtelMapper::finish` fallback — drains the post-`close()` tail of the
+///      compact log first, then force-ends everything still open.
+pub struct OpenAction {
+    /// SpanContext + timing bounds; cloned cheaply for child-span parent
+    /// linking. Stays valid even after `span` has been ended.
+    pub info: ActionSpanInfo,
+    /// Live span handle, `None` once ended. The OTel SDK seals attribute
+    /// mutations on end so we drop the handle to make that misuse obvious
+    /// (subsequent `set_attribute` calls would silently no-op).
+    pub span: Option<opentelemetry_sdk::trace::Span>,
+    /// Parent target label, used by `end_open_actions_for_target` to flush
+    /// every still-open action belonging to a freshly-completed target.
+    pub target_label: String,
+    /// Count of [`SpawnExec`] entries seen for this action so far. The first
+    /// spawn backfills curated attrs onto the action span; subsequent ones
+    /// (retries, dynamic-exec races) only emit child spawn spans and bump
+    /// this counter. Surfaced as `bazel.action.spawn.count` at end time.
+    pub spawn_count: u32,
+}
+
+/// Extract (start_nanos, end_nanos) from a `SpawnExec` via its
+/// `SpawnMetrics.start_time` + `total_time`. Returns `None` when timing
+/// data is absent.
+fn spawn_time_range(s: &SpawnExec) -> Option<(i64, i64)> {
+    let m = s.metrics.as_ref()?;
+    let start = m.start_time.as_ref()?;
+    let total = m.total_time.as_ref()?;
+    let start_nanos = start.seconds * 1_000_000_000 + i64::from(start.nanos);
+    let total_nanos = total.seconds * 1_000_000_000 + i64::from(total.nanos);
+    Some((start_nanos, start_nanos + total_nanos))
 }
 
 /// Clamp a (start, end) time range to fit within (bound_start, bound_end).
@@ -427,18 +488,50 @@ pub struct OtelMapper {
     /// Replayed once `on_build_started` fires (BES can send test events before Started).
     pending_test_results: Vec<BufferedTestResult>,
 
-    /// Execution log path + format detected from BEP `OptionsParsed`.
-    /// Set by [`Self::on_exec_log_detected`]; consumed in [`Self::finish`]
-    /// post-build to attach spawn child spans to their action parents.
-    exec_log: Option<(PathBuf, crate::exec_log::ExecLogFormat)>,
+    /// True once a compact-log tailer has been wired in (whether via
+    /// [`Self::on_exec_log_detected`] in prod or a test helper). Drives
+    /// the deferred-end gate in [`Self::on_action_completed`]: when set,
+    /// action spans stay open until `TargetCompleted` / `finish()` so
+    /// arriving spawns can backfill attrs onto them; when clear, action
+    /// spans end immediately as in the pre-streaming codepath.
+    compact_streaming_active: bool,
+
+    /// Live compact-exec-log tailer (spawned on `on_exec_log_detected`).
+    /// `None` if the compact log isn't enabled — in that case action spans
+    /// end immediately in `on_action_completed` and no spawn child spans
+    /// or attribute backfill happens.
+    exec_log_state: Option<ExecLogState>,
+
+    /// Relative compact-log path observed before `workspace_directory` was
+    /// known. Retried from `on_build_started_extended`.
+    pending_exec_log_path: Option<PathBuf>,
 
     /// Workspace directory from BuildStarted (for resolving relative exec log path).
     workspace_directory: Option<PathBuf>,
 
-    /// Cached action span info for exec log enrichment.
-    /// Key: (target_label, mnemonic, primary_output). Used in finish() to attach
-    /// spawn child spans to the correct action span, with timing for clamping.
-    action_span_cache: HashMap<ActionSpanKey, ActionSpanInfo>,
+    /// Action spans, keyed by (target_label, mnemonic, primary_output). When
+    /// the compact exec log is enabled, entries hold a live span that stays
+    /// open until `TargetCompleted` or `finish()` forces it to end, allowing
+    /// arriving `SpawnExec` entries to backfill spawn-derived attrs onto it.
+    /// When the compact log is disabled, the span is ended immediately in
+    /// `on_action_completed` and the cache entry is informational only.
+    action_span_cache: HashMap<ActionSpanKey, OpenAction>,
+
+    /// SpawnExecs that arrived before their parent action reached
+    /// [`Self::action_span_cache`], indexed by their deterministic
+    /// `(target_label, mnemonic, primary_output)` key.
+    ///
+    /// zstd-jni flushes ~128 KiB chunks asynchronously to BEP, so a chunk can
+    /// deliver spawns whose `ActionExecuted` is still in flight on the stream.
+    /// `on_action_completed` flushes only its own key; remaining entries are
+    /// synthesised at [`Self::finish`].
+    pending_spawns: HashMap<ActionSpanKey, Vec<SpawnExec>>,
+
+    /// Count of SpawnExec entries received from the tailer. Surfaced as
+    /// `bazel.exec_log.spawns_received` on the `tailer_finished` root-span
+    /// event so a trace consumer can see whether the tailer produced data
+    /// without grep'ing conduit's logs.
+    compact_spawns_received: u64,
 
     /// Scrubs sensitive values out of command-line attributes before they
     /// hit the exporter. See [`crate::otel::redact`].
@@ -486,8 +579,12 @@ impl OtelMapper {
             named_set_cache: HashMap::new(),
             pending_fetches: Vec::new(),
             pending_test_results: Vec::new(),
-            exec_log: None,
+            compact_streaming_active: false,
+            exec_log_state: None,
+            pending_exec_log_path: None,
             action_span_cache: HashMap::new(),
+            pending_spawns: HashMap::new(),
+            compact_spawns_received: 0,
             workspace_directory: None,
             redactor: Redactor::default_enabled(),
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
@@ -564,8 +661,30 @@ impl OtelMapper {
         }
     }
 
-    /// Build a child span with the given attributes, set its status, and end it.
-    /// Returns the finished span's `SpanContext` for cache/linking purposes.
+    /// Build a child span with the given attributes; does **not** end it.
+    /// Callers either end it immediately (today's default for everything
+    /// except deferred action spans) or hold the handle open and end it later.
+    fn build_child_span(
+        &self,
+        parent: &Context,
+        name: String,
+        kind: SpanKind,
+        attrs: Vec<KeyValue>,
+        start_time: Option<i64>,
+    ) -> opentelemetry_sdk::trace::Span {
+        let mut builder = self
+            .tracer
+            .span_builder(name)
+            .with_kind(kind)
+            .with_attributes(attrs);
+        if let Some(nanos) = start_time {
+            builder = builder.with_start_time(nanos_to_system_time(nanos));
+        }
+        self.tracer.build_with_context(builder, parent)
+    }
+
+    /// Build a child span, set its status, and end it. Returns the finished
+    /// span's `SpanContext` for cache/linking purposes.
     fn build_and_end_child_span(
         &self,
         parent: &Context,
@@ -576,15 +695,7 @@ impl OtelMapper {
         start_time: Option<i64>,
         end_time: Option<i64>,
     ) -> SpanContext {
-        let mut builder = self
-            .tracer
-            .span_builder(name)
-            .with_kind(kind)
-            .with_attributes(attrs);
-        if let Some(nanos) = start_time {
-            builder = builder.with_start_time(nanos_to_system_time(nanos));
-        }
-        let mut span = self.tracer.build_with_context(builder, parent);
+        let mut span = self.build_child_span(parent, name, kind, attrs, start_time);
         let span_cx = span.span_context().clone();
         span.set_status(status);
         if let Some(nanos) = end_time {
@@ -724,8 +835,16 @@ impl OtelMapper {
         if let Some(v) = workspace_dir {
             self.set_root_attr(KeyValue::new(BAZEL_WORKSPACE_DIR, v.to_string()));
             if !v.is_empty() {
-                self.workspace_directory = Some(PathBuf::from(v));
+                let path = PathBuf::from(v);
+                if let Some(name) = detect_workspace_name(&path) {
+                    self.set_root_attr(KeyValue::new(VCS_REPOSITORY_NAME, name));
+                }
+                self.workspace_directory = Some(path);
             }
+        }
+        // Retry a previously skipped relative exec-log path once workspace is known.
+        if let Some(path) = self.pending_exec_log_path.take() {
+            self.on_exec_log_detected(path);
         }
         if let Some(v) = working_dir {
             self.set_root_attr(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
@@ -772,14 +891,74 @@ impl OtelMapper {
         self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
     }
 
-    /// Execution log path + format detected (binary or compact). Stored for
-    /// use in [`Self::finish`] to enrich the trace with spawn data.
-    pub fn on_exec_log_detected(
-        &mut self,
-        path: PathBuf,
-        format: crate::exec_log::ExecLogFormat,
-    ) {
-        self.exec_log = Some((path, format));
+    /// Compact-exec-log path detected (typically from BEP `OptionsParsed`).
+    /// Spawns the tail-follow worker; arriving [`SpawnExec`] entries are
+    /// drained at every BEP-event boundary via [`Self::pump_compact_spawns`].
+    ///
+    /// Bazel resolves `--execution_log_compact_file=<rel>` against the client
+    /// cwd (i.e. the workspace), not against conduit's cwd. We replicate that
+    /// here so the tailer opens the same file Bazel writes.
+    pub fn on_exec_log_detected(&mut self, path: PathBuf) {
+        if self.compact_streaming_active {
+            warn!("on_exec_log_detected called twice; ignoring second");
+            return;
+        }
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            match self.workspace_directory.as_ref() {
+                Some(ws) => ws.join(&path),
+                None => {
+                    self.pending_exec_log_path = Some(path.clone());
+                    warn!(
+                        path = %path.display(),
+                        "Compact exec log path is relative but workspace_directory is not set yet; skipping tailer"
+                    );
+                    self.add_root_event(
+                        "bazel.exec_log.tailer_skipped",
+                        vec![
+                            KeyValue::new("path", path.display().to_string()),
+                            KeyValue::new("reason", "workspace_directory_not_set"),
+                        ],
+                    );
+                    return;
+                }
+            }
+        };
+        self.start_compact_tailer(resolved);
+    }
+
+    fn start_compact_tailer(&mut self, path: PathBuf) {
+        let handle = crate::exec_log::tailer::spawn(
+            path.clone(),
+            self.exec_log_max_message_bytes,
+            self.exec_log_max_decompressed_bytes,
+        );
+        info!(path = %path.display(), "Started compact exec log tailer");
+        self.add_root_event(
+            "bazel.exec_log.tailer_started",
+            vec![KeyValue::new("path", path.display().to_string())],
+        );
+        self.exec_log_state = Some(ExecLogState { path, handle });
+        self.compact_streaming_active = true;
+    }
+
+    /// `--execution_log_binary_file` / `--execution_log_json_file` observed
+    /// in BEP `OptionsParsed`. Neither format is supported by conduit's
+    /// live streaming pipeline (no dedup table, no zstd framing); record a
+    /// root-span event so users can spot the misconfiguration in their
+    /// trace UI without grepping the conduit log.
+    pub fn on_unsupported_exec_log_flag(&mut self, flags: &str) {
+        self.add_root_event(
+            "bazel.exec_log.unsupported_format",
+            vec![
+                KeyValue::new("flags", flags.to_string()),
+                KeyValue::new(
+                    "supported",
+                    "--execution_log_compact_file".to_string(),
+                ),
+            ],
+        );
     }
 
     /// WorkspaceStatus → add workspace attributes to root span.
@@ -1086,6 +1265,11 @@ impl OtelMapper {
         tags: &[String],
         event_time_nanos: Option<i64>,
     ) {
+        // Drain any spawns that flushed between the last ActionExecuted and
+        // this TargetCompleted; they need to land on the action span before
+        // `end_open_actions_for_target` seals it.
+        self.pump_compact_spawns();
+
         // Clamp end-of-target to the invocation window. Cached targets re-emit
         // their original action timestamps, so without this a span ending at
         // event_time will run from the cached `start` (weeks ago) to today.
@@ -1129,6 +1313,12 @@ impl OtelMapper {
             }
         };
         cx.span().set_status(status);
+
+        // End any action spans we held open for this target. Deterministic
+        // boundary — Bazel guarantees no further ActionExecuted events for
+        // this target. Anything still open without a matching SpawnExec at
+        // this point picks up `bazel.action.spawn.missing=true`.
+        self.end_open_actions_for_target(label, effective_end);
 
         Self::set_output_attributes_and_end_target_span(
             &self.named_set_cache,
@@ -1294,7 +1484,9 @@ impl OtelMapper {
     // Action events
     // =====================================================================
 
-    /// ActionCompleted → create + immediately end `action {mnemonic} {label}`.
+    /// ActionCompleted → create `action {mnemonic} {label}` span. With the
+    /// compact exec log enabled the span is kept open so arriving spawns can
+    /// backfill attrs onto it; without it the span ends here as today.
     ///
     /// In **lightweight** mode only failed actions reach this method.
     /// In **full** mode every action (success or failure) is mapped.
@@ -1303,6 +1495,10 @@ impl OtelMapper {
     /// `ActionExecuted.start_time` / `end_time` proto fields) they are used
     /// for accurate span timing.
     pub fn on_action_completed(&mut self, ev: &ActionCompletedEvent<'_>) {
+        // Drain whatever the tailer has produced so far. Cheap; runs the
+        // backfill against actions that already landed in the cache.
+        self.pump_compact_spawns();
+
         if let Some(l) = ev.label {
             self.ensure_target_span(l, ev.start_time_nanos);
         }
@@ -1401,24 +1597,201 @@ impl OtelMapper {
             self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
         );
 
-        let span_cx = self.build_and_end_child_span(
-            &parent,
-            span_name,
-            SpanKind::Internal,
-            attrs,
-            status,
-            clamped_start,
-            clamped_end,
-        );
-
         let key = ActionSpanKey::new(ev.label, ev.mnemonic, ev.primary_output);
-        self.action_span_cache.insert(key, ActionSpanInfo {
-            span_context: span_cx,
+        let target_label = ev.label.map(str::to_string).unwrap_or_default();
+        let defer_end = self.compact_streaming_active;
+
+        let mut span =
+            self.build_child_span(&parent, span_name, SpanKind::Internal, attrs, clamped_start);
+        span.set_status(status);
+        let span_context = span.span_context().clone();
+
+        let info = ActionSpanInfo {
+            span_context,
             start_nanos: clamped_start,
             end_nanos: clamped_end,
-        });
+        };
 
-        debug!("Created action span (success={}) for {:?}", ev.success, ev.label);
+        let open = if defer_end {
+            OpenAction {
+                info,
+                span: Some(span),
+                target_label,
+                spawn_count: 0,
+            }
+        } else {
+            if let Some(nanos) = clamped_end {
+                span.end_with_timestamp(nanos_to_system_time(nanos));
+            } else {
+                span.end();
+            }
+            OpenAction {
+                info,
+                span: None,
+                target_label,
+                spawn_count: 0,
+            }
+        };
+        self.action_span_cache.insert(key.clone(), open);
+
+        // Re-check pending spawns for any spawn that the just-inserted action
+        // is the parent of. Order: a spawn that arrived first via the tailer,
+        // then its ActionExecuted via BEP — flush the buffered spawn now so
+        // it backfills attrs on the freshly-built span.
+        if defer_end {
+            self.flush_pending_spawns_for_action(&key);
+        }
+
+        debug!(
+            success = ev.success,
+            label = ?ev.label,
+            defer_end,
+            "Recorded action span",
+        );
+    }
+
+    /// Drain everything the compact-log tailer has produced through the mpsc.
+    /// Each [`SpawnExec`] either finds its parent action in
+    /// [`Self::action_span_cache`] (backfill + emit child span) or lands in
+    /// [`Self::pending_spawns`] to be retried by
+    /// [`Self::flush_pending_spawns_for_action`] when the parent action
+    /// arrives, or finally synthesised at [`Self::finish`].
+    ///
+    /// Non-blocking: called from BEP event handlers, never blocks the gRPC
+    /// receive loop. The tailer's mpsc buffer absorbs bursts.
+    pub(super) fn pump_compact_spawns(&mut self) {
+        let mut drained = Vec::new();
+        if let Some(state) = self.exec_log_state.as_mut() {
+            while let Ok(spawn) = state.handle.rx.try_recv() {
+                drained.push(spawn);
+            }
+        }
+        for spawn in drained {
+            self.on_compact_spawn(spawn);
+        }
+    }
+
+    /// One [`SpawnExec`] from the tailer: match it against an open action,
+    /// emit the child spawn span, and (on the action's first spawn only)
+    /// backfill curated attrs onto the parent. Unmatched spawns are queued by
+    /// action key for targeted flush once their ActionExecuted arrives.
+    pub(crate) fn on_compact_spawn(&mut self, spawn: SpawnExec) {
+        self.compact_spawns_received = self.compact_spawns_received.saturating_add(1);
+        // Exact-match path. Fuzzy matching (output-dir / suffix) is
+        // deliberately not run live — multi-spawn actions confuse fuzzy
+        // matching, and we'd rather emit a child span under a synthesised
+        // parent at finish() than misattribute attrs onto a sibling action.
+        let key = crate::exec_log::spawn_exec_candidate_keys(&spawn)
+            .into_iter()
+            .find(|k| self.action_span_cache.contains_key(k));
+        let Some(key) = key else {
+            self.push_pending_spawn(spawn);
+            return;
+        };
+        self.apply_spawn_to_action(&key, spawn);
+    }
+
+    /// Apply a single spawn to a known-present action cache entry: bump the
+    /// counter, backfill attrs on the first one, emit the child span.
+    fn apply_spawn_to_action(&mut self, key: &ActionSpanKey, spawn: SpawnExec) {
+        let (parent_info, is_first) = {
+            let action = self
+                .action_span_cache
+                .get_mut(key)
+                .expect("apply_spawn_to_action called with key not in cache");
+            let is_first = action.spawn_count == 0;
+            if is_first {
+                if let Some(span) = action.span.as_mut() {
+                    crate::exec_log::apply_spawn_attrs_to_action(span, &spawn);
+                }
+            }
+            action.spawn_count = action.spawn_count.saturating_add(1);
+            (action.info.clone(), is_first)
+        };
+        debug!(
+            label = %key.target_label,
+            mnemonic = %key.mnemonic,
+            first = is_first,
+            "Applied compact spawn to action span",
+        );
+        crate::exec_log::emit_spawn_span(&self.tracer, &parent_info, &spawn, &self.redactor);
+    }
+
+    fn push_pending_spawn(&mut self, spawn: SpawnExec) {
+        let key = crate::exec_log::spawn_exec_candidate_keys(&spawn)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                ActionSpanKey::new(
+                    Some(spawn.target_label.as_str()),
+                    Some(spawn.mnemonic.as_str()),
+                    Some(""),
+                )
+            });
+        self.pending_spawns.entry(key).or_default().push(spawn);
+    }
+
+    /// Move buffered spawns for `key` from [`Self::pending_spawns`] into the
+    /// action cache once ActionExecuted has arrived.
+    fn flush_pending_spawns_for_action(&mut self, key: &ActionSpanKey) {
+        let Some(matched) = self.pending_spawns.remove(key) else {
+            return;
+        };
+        for spawn in matched {
+            self.apply_spawn_to_action(key, spawn);
+        }
+    }
+
+    /// Record an end timestamp hint for every still-open action span belonging
+    /// to `target_label`. The action spans stay open until `finish()` so late
+    /// tailer arrivals can still backfill attrs before finalisation.
+    ///
+    /// `fallback_end_nanos` is used when the action's own clamped end is
+    /// `None` (an action completed without timing data) — typically the
+    /// target's effective end time.
+    pub(super) fn end_open_actions_for_target(
+        &mut self,
+        target_label: &str,
+        fallback_end_nanos: Option<i64>,
+    ) {
+        let normalized = normalize_label(target_label);
+        for action in self.action_span_cache.values_mut() {
+            if action.span.is_some()
+                && normalize_label(&action.target_label) == normalized
+                && action.info.end_nanos.is_none()
+            {
+                action.info.end_nanos = fallback_end_nanos;
+            }
+        }
+    }
+
+    fn finalize_action_summary_attrs(span: &mut opentelemetry_sdk::trace::Span, spawn_count: u32) {
+        span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_COUNT, i64::from(spawn_count)));
+        if spawn_count == 0 {
+            span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_MISSING, true));
+        }
+    }
+
+    /// Finalize and end the in-place action span for `key`. No-op if the span
+    /// has already been ended (e.g. compact log disabled).
+    fn finalize_and_end_action_entry(
+        &mut self,
+        key: &ActionSpanKey,
+        fallback_end_nanos: Option<i64>,
+    ) {
+        let Some(action) = self.action_span_cache.get_mut(key) else {
+            return;
+        };
+        let Some(mut span) = action.span.take() else {
+            return;
+        };
+        Self::finalize_action_summary_attrs(&mut span, action.spawn_count);
+        let end_nanos = action.info.end_nanos.or(fallback_end_nanos);
+        if let Some(nanos) = end_nanos {
+            span.end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            span.end();
+        }
     }
 
     // =====================================================================
@@ -1993,8 +2366,14 @@ impl OtelMapper {
         self.named_set_cache.clear();
         self.pending_fetches.clear();
         self.pending_test_results.clear();
-        self.exec_log = None;
+        if let Some(state) = self.exec_log_state.take() {
+            state.handle.shutdown();
+        }
+        self.pending_exec_log_path = None;
+        self.compact_streaming_active = false;
         self.action_span_cache.clear();
+        self.pending_spawns.clear();
+        self.compact_spawns_received = 0;
         self.workspace_directory = None;
     }
 
@@ -2002,37 +2381,229 @@ impl OtelMapper {
     // Finalization
     // =====================================================================
 
+    /// Signal shutdown, then drain the compact-log tailer channel with a
+    /// bounded budget so the post-`close()` final chunk can still be consumed.
+    ///
+    /// Why a budget and not an unbounded await: the tailer is a separate
+    /// blocking thread driving zstd decode. By the time `finish()` is
+    /// called Bazel has already invoked `close()` on the spawn-log stream
+    /// (it happens in `SpawnLogModule.afterCommand` before
+    /// `BuildCompleteEvent` is published), so the final chunk + frame
+    /// terminator are guaranteed to be on disk; the only question is
+    /// whether the tailer has consumed and forwarded them yet. 2 s of
+    /// slack is generous — typical decode of a final 128 KiB chunk +
+    /// 200–600 entry burst takes <100 ms — but cheap insurance against
+    /// transient slowness without holding the mapper for arbitrary time.
+    fn drain_and_stop_tailer(&mut self) {
+        let Some(mut state) = self.exec_log_state.take() else {
+            return;
+        };
+        state.handle.shutdown();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut drained = Vec::new();
+        loop {
+            let mut got_any = false;
+            while let Ok(spawn) = state.handle.rx.try_recv() {
+                drained.push(spawn);
+                got_any = true;
+            }
+            // Exit once the worker has exited and we've observed an empty poll,
+            // or once the bounded budget is exhausted.
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if state.handle.is_finished() && !got_any {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Poll for worker exit before reading the error slot. The blocking
+        // thread may still be in a short sleep window; wait briefly for a
+        // clean terminal state, then do one final non-blocking drain.
+        let worker_exit_deadline = std::time::Instant::now() + Duration::from_millis(300);
+        while !state.handle.is_finished()
+            && std::time::Instant::now() < worker_exit_deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while let Ok(spawn) = state.handle.rx.try_recv() {
+            drained.push(spawn);
+        }
+        debug!(
+            count = drained.len(),
+            "Drained compact exec log tailer at finish()",
+        );
+        for spawn in drained {
+            self.on_compact_spawn(spawn);
+        }
+        // Worker error (if any) is only readable now — the shutdown sleep
+        // above gives the blocking task time to populate the slot before
+        // we read it here.
+        let worker_error = state.handle.take_error();
+        let mut attrs = vec![KeyValue::new(
+            "spawns_received",
+            self.compact_spawns_received as i64,
+        )];
+        if let Some(err) = worker_error {
+            attrs.push(KeyValue::new("status", "failed"));
+            attrs.push(KeyValue::new("error", err));
+        } else {
+            attrs.push(KeyValue::new("status", "ok"));
+        }
+        self.add_root_event("bazel.exec_log.tailer_finished", attrs);
+    }
+
+    /// Build synthetic parent action spans for spawns left in
+    /// [`Self::pending_spawns`] after `drain_and_stop_tailer`. These are
+    /// spawns whose `ActionExecuted` never arrived on BEP — most commonly
+    /// because the user passed `--nobuild_event_publish_all_actions` and
+    /// the action was a non-failure. Group by
+    /// `(target_label, mnemonic, primary_output)` to mirror the on-disk
+    /// shape; emit child spawn spans under each synthetic parent and
+    /// backfill the same curated attrs onto it.
+    fn synthesise_orphan_actions(&mut self) {
+        if self.pending_spawns.is_empty() {
+            return;
+        }
+        let mut groups: HashMap<ActionSpanKey, Vec<SpawnExec>> = HashMap::new();
+        for (key, spawns) in self.pending_spawns.drain() {
+            groups.entry(key).or_default().extend(spawns);
+        }
+        let group_count = groups.len();
+        for (key, spawns) in groups {
+            self.synthesise_one_orphan_action(key, spawns);
+        }
+        debug!(
+            groups = group_count,
+            "Synthesised orphan action spans from unmatched compact-log spawns",
+        );
+    }
+
+    fn synthesise_one_orphan_action(&mut self, key: ActionSpanKey, spawns: Vec<SpawnExec>) {
+        // Parent picks target if BEP told us about it, else root. We don't
+        // create a target span on the fly — a target that never appeared in
+        // BEP is itself an orphan, beyond the scope of compact-log backfill.
+        let parent = self
+            .target_contexts
+            .get(&key.target_label)
+            .cloned()
+            .or_else(|| self.root_context.clone());
+        let Some(parent) = parent else {
+            warn!(
+                label = %key.target_label,
+                mnemonic = %key.mnemonic,
+                "Cannot synthesise orphan action: no parent context (root span missing?)",
+            );
+            return;
+        };
+
+        // Bounds: earliest start to latest end across the group's spawns.
+        // `SpawnMetrics.start_time` + `total_time` gives an absolute end.
+        let (raw_start, raw_end) = spawns
+            .iter()
+            .filter_map(spawn_time_range)
+            .fold((None::<i64>, None::<i64>), |(s, e), (ns, ne)| {
+                (
+                    Some(s.map_or(ns, |v| v.min(ns))),
+                    Some(e.map_or(ne, |v| v.max(ne))),
+                )
+            });
+        let (clamped_start, clamped_end) = self.clamp_to_invocation(raw_start, raw_end);
+
+        let span_name = if key.mnemonic.is_empty() {
+            format!("action {} (synth)", shorten_label(&key.target_label))
+        } else {
+            format!(
+                "action {} {} (synth)",
+                key.mnemonic,
+                shorten_label(&key.target_label)
+            )
+        };
+
+        let mut attrs = vec![
+            KeyValue::new(BAZEL_ACTION_SUCCESS, true),
+            KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
+        ];
+        if !key.mnemonic.is_empty() {
+            attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, key.mnemonic.clone()));
+        }
+        if !key.target_label.is_empty() {
+            attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, key.target_label.clone()));
+            attrs.push(KeyValue::new(
+                BAZEL_ACTION_LABEL_SHORT,
+                shorten_label(&key.target_label).to_string(),
+            ));
+        }
+        if !key.primary_output.is_empty() {
+            attrs.push(KeyValue::new(
+                BAZEL_ACTION_PRIMARY_OUTPUT,
+                key.primary_output.clone(),
+            ));
+        }
+
+        let mut span =
+            self.build_child_span(&parent, span_name, SpanKind::Internal, attrs, clamped_start);
+        let span_context = span.span_context().clone();
+        if let Some(first) = spawns.first() {
+            crate::exec_log::apply_spawn_attrs_to_action(&mut span, first);
+        }
+        span.set_attribute(KeyValue::new(
+            BAZEL_ACTION_SPAWN_COUNT,
+            i64::try_from(spawns.len()).unwrap_or(i64::MAX),
+        ));
+
+        let info = ActionSpanInfo {
+            span_context,
+            start_nanos: clamped_start,
+            end_nanos: clamped_end,
+        };
+        for spawn in &spawns {
+            crate::exec_log::emit_spawn_span(&self.tracer, &info, spawn, &self.redactor);
+        }
+
+        if let Some(nanos) = clamped_end {
+            span.end_with_timestamp(nanos_to_system_time(nanos));
+        } else {
+            span.end();
+        }
+    }
+
+    /// Finalize and end every action span still held open in
+    /// [`Self::action_span_cache`]. Called from `finish()` after the tailer
+    /// drain and orphan synthesis, so `spawn.missing` decisions are based on
+    /// the complete compact-log stream.
+    fn finalize_and_end_remaining_open_actions(&mut self) {
+        let fallback = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
+        let keys: Vec<ActionSpanKey> = self
+            .action_span_cache
+            .iter()
+            .filter(|(_, action)| action.span.is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
+            self.finalize_and_end_action_entry(&key, fallback);
+        }
+    }
+
     /// End all remaining spans (call after last BEP event).
     pub fn finish(&mut self) {
-        // Enrich trace with execution log data if a binary or compact log
-        // was discovered during options parsing.
-        if let Some((ref path, format)) = self.exec_log {
-            let resolved = if path.is_relative() {
-                self.workspace_directory
-                    .as_ref()
-                    .map(|ws| ws.join(path))
-                    .unwrap_or_else(|| path.clone())
-            } else {
-                path.clone()
-            };
-            let root_cx = self
-                .root_context
-                .as_ref()
-                .map(|c| c.span().span_context().clone());
-            let root_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
-            crate::exec_log::enrich_trace(
-                &resolved,
-                format,
-                &self.action_span_cache,
-                &self.tracer,
-                root_cx.as_ref(),
-                self.root_span_start_nanos,
-                root_end,
-                self.exec_log_max_message_bytes,
-                self.exec_log_max_decompressed_bytes,
-                &self.redactor,
-            );
-        }
+        // Drain the compact-log tailer's post-`close()` final chunk before
+        // sealing any spans. zstd-jni's 128 KiB input buffer means the last
+        // batch of spawns only hits disk when Bazel runs `close()` on the
+        // log stream — which happens before BuildCompleteEvent is emitted,
+        // but the chunk + frame terminator may still be in flight through
+        // the tailer's mpsc when we get here.
+        self.drain_and_stop_tailer();
+
+        // Anything still buffered after the drain never matched a BEP
+        // ActionExecuted (e.g. `--build_event_publish_all_actions=false`).
+        // Synthesise parent action spans for them.
+        self.synthesise_orphan_actions();
+
+        // Finalise action-level spawn summaries only after the tailer has
+        // fully drained, so late chunk arrivals cannot create false
+        // `bazel.action.spawn.missing=true` on parent action spans.
+        self.finalize_and_end_remaining_open_actions();
 
         // End the `fetches` parent span.
         if let Some(cx) = self.fetches_context.take() {
@@ -2115,6 +2686,78 @@ impl OtelMapper {
     }
 }
 
+/// Resolve a human-readable name for the Bazel workspace producing this
+/// trace. Used to populate [`VCS_REPOSITORY_NAME`] on the root span.
+///
+/// Lookup order (first non-empty wins):
+///   1. `MODULE.bazel` → `module(name = "...")` (bzlmod, default since 7.0).
+///   2. `WORKSPACE.bazel` / `WORKSPACE` → `workspace(name = "...")` (legacy).
+///   3. Basename of `workspace_dir` (e.g. `/repos/bazel_conduit` → `bazel_conduit`).
+///
+/// I/O happens once per build at `BuildStarted` — both candidate files are
+/// small (typically <2 KiB) and read synchronously. Failures fall through
+/// to the next source rather than propagating, since this attribute is a
+/// hint rather than load-bearing.
+fn detect_workspace_name(workspace_dir: &Path) -> Option<String> {
+    if let Some(name) = read_starlark_name(&workspace_dir.join("MODULE.bazel"), "module") {
+        return Some(name);
+    }
+    for candidate in ["WORKSPACE.bazel", "WORKSPACE"] {
+        if let Some(name) = read_starlark_name(&workspace_dir.join(candidate), "workspace") {
+            return Some(name);
+        }
+    }
+    let basename = workspace_dir.file_name()?.to_str()?;
+    if basename.is_empty() {
+        None
+    } else {
+        Some(basename.to_string())
+    }
+}
+
+/// Pull `name = "<value>"` out of the first `<func>(...)` block in a
+/// MODULE.bazel / WORKSPACE.bazel file. Substring-based and deliberately
+/// dumb — Starlark string escaping, commented-out blocks, or unusual
+/// formatting (e.g. `module (\n name="x"\n)`) trips it. That's fine for
+/// the canonical idioms emitted by `bazel new`, `bazel mod tidy`, and
+/// every real-world MODULE.bazel I've seen; degenerate inputs fall
+/// through to the basename in `detect_workspace_name`.
+fn read_starlark_name(path: &Path, func: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let needle = format!("{func}(");
+    let start = content.find(&needle)?;
+    let after = &content[start + needle.len()..];
+    // Bound the search to the matching `)` so we don't grab `name=` out
+    // of a later `bazel_dep(name = "...")`.
+    let mut depth = 1i32;
+    let mut end = after.len();
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+    let key_pos = body.find("name")?;
+    let rest = body[key_pos + 4..].trim_start();
+    let after_eq = rest.strip_prefix('=')?.trim_start();
+    let after_quote = after_eq.strip_prefix('"')?;
+    let close = after_quote.find('"')?;
+    let name = &after_quote[..close];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 fn nanos_to_system_time(nanos: i64) -> SystemTime {
     if nanos >= 0 {
         UNIX_EPOCH + Duration::from_nanos(nanos as u64)
@@ -2190,6 +2833,62 @@ mod tests {
     }
 
     #[test]
+    fn detect_workspace_name_reads_module_bazel() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("MODULE.bazel"),
+            "module(\n    name = \"my_repo\",\n    version = \"0.1.0\",\n)\n\nbazel_dep(name = \"rules_rust\", version = \"0.40\")\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_workspace_name(dir.path()).as_deref(),
+            Some("my_repo"),
+        );
+    }
+
+    #[test]
+    fn detect_workspace_name_falls_back_to_workspace_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("WORKSPACE"),
+            "workspace(name = \"legacy_repo\")\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_workspace_name(dir.path()).as_deref(),
+            Some("legacy_repo"),
+        );
+    }
+
+    #[test]
+    fn detect_workspace_name_falls_back_to_basename() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("just_a_dir");
+        std::fs::create_dir(&dir).unwrap();
+        // No MODULE.bazel or WORKSPACE -> directory basename.
+        assert_eq!(
+            detect_workspace_name(&dir).as_deref(),
+            Some("just_a_dir"),
+        );
+    }
+
+    #[test]
+    fn detect_workspace_name_ignores_bazel_dep_blocks() {
+        // The regex-free parser must consume only the first `module(...)`
+        // block, not pick up `name=` from a later `bazel_dep(...)`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("MODULE.bazel"),
+            "module(\n    name = \"the_one\",\n)\n\nbazel_dep(name = \"not_this\", version = \"1.0\")\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_workspace_name(dir.path()).as_deref(),
+            Some("the_one"),
+        );
+    }
+
+    #[test]
     fn nanos_to_system_time_positive() {
         let t = nanos_to_system_time(1_000_000_000);
         assert_eq!(t, UNIX_EPOCH + Duration::from_secs(1));
@@ -2198,6 +2897,86 @@ mod tests {
     #[test]
     fn nanos_to_system_time_negative() {
         assert_eq!(nanos_to_system_time(-1), UNIX_EPOCH);
+    }
+
+    // ---- on_exec_log_detected path resolution ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_exec_log_detected_resolves_relative_against_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut mapper = test_mapper();
+        mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
+        mapper.on_build_started_extended(
+            ws.path().to_str(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        mapper.on_exec_log_detected(PathBuf::from("exec.log"));
+
+        let state = mapper.exec_log_state.as_ref().expect("tailer should start");
+        assert_eq!(state.path, ws.path().join("exec.log"));
+        assert!(mapper.compact_streaming_active);
+
+        mapper.drain_and_stop_tailer();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_exec_log_detected_passes_absolute_path_through() {
+        let ws = tempfile::tempdir().unwrap();
+        let absolute = ws.path().join("custom_exec.log");
+        let mut mapper = test_mapper();
+        mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
+        mapper.on_build_started_extended(
+            ws.path().to_str(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        mapper.on_exec_log_detected(absolute.clone());
+
+        let state = mapper.exec_log_state.as_ref().expect("tailer should start");
+        assert_eq!(state.path, absolute);
+
+        mapper.drain_and_stop_tailer();
+    }
+
+    #[test]
+    fn on_exec_log_detected_skips_when_workspace_unknown() {
+        let mut mapper = test_mapper();
+        mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
+        mapper.on_exec_log_detected(PathBuf::from("exec.log"));
+        assert!(mapper.exec_log_state.is_none());
+        assert!(!mapper.compact_streaming_active);
+        assert_eq!(mapper.pending_exec_log_path, Some(PathBuf::from("exec.log")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_build_started_extended_retries_pending_relative_exec_log() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut mapper = test_mapper();
+        mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
+        mapper.on_exec_log_detected(PathBuf::from("exec.log"));
+        assert!(mapper.exec_log_state.is_none());
+        assert_eq!(mapper.pending_exec_log_path, Some(PathBuf::from("exec.log")));
+
+        mapper.on_build_started_extended(
+            ws.path().to_str(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let state = mapper.exec_log_state.as_ref().expect("tailer should start after workspace arrives");
+        assert_eq!(state.path, ws.path().join("exec.log"));
+        assert!(mapper.pending_exec_log_path.is_none());
+        mapper.drain_and_stop_tailer();
     }
 
     // ---- Mapper lifecycle tests ----
@@ -2352,5 +3131,483 @@ mod tests {
         assert_eq!(e, Some(2_000_000_000));
     }
 
+    // =====================================================================
+    // Compact exec log streaming / enrichment fixtures
+    //
+    // Each test instruments the mapper with a `CollectingProcessor` so we can
+    // inspect every span the pipeline emits. The tailer thread is bypassed —
+    // tests inject `SpawnExec` records directly via `on_compact_spawn` and
+    // flip `compact_streaming_active` to mimic the deferred-end mode. The
+    // tailer's own machinery (file open, blocking-EOF read, zstd decode) is
+    // covered by `crate::exec_log::tailer::tests`.
+    // =====================================================================
+
+    use opentelemetry::trace::SpanId;
+    use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+    use spawn_proto::tools::protos::{File as ProtoFile, SpawnExec, SpawnMetrics};
+    use std::sync::{Arc, Mutex};
+
+    // `SpanExporter::export` returns `futures_util::future::BoxFuture<'static, _>`.
+    // We don't depend on `futures-util` directly, so spell the equivalent
+    // type out by hand; it's `Pin<Box<dyn Future<Output = T> + Send>>` with
+    // the implicit `'static` bound that `Box<dyn Trait>` carries.
+    type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+    #[derive(Debug, Default, Clone)]
+    struct Collector(Arc<Mutex<Vec<SpanData>>>);
+
+    impl Collector {
+        fn snapshot(&self) -> Vec<SpanData> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl SpanExporter for Collector {
+        fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<ExportResult> {
+            self.0.lock().unwrap().extend(batch);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn mapper_with_collector() -> (OtelMapper, Collector) {
+        use opentelemetry::trace::TracerProvider;
+        let collector = Collector::default();
+        // SimpleSpanProcessor exports synchronously on each span.end(), so we
+        // see attributes immediately on inspection without needing flush().
+        let processor = opentelemetry_sdk::trace::SimpleSpanProcessor::new(Box::new(
+            collector.clone(),
+        ));
+        let tp = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_span_processor(processor)
+            .build();
+        let tracer = tp.tracer("test");
+        let mut mapper = OtelMapper::new(tracer, None);
+        // Bring the root span up; downstream spans need it as their grand-parent.
+        mapper.on_build_started("test-uuid", "build", Some(1_000_000_000), None);
+        (mapper, collector)
+    }
+
+    fn spawn_exec_with_metrics(
+        target: &str,
+        mnemonic: &str,
+        output: &str,
+        runner: &str,
+        cache_hit: bool,
+    ) -> SpawnExec {
+        SpawnExec {
+            target_label: target.to_string(),
+            mnemonic: mnemonic.to_string(),
+            runner: runner.to_string(),
+            cache_hit,
+            remote_cacheable: true,
+            listed_outputs: vec![output.to_string()],
+            actual_outputs: vec![ProtoFile {
+                path: output.to_string(),
+                ..Default::default()
+            }],
+            metrics: Some(SpawnMetrics {
+                start_time: Some(spawn_proto::timestamp_proto::google::protobuf::Timestamp {
+                    seconds: 1,
+                    nanos: 100_000_000,
+                }),
+                total_time: Some(spawn_proto::duration_proto::google::protobuf::Duration {
+                    seconds: 0,
+                    nanos: 400_000_000,
+                }),
+                execution_wall_time: Some(
+                    spawn_proto::duration_proto::google::protobuf::Duration {
+                        seconds: 0,
+                        nanos: 300_000_000,
+                    },
+                ),
+                queue_time: Some(spawn_proto::duration_proto::google::protobuf::Duration {
+                    seconds: 0,
+                    nanos: 50_000_000,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn action_event_for<'a>(
+        label: &'a str,
+        mnemonic: &'a str,
+        output: &'a str,
+    ) -> ActionCompletedEvent<'a> {
+        ActionCompletedEvent {
+            label: Some(label),
+            mnemonic: Some(mnemonic),
+            success: true,
+            exit_code: Some(0),
+            exit_code_name: None,
+            primary_output: Some(output),
+            configuration: None,
+            command_line: &[],
+            stdout_path: None,
+            stderr_path: None,
+            start_time_nanos: Some(1_000_000_000),
+            end_time_nanos: Some(1_500_000_000),
+            cached: Some(false),
+            hostname: None,
+            cached_remotely: None,
+            runner: None,
+        }
+    }
+
+    /// Find the first span matching `pred` in the collector's output.
+    fn find_span(spans: &[SpanData], pred: impl Fn(&SpanData) -> bool) -> Option<SpanData> {
+        spans.iter().find(|s| pred(s)).cloned()
+    }
+
+    /// Read a single attribute (returns the rendered display string).
+    fn attr_value<'a>(span: &'a SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    /// Scenario 1: BEP action + a single matching SpawnExec → action span
+    /// carries runner / cache_hit / SpawnMetrics, plus exactly one child
+    /// spawn span with `bazel.spawn.*` attrs.
+    #[test]
+    fn cache_hit_single_spawn_backfills_action_span() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.compact_streaming_active = true;
+
+        mapper.on_action_completed(&action_event_for(
+            "//pkg:foo",
+            "CppCompile",
+            "bazel-out/foo.o",
+        ));
+        mapper.on_compact_spawn(spawn_exec_with_metrics(
+            "//pkg:foo",
+            "CppCompile",
+            "bazel-out/foo.o",
+            "remote cache hit",
+            true,
+        ));
+        // Close out the action span (TargetCompleted boundary in real life).
+        mapper.end_open_actions_for_target("//pkg:foo", Some(2_000_000_000));
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let action = find_span(&spans, |s| s.name.starts_with("action CppCompile"))
+            .expect("action span emitted");
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_RUNNER).as_deref(),
+            Some("remote cache hit"),
+        );
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_CACHE_HIT).as_deref(),
+            Some("true"),
+        );
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
+            Some("1"),
+        );
+        // exec_wall = 300 ms.
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_EXEC_WALL_TIME_MS).as_deref(),
+            Some("300"),
+        );
+        // `spawn.missing` should not be set.
+        assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
+
+        let child_spawns: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name.starts_with("spawn CppCompile"))
+            .collect();
+        assert_eq!(child_spawns.len(), 1, "exactly one child spawn span");
+    }
+
+    /// Scenario 2: BEP action + TWO matching SpawnExecs (retry). The action
+    /// span carries attrs from the FIRST spawn only, `spawn.count == 2`,
+    /// and two child spawn spans are emitted.
+    #[test]
+    fn two_attempt_retry_backfills_first_only() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.compact_streaming_active = true;
+
+        mapper.on_action_completed(&action_event_for(
+            "//pkg:bar",
+            "GoCompile",
+            "bazel-out/bar.a",
+        ));
+        // First attempt: remote, cache miss.
+        mapper.on_compact_spawn(spawn_exec_with_metrics(
+            "//pkg:bar",
+            "GoCompile",
+            "bazel-out/bar.a",
+            "remote",
+            false,
+        ));
+        // Second attempt: local fallback. Should NOT overwrite the action's
+        // runner attribute.
+        mapper.on_compact_spawn(spawn_exec_with_metrics(
+            "//pkg:bar",
+            "GoCompile",
+            "bazel-out/bar.a",
+            "linux-sandbox",
+            false,
+        ));
+        mapper.end_open_actions_for_target("//pkg:bar", Some(2_000_000_000));
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let action = find_span(&spans, |s| s.name.starts_with("action GoCompile"))
+            .expect("action span emitted");
+        // First spawn wins for the action-level backfill.
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_RUNNER).as_deref(),
+            Some("remote"),
+        );
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
+            Some("2"),
+        );
+
+        let child_spawns: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name.starts_with("spawn GoCompile"))
+            .collect();
+        assert_eq!(child_spawns.len(), 2, "one child span per attempt");
+    }
+
+    /// Spawn arrives before ActionExecuted and is buffered. Once the action
+    /// lands, buffered spawns must flush onto that action (no orphan synthesis).
+    #[test]
+    fn buffered_spawn_flushes_when_action_arrives() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.compact_streaming_active = true;
+
+        mapper.on_compact_spawn(spawn_exec_with_metrics(
+            "//pkg:pre",
+            "RustCompile",
+            "bazel-out/pre.rlib",
+            "remote",
+            false,
+        ));
+        mapper.on_action_completed(&action_event_for(
+            "//pkg:pre",
+            "RustCompile",
+            "bazel-out/pre.rlib",
+        ));
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let action = find_span(&spans, |s| s.name.starts_with("action RustCompile"))
+            .expect("action span emitted");
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
+            Some("1"),
+        );
+        assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
+        let child_count = spans
+            .iter()
+            .filter(|s| s.name.starts_with("spawn RustCompile"))
+            .count();
+        assert_eq!(child_count, 1);
+    }
+
+    /// Scenario 3: SpawnExec arrives but the BEP `ActionExecuted` never
+    /// does (most commonly `--build_event_publish_all_actions=false` on a
+    /// successful action). `finish()` synthesises a parent action span,
+    /// backfills attrs, and emits the child spawn under it.
+    #[test]
+    fn orphan_spawn_synthesises_parent_action() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.compact_streaming_active = true;
+
+        // Spawn comes through but no matching `on_action_completed` fired
+        // for this target/mnemonic/output triple.
+        mapper.on_compact_spawn(spawn_exec_with_metrics(
+            "//pkg:orphan",
+            "JavaCompile",
+            "bazel-out/orphan.jar",
+            "remote cache hit",
+            true,
+        ));
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let synth_action = find_span(&spans, |s| s.name.contains("JavaCompile") && s.name.contains("(synth)"))
+            .expect("synthesised orphan action span emitted");
+        assert_eq!(
+            attr_value(&synth_action, BAZEL_TARGET_SYNTHETIC).as_deref(),
+            Some("true"),
+        );
+        assert_eq!(
+            attr_value(&synth_action, BAZEL_ACTION_SPAWN_RUNNER).as_deref(),
+            Some("remote cache hit"),
+        );
+        assert_eq!(
+            attr_value(&synth_action, BAZEL_ACTION_SPAWN_CACHE_HIT).as_deref(),
+            Some("true"),
+        );
+        assert_eq!(
+            attr_value(&synth_action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
+            Some("1"),
+        );
+
+        let child_count = spans
+            .iter()
+            .filter(|s| s.name.starts_with("spawn JavaCompile"))
+            .count();
+        assert_eq!(child_count, 1);
+    }
+
+    /// Scenario 4: BEP action arrives but **no** compact-log spawn matches
+    /// it (e.g. action-cache hit invisible to the spawn log). At `finish()`
+    /// the still-open action gets ended with
+    /// `bazel.action.spawn.missing = true` and `bazel.action.spawn.count = 0`.
+    #[test]
+    fn bep_only_action_marked_spawn_missing() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.compact_streaming_active = true;
+
+        mapper.on_action_completed(&action_event_for(
+            "//pkg:bep_only",
+            "GenRule",
+            "bazel-out/bep_only.txt",
+        ));
+        // No on_compact_spawn call: the spawn log produced nothing for this
+        // action.
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let action = find_span(&spans, |s| s.name.starts_with("action GenRule"))
+            .expect("action span emitted");
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
+            Some("0"),
+        );
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).as_deref(),
+            Some("true"),
+        );
+
+        let any_spawn = spans.iter().any(|s| s.name.starts_with("spawn "));
+        assert!(!any_spawn, "no child spawn spans expected");
+    }
+
+    /// Spawn arrives after TargetCompleted marked the action boundary but
+    /// before finish-time finalization. Parent action must not carry
+    /// `spawn.missing=true`.
+    #[test]
+    fn late_spawn_before_finish_clears_missing() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.compact_streaming_active = true;
+
+        mapper.on_action_completed(&action_event_for(
+            "//pkg:late",
+            "CppCompile",
+            "bazel-out/late.o",
+        ));
+        mapper.end_open_actions_for_target("//pkg:late", Some(2_000_000_000));
+        mapper.on_compact_spawn(spawn_exec_with_metrics(
+            "//pkg:late",
+            "CppCompile",
+            "bazel-out/late.o",
+            "linux-sandbox",
+            false,
+        ));
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let action = find_span(&spans, |s| s.name.starts_with("action CppCompile"))
+            .expect("action span emitted");
+        assert_eq!(
+            attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
+            Some("1"),
+        );
+        assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
+    }
+
+    /// Find a root-span event by name. Returns the event's attribute map as
+    /// a flat (key, display_value) Vec.
+    fn root_event<'a>(spans: &'a [SpanData], event_name: &str) -> Option<Vec<(String, String)>> {
+        let root = spans.iter().find(|s| s.parent_span_id == SpanId::INVALID)?;
+        let event = root.events.iter().find(|e| e.name == event_name)?;
+        Some(
+            event
+                .attributes
+                .iter()
+                .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                .collect(),
+        )
+    }
+
+    /// Missing-file scenario: the tailer aborts in `open_with_backoff` once
+    /// the mapper signals shutdown. We exercise that path because it's the
+    /// real-world "user pointed at the wrong file / wrote to a read-only
+    /// dir" failure mode. Asserts the started event carries the resolved
+    /// path, and the finished event reports `status=failed` with a non-empty
+    /// error string. Happy-path (`status=ok`) coverage is in the integration
+    /// suite where a real Bazel build writes a valid log; reproducing a
+    /// valid zstd frame in a unit test would be more brittle than useful.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_log_finished_event_reports_open_failure() {
+        let ws = tempfile::tempdir().unwrap();
+        let absolute = ws.path().join("exec.log");
+
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.on_build_started_extended(
+            ws.path().to_str(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        mapper.on_exec_log_detected(absolute.clone());
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let started = root_event(&spans, "bazel.exec_log.tailer_started")
+            .expect("tailer_started event on root");
+        assert!(
+            started.iter().any(|(k, v)| k == "path" && v == &absolute.display().to_string()),
+            "tailer_started should carry resolved path, got {started:?}",
+        );
+
+        let finished = root_event(&spans, "bazel.exec_log.tailer_finished")
+            .expect("tailer_finished event on root");
+        assert!(
+            finished.iter().any(|(k, v)| k == "status" && v == "failed"),
+            "expected status=failed when the log file never appears, got {finished:?}",
+        );
+        assert!(
+            finished
+                .iter()
+                .any(|(k, v)| k == "error" && !v.is_empty()),
+            "expected non-empty error string, got {finished:?}",
+        );
+        assert!(
+            finished.iter().any(|(k, v)| k == "spawns_received" && v == "0"),
+            "expected spawns_received=0, got {finished:?}",
+        );
+    }
+
+    #[test]
+    fn exec_log_emits_skipped_event_when_workspace_missing() {
+        let (mut mapper, collector) = mapper_with_collector();
+        mapper.on_exec_log_detected(PathBuf::from("exec.log"));
+        mapper.finish();
+
+        let spans = collector.snapshot();
+        let skipped = root_event(&spans, "bazel.exec_log.tailer_skipped")
+            .expect("tailer_skipped event on root");
+        assert!(
+            skipped.iter().any(|(k, v)| k == "reason" && v == "workspace_directory_not_set"),
+            "expected reason attribute, got {skipped:?}",
+        );
+        // No tailer was spawned, so no finished event.
+        assert!(
+            root_event(&spans, "bazel.exec_log.tailer_finished").is_none(),
+            "tailer_finished must not appear when the tailer was skipped",
+        );
+    }
 }
 
