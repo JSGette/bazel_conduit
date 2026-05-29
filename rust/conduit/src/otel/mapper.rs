@@ -29,7 +29,7 @@
 //! ```
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -432,6 +432,15 @@ pub struct OtelMapper {
     /// `TargetCompleted` time), keyed by target label.
     target_contexts: HashMap<String, Context>,
 
+    /// Labels whose currently-open target context is synthetic
+    /// (action/test-driven, no observed TargetConfigured lifecycle).
+    synthetic_target_labels: HashSet<String>,
+
+    /// Targets whose lifecycle has reached a terminal event
+    /// (`TargetCompleted` or skipped/aborted). Used to avoid recreating
+    /// long-lived target contexts from late action/test events.
+    closed_targets: HashSet<String>,
+
     /// Single `fetches` parent span grouping all fetch child spans.
     /// Created lazily on first fetch event, ended in [`finish`].
     fetches_context: Option<Context>,
@@ -570,6 +579,8 @@ impl OtelMapper {
             root_context: None,
             configured_targets: HashMap::new(),
             target_contexts: HashMap::new(),
+            synthetic_target_labels: HashSet::new(),
+            closed_targets: HashSet::new(),
             fetches_context: None,
             skipped_context: None,
             external_deps_context: None,
@@ -1129,6 +1140,7 @@ impl OtelMapper {
             warn!("TargetConfigured before BuildStarted for {label}");
             return;
         }
+        self.closed_targets.remove(label);
 
         self.configured_targets.insert(
             label.to_string(),
@@ -1187,26 +1199,36 @@ impl OtelMapper {
         Context::new().with_span(span)
     }
 
-    /// Ensure a target span exists in `target_contexts`, creating it
-    /// lazily (under root) if we have `ConfiguredTarget` metadata, or a
-    /// synthetic target from the action label when no TargetConfigured was seen.
-    /// When `action_start_nanos` is set (e.g. from ActionExecuted), the new span's
-    /// start time is set so target timing reflects the action.
-    fn ensure_target_span(&mut self, label: &str, action_start_nanos: Option<i64>) {
-        if self.target_contexts.contains_key(label) {
-            return;
+    /// Resolve the parent context to use for action/test child spans.
+    ///
+    /// Lifecycle targets (`TargetConfigured` seen and not yet terminal) are
+    /// kept in `target_contexts`. Synthetic targets are also persisted so
+    /// action/test children share a stable target parent in exporters.
+    fn target_parent_context(
+        &mut self,
+        label: &str,
+        start_nanos: Option<i64>,
+    ) -> Option<Context> {
+        if let Some(existing) = self.target_contexts.get(label) {
+            return Some(existing.clone());
         }
-        let parent = self.choose_parent_for_label(label);
-        let Some(parent) = parent else { return };
+        let parent = self.choose_parent_for_label(label)?;
+        if self.closed_targets.contains(label) {
+            let cx = self.create_synthetic_target_span(label, &parent, start_nanos);
+            self.synthetic_target_labels.insert(label.to_string());
+            self.target_contexts.insert(label.to_string(), cx.clone());
+            return Some(cx);
+        }
         if let Some(configured) = self.configured_targets.get(label) {
-            let cx = self.create_target_span(label, configured, &parent, action_start_nanos);
+            let cx = self.create_target_span(label, configured, &parent, start_nanos);
             debug!("Lazily created target span for {label} (action needed parent)");
-            self.target_contexts.insert(label.to_string(), cx);
-        } else {
-            let cx = self.create_synthetic_target_span(label, &parent, action_start_nanos);
-            debug!("Created synthetic target span for {label} (from action label)");
-            self.target_contexts.insert(label.to_string(), cx);
+            self.target_contexts.insert(label.to_string(), cx.clone());
+            return Some(cx);
         }
+        let cx = self.create_synthetic_target_span(label, &parent, start_nanos);
+        self.synthetic_target_labels.insert(label.to_string());
+        self.target_contexts.insert(label.to_string(), cx.clone());
+        Some(cx)
     }
 
     /// Returns true if a label looks like an external dependency.
@@ -1283,11 +1305,14 @@ impl OtelMapper {
         // their original action timestamps, so without this a span ending at
         // event_time will run from the cached `start` (weeks ago) to today.
         let (_, effective_end) = self.clamp_to_invocation(None, event_time_nanos);
+        // Consume configured metadata up front regardless of whether the span
+        // was already created lazily from an action/test event.
+        let configured = self.configured_targets.remove(label);
 
         // Get or create the span under the appropriate parent.
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
             cx
-        } else if let Some(configured) = self.configured_targets.remove(label) {
+        } else if let Some(configured) = configured {
             let parent = self.choose_parent_for_label(label);
             if let Some(parent) = parent {
                 let cx = self.create_target_span(label, &configured, &parent, None);
@@ -1335,6 +1360,8 @@ impl OtelMapper {
             file_set_ids,
             effective_end,
         );
+        self.synthetic_target_labels.remove(label);
+        self.closed_targets.insert(label.to_string());
         debug!("Ended target span for {label} (success={success})");
     }
 
@@ -1403,6 +1430,8 @@ impl OtelMapper {
 
         cx.span().set_status(Status::Unset);
         cx.span().end_with_timestamp(instant);
+        self.synthetic_target_labels.remove(label);
+        self.closed_targets.insert(label.to_string());
 
         debug!("Created and ended skipped target span for {label}");
     }
@@ -1508,21 +1537,15 @@ impl OtelMapper {
         // backfill against actions that already landed in the cache.
         self.pump_compact_spawns();
 
-        if let Some(l) = ev.label {
-            self.ensure_target_span(l, ev.start_time_nanos);
-        }
-
-        let parent = ev
-            .label
-            .and_then(|l| self.target_contexts.get(l))
-            .or(self.root_context.as_ref());
-
-        let parent = match parent {
-            Some(cx) => cx.clone(),
-            None => {
-                warn!("ActionCompleted with no parent context");
-                return;
-            }
+        let parent = match ev.label {
+            Some(label) => self
+                .target_parent_context(label, ev.start_time_nanos)
+                .or_else(|| self.root_context.clone()),
+            None => self.root_context.clone(),
+        };
+        let Some(parent) = parent else {
+            warn!("ActionCompleted with no parent context");
+            return;
         };
 
         // Track action for cached-target detection.
@@ -1841,19 +1864,12 @@ impl OtelMapper {
             return;
         }
 
-        self.ensure_target_span(ev.label, None);
-
         let parent = self
-            .target_contexts
-            .get(ev.label)
-            .or(self.root_context.as_ref());
-
-        let parent = match parent {
-            Some(cx) => cx.clone(),
-            None => {
-                warn!("TestResult with no parent context for {}", ev.label);
-                return;
-            }
+            .target_parent_context(ev.label, None)
+            .or_else(|| self.root_context.clone());
+        let Some(parent) = parent else {
+            warn!("TestResult with no parent context for {}", ev.label);
+            return;
         };
 
         let span_name = build_test_span_name(ev);
@@ -2022,6 +2038,8 @@ impl OtelMapper {
             cx.span().end();
         }
         self.configured_targets.clear();
+        self.synthetic_target_labels.clear();
+        self.closed_targets.clear();
         self.configurations.clear();
         self.cached_command = None;
         self.cached_patterns.clear();
@@ -2121,7 +2139,11 @@ impl OtelMapper {
             if let Some(cx) = self.target_contexts.remove(&label) {
                 cx.span().set_status(Status::Unset);
                 cx.span().end();
-                warn!("Force-ended orphaned target span for {label}");
+                if self.synthetic_target_labels.remove(&label) {
+                    debug!("Force-ended synthetic target span for {label}");
+                } else {
+                    warn!("Force-ended orphaned target span for {label}");
+                }
             }
         }
 

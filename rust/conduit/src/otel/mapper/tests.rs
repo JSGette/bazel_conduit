@@ -257,6 +257,82 @@ fn reset_clears_state() {
 }
 
 #[test]
+fn target_completed_clears_configured_after_lazy_target_span_creation() {
+    let mut mapper = test_mapper();
+    mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+
+    let tags = vec!["manual".to_string()];
+    mapper.on_target_configured(
+        "//pkg:lazy",
+        Some("cc_library"),
+        &tags,
+        Some(1_100_000_000),
+        None,
+    );
+    assert!(mapper.configured_targets.contains_key("//pkg:lazy"));
+
+    // Action arrival lazily creates target context before TargetCompleted.
+    mapper.on_action_completed(&action_event_for(
+        "//pkg:lazy",
+        "CppCompile",
+        "bazel-out/lazy.o",
+    ));
+    assert!(mapper.target_contexts.contains_key("//pkg:lazy"));
+
+    mapper.on_target_completed("//pkg:lazy", true, &[], &[], Some(1_500_000_000));
+
+    assert!(
+        !mapper.configured_targets.contains_key("//pkg:lazy"),
+        "configured entry must be cleared on completion",
+    );
+    assert!(
+        !mapper.target_contexts.contains_key("//pkg:lazy"),
+        "target context must be closed on completion",
+    );
+}
+
+#[test]
+fn action_only_target_creates_persistent_synthetic_parent_context() {
+    let mut mapper = test_mapper();
+    mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+
+    let label = "@@repo//pkg:external";
+    mapper.on_action_completed(&action_event_for(
+        label,
+        "GoCompile",
+        "bazel-out/external.a",
+    ));
+
+    assert!(
+        mapper.target_contexts.contains_key(label),
+        "synthetic action-only target should be kept as a shared parent",
+    );
+    assert!(mapper.synthetic_target_labels.contains(label));
+}
+
+#[test]
+fn action_after_target_completion_reopens_as_synthetic_parent() {
+    let mut mapper = test_mapper();
+    mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+
+    mapper.on_target_configured("//pkg:late", Some("cc_library"), &[], Some(1_100_000_000), None);
+    mapper.on_target_completed("//pkg:late", true, &[], &[], Some(1_200_000_000));
+    assert!(mapper.closed_targets.contains("//pkg:late"));
+
+    mapper.on_action_completed(&action_event_for(
+        "//pkg:late",
+        "CppCompile",
+        "bazel-out/late.o",
+    ));
+
+    assert!(
+        mapper.target_contexts.contains_key("//pkg:late"),
+        "late action should use a synthetic target parent for linkage",
+    );
+    assert!(mapper.synthetic_target_labels.contains("//pkg:late"));
+}
+
+#[test]
 fn clamp_time_range_no_bounds() {
     let (s, e) = clamp_time_range(Some(10), Some(20), None, None);
     assert_eq!(s, Some(10));
