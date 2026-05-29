@@ -5,3 +5,4 @@ target/
 docs/
 security-report/
 .vscode/
+user.bazelrc
