@@ -6,8 +6,9 @@ use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::KeyValue;
 use tracing::{debug, info, warn};
 
-use super::{trace_context, ExecLogState, OtelMapper, TestResultEvent};
 use super::super::attributes::*;
+use super::{ExecLogState, OtelMapper, TestResultEvent};
+use crate::otel::trace_context;
 
 impl OtelMapper {
     /// BuildStarted -> create root span `bazel.invocation`.

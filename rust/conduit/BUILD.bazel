@@ -76,6 +76,7 @@ rust_library(
         "src/otel/mapper/targets.rs",
         "src/otel/mapper/test_attrs.rs",
         "src/otel/mapper/tests.rs",
+        "src/otel/mapper/utils.rs",
         "src/otel/mod.rs",
     ],
     deps = [
