@@ -218,6 +218,13 @@ impl EventRouter {
         &mut self.state
     }
 
+    /// Apply compact execution-log records produced since the last pump.
+    pub(crate) fn pump_exec_log(&mut self) {
+        if let Some(mapper) = &mut self.mapper {
+            mapper.pump_compact_spawns();
+        }
+    }
+
     /// Finalize: end all open spans on the current invocation.
     ///
     /// We intentionally do NOT call `force_flush()` on either provider here.

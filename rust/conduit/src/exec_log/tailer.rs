@@ -179,9 +179,6 @@ fn run(
     let mut buf = Vec::new();
 
     while let Some(len) = read_message_len(&mut reader, max_message_bytes)? {
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(());
-        }
         buf.resize(len, 0);
         reader.read_exact(&mut buf)?;
         let entry = ExecLogEntry::decode(buf.as_slice())
@@ -347,6 +344,43 @@ mod tests {
         assert_eq!(spawn.runner, "linux-sandbox");
         handle.shutdown();
         handle.join.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_records_already_on_disk() {
+        let f = NamedTempFile::new().unwrap();
+        append_frame(
+            f.path(),
+            &[
+                entry(
+                    0,
+                    EntryType::Invocation(Invocation {
+                        hash_function_name: "SHA256".into(),
+                        workspace_runfiles_directory: "_main".into(),
+                        sibling_repository_layout: false,
+                        id: "inv".into(),
+                    }),
+                ),
+                entry(
+                    1,
+                    EntryType::Spawn(SpawnEntry {
+                        target_label: "//pkg:final".into(),
+                        mnemonic: "Rustc".into(),
+                        ..Default::default()
+                    }),
+                ),
+            ],
+        );
+
+        let mut handle = spawn_with_defaults(f.path().to_path_buf());
+        handle.shutdown();
+
+        let spawn = tokio::time::timeout(Duration::from_secs(2), handle.rx.recv())
+            .await
+            .expect("tailer should stop within 2s")
+            .expect("record already on disk must survive shutdown");
+        assert_eq!(spawn.target_label, "//pkg:final");
+        handle.join().await;
     }
 
     /// File doesn't exist at spawn time. Tailer retries the open until

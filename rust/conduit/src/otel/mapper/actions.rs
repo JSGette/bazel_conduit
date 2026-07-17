@@ -115,9 +115,9 @@ impl OtelMapper {
     /// [`Self::flush_pending_spawns_for_action`] when the parent action
     /// arrives, or finally synthesised at [`Self::finish`].
     ///
-    /// Non-blocking: called from BEP event handlers, never blocks the gRPC
-    /// receive loop. The tailer's mpsc buffer absorbs bursts.
-    pub(super) fn pump_compact_spawns(&mut self) {
+    /// Non-blocking: called from BEP event handlers and the BES routing
+    /// worker's periodic pump. The tailer's mpsc buffer absorbs bursts.
+    pub(crate) fn pump_compact_spawns(&mut self) {
         let mut drained = Vec::new();
         if let Some(state) = self.exec_log_state.as_mut() {
             while let Ok(spawn) = state.handle.rx.try_recv() {

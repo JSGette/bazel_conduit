@@ -99,12 +99,27 @@ impl PublishBuildEvent for BesServer {
         let router_for_worker = router.clone();
         tokio::spawn(async move {
             let mut routed: u64 = 0;
-            while let Some((build_event, event_time_nanos)) = route_rx.recv().await {
-                let mut router = router_for_worker.lock().await;
-                if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
-                    warn!(error = %e, "Failed to route BEP event");
+            let first_pump = tokio::time::Instant::now() + EXEC_LOG_PUMP_INTERVAL;
+            let mut exec_log_tick =
+                tokio::time::interval_at(first_pump, EXEC_LOG_PUMP_INTERVAL);
+            exec_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    event = route_rx.recv() => {
+                        let Some((build_event, event_time_nanos)) = event else {
+                            break;
+                        };
+                        let mut router = router_for_worker.lock().await;
+                        if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
+                            warn!(error = %e, "Failed to route BEP event");
+                        }
+                        routed += 1;
+                    }
+                    _ = exec_log_tick.tick() => {
+                        router_for_worker.lock().await.pump_exec_log();
+                    }
                 }
-                routed += 1;
             }
             let mut router = router_for_worker.lock().await;
             router.finish();
@@ -179,6 +194,10 @@ impl PublishBuildEvent for BesServer {
 /// Bound on the receive→worker hand-off; sized to match the OTel batch queue
 /// so even a fully-cached giant build never backpressures the BES ACK path.
 const ROUTE_CHANNEL_CAPACITY: usize = 65536;
+
+/// Compact-log decode runs off-thread; pump completed chunks into spans
+/// independently of the BEP event cadence.
+const EXEC_LOG_PUMP_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Per-message cap for inbound BES events. BEP `BuildMetrics`, action stderr,
 /// or fat `OptionsParsed` blobs occasionally reach hundreds of KiB; 8 MiB
