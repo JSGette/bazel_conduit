@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+# This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
 """Parse conduit stdout trace output and assert no performance/structure regression.
 
 Conduit with --export stdout prints human-readable span lines. We count spans,

@@ -1,3 +1,6 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+// This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
 //! Compact execution-log helpers shared by the live tailer and mapper.
 //!
 //! Conduit only consumes `--execution_log_compact_file` (and the experimental

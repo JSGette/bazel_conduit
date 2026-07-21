@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+# This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
 # Full scenario: run bazel build for conduit with BEP + exec log, then produce and analyze trace.
 # Use for manual/CI validation. Not a Bazel test (runs bazel build from inside repo).
 #

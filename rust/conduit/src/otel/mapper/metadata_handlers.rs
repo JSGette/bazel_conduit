@@ -1,3 +1,6 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+// This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
 use super::super::attributes::BAZEL_CRITICAL_PATH_LOG_URI;
 use super::OtelMapper;
 use opentelemetry::KeyValue;

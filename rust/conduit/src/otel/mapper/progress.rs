@@ -1,3 +1,6 @@
+// Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+// This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
 use super::super::attributes::BAZEL_PROGRESS_STDOUT;
 use super::{append_progress_capped, strip_ansi, truncate_to_byte_limit, OtelMapper, PROGRESS_CAP_BYTES};
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};

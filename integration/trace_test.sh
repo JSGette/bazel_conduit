@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+# This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
 # Integration test: run conduit on BEP input, export trace to stdout, analyze for regressions.
 # Usage: trace_test.sh <conduit_bin> <bep_file> <analyzer_py> [trace_out]
 #   conduit_bin: path to conduit binary
