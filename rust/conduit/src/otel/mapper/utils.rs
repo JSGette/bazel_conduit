@@ -93,9 +93,10 @@ pub(super) fn spawn_time_range(s: &SpawnExec) -> Option<(i64, i64)> {
 /// Clamp a (start, end) time range to fit within (bound_start, bound_end).
 /// Ensures the result satisfies start <= end when both are present.
 ///
-/// Heuristic: when the entire range predates `bound_start` (both start and end
-/// are strictly before the invocation began), treat it as a cache hit replaying
-/// original exec timestamps and collapse to zero duration at `bound_start`.
+/// When the entire range predates `bound_start`, preserve its duration while
+/// shifting it inside the parent window. Cached actions commonly replay old
+/// execution timestamps; zero-width spans at the parent boundary break
+/// flamegraph nesting in Datadog.
 pub fn clamp_time_range(
     start: Option<i64>,
     end: Option<i64>,
@@ -104,7 +105,11 @@ pub fn clamp_time_range(
 ) -> (Option<i64>, Option<i64>) {
     if let (Some(s), Some(e), Some(bs)) = (start, end, bound_start) {
         if s < bs && e <= bs {
-            return (Some(bs), Some(bs));
+            let shifted_end = bs.saturating_add(e.saturating_sub(s).max(0));
+            return (
+                Some(bs),
+                Some(bound_end.map_or(shifted_end, |be| shifted_end.min(be)).max(bs)),
+            );
         }
     }
     let clamped_start = match (start, bound_start) {

@@ -23,9 +23,18 @@ impl OtelMapper {
         // backfill against actions that already landed in the cache.
         self.pump_compact_spawns();
 
+        // Clamp action timing before creating a synthetic target so its
+        // lifecycle can use the same child bounds.
+        let (clamped_start, clamped_end) = clamp_time_range(
+            ev.start_time_nanos,
+            ev.end_time_nanos,
+            self.root_span_start_nanos,
+            self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
+        );
+
         let parent = match ev.label {
             Some(label) => self
-                .target_parent_context(label, ev.start_time_nanos)
+                .target_parent_context(label, clamped_start)
                 .or_else(|| self.root_context.clone()),
             None => self.root_context.clone(),
         };
@@ -33,6 +42,10 @@ impl OtelMapper {
             warn!("ActionCompleted with no parent context");
             return;
         };
+
+        if let Some(label) = ev.label {
+            self.record_synthetic_target_end(label, clamped_end);
+        }
 
         // Track action for cached-target detection.
         if let Some(l) = ev.label {
@@ -45,15 +58,6 @@ impl OtelMapper {
         let span_name = build_action_span_name(ev);
         let attrs = build_action_attrs(ev, &self.configurations, &self.redactor);
         let status = action_status(ev.success);
-
-        // Clamp action timing to root span bounds so cached-action timestamps
-        // (which reflect original remote execution time) don't escape the build.
-        let (clamped_start, clamped_end) = clamp_time_range(
-            ev.start_time_nanos,
-            ev.end_time_nanos,
-            self.root_span_start_nanos,
-            self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
-        );
 
         let key = ActionSpanKey::new(ev.label, ev.mnemonic, ev.primary_output);
         let target_label = ev.label.map(str::to_string).unwrap_or_default();

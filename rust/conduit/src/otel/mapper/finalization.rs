@@ -90,20 +90,6 @@ pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
 }
 
 fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spawns: Vec<SpawnExec>) {
-    let parent = mapper
-        .target_contexts
-        .get(&key.target_label)
-        .cloned()
-        .or_else(|| mapper.root_context.clone());
-    let Some(parent) = parent else {
-        warn!(
-            label = %key.target_label,
-            mnemonic = %key.mnemonic,
-            "Cannot synthesise orphan action: no parent context (root span missing?)",
-        );
-        return;
-    };
-
     let (raw_start, raw_end) = spawns
         .iter()
         .filter_map(spawn_time_range)
@@ -114,6 +100,27 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
             )
         });
     let (clamped_start, clamped_end) = mapper.clamp_to_invocation(raw_start, raw_end);
+
+    let parent_label = spawns
+        .first()
+        .map(|spawn| spawn.target_label.clone())
+        .unwrap_or_else(|| key.target_label.clone());
+    let parent = if parent_label.is_empty() {
+        mapper.root_context.clone()
+    } else {
+        mapper
+            .target_parent_context(&parent_label, clamped_start)
+            .or_else(|| mapper.root_context.clone())
+    };
+    let Some(parent) = parent else {
+        warn!(
+            label = %key.target_label,
+            mnemonic = %key.mnemonic,
+            "Cannot synthesise orphan action: no parent context (root span missing?)",
+        );
+        return;
+    };
+    mapper.record_synthetic_target_end(&parent_label, clamped_end);
 
     let span_name = if key.mnemonic.is_empty() {
         format!("action {} (synth)", shorten_label(&key.target_label))

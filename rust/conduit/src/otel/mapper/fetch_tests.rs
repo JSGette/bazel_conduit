@@ -111,18 +111,6 @@ impl OtelMapper {
             return;
         }
 
-        let parent = self
-            .target_parent_context(ev.label, None)
-            .or_else(|| self.root_context.clone());
-        let Some(parent) = parent else {
-            warn!("TestResult with no parent context for {}", ev.label);
-            return;
-        };
-
-        let span_name = build_test_span_name(ev);
-        let attrs = build_test_attrs(ev);
-        let status = test_status(ev);
-
         let raw_end = match (ev.start_time_nanos, ev.duration_nanos) {
             (Some(start), Some(dur)) => Some(start + dur),
             _ => None,
@@ -130,6 +118,19 @@ impl OtelMapper {
         // Cached test results carry the original execution timestamps; clamp
         // so they don't escape the current invocation's window.
         let (start_nanos, end_nanos) = self.clamp_to_invocation(ev.start_time_nanos, raw_end);
+
+        let parent = self
+            .target_parent_context(ev.label, start_nanos)
+            .or_else(|| self.root_context.clone());
+        let Some(parent) = parent else {
+            warn!("TestResult with no parent context for {}", ev.label);
+            return;
+        };
+        self.record_synthetic_target_end(ev.label, end_nanos);
+
+        let span_name = build_test_span_name(ev);
+        let attrs = build_test_attrs(ev);
+        let status = test_status(ev);
 
         self.build_and_end_child_span(
             &parent,

@@ -245,6 +245,9 @@ pub struct OtelMapper {
     /// (action/test-driven, no observed TargetConfigured lifecycle).
     synthetic_target_labels: HashSet<String>,
 
+    /// Latest observed child end for each open synthetic target.
+    synthetic_target_end_nanos: HashMap<String, i64>,
+
     /// Targets whose lifecycle has reached a terminal event
     /// (`TargetCompleted` or skipped/aborted). Used to avoid recreating
     /// long-lived target contexts from late action/test events.
@@ -389,6 +392,7 @@ impl OtelMapper {
             configured_targets: HashMap::new(),
             target_contexts: HashMap::new(),
             synthetic_target_labels: HashSet::new(),
+            synthetic_target_end_nanos: HashMap::new(),
             closed_targets: HashSet::new(),
             fetches_context: None,
             skipped_context: None,
@@ -638,6 +642,7 @@ impl OtelMapper {
         }
         self.configured_targets.clear();
         self.synthetic_target_labels.clear();
+        self.synthetic_target_end_nanos.clear();
         self.closed_targets.clear();
         self.configurations.clear();
         self.cached_command = None;
@@ -707,6 +712,8 @@ impl OtelMapper {
 
     /// End all remaining spans (call after last BEP event).
     pub fn finish(&mut self) {
+        let effective_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
+
         // Drain the compact-log tailer's post-`close()` final chunk before
         // sealing any spans. zstd-jni's 128 KiB input buffer means the last
         // batch of spawns only hits disk when Bazel runs `close()` on the
@@ -728,7 +735,11 @@ impl OtelMapper {
         // End the `fetches` parent span.
         if let Some(cx) = self.fetches_context.take() {
             cx.span().set_status(Status::Ok);
-            cx.span().end();
+            if let Some(nanos) = effective_end {
+                cx.span().end_with_timestamp(nanos_to_system_time(nanos));
+            } else {
+                cx.span().end();
+            }
             debug!("Ended fetches span");
         }
 
@@ -737,8 +748,18 @@ impl OtelMapper {
         for label in labels {
             if let Some(cx) = self.target_contexts.remove(&label) {
                 cx.span().set_status(Status::Unset);
-                cx.span().end();
-                if self.synthetic_target_labels.remove(&label) {
+                let is_synthetic = self.synthetic_target_labels.remove(&label);
+                let target_end = if is_synthetic {
+                    self.synthetic_target_end_nanos.remove(&label).or(effective_end)
+                } else {
+                    effective_end
+                };
+                if let Some(nanos) = target_end {
+                    cx.span().end_with_timestamp(nanos_to_system_time(nanos));
+                } else {
+                    cx.span().end();
+                }
+                if is_synthetic {
                     debug!("Force-ended synthetic target span for {label}");
                 } else {
                     warn!("Force-ended orphaned target span for {label}");
@@ -755,14 +776,22 @@ impl OtelMapper {
         // End the `skipped targets` parent span.
         if let Some(cx) = self.skipped_context.take() {
             cx.span().set_status(Status::Unset);
-            cx.span().end();
+            if let Some(nanos) = effective_end {
+                cx.span().end_with_timestamp(nanos_to_system_time(nanos));
+            } else {
+                cx.span().end();
+            }
             debug!("Ended 'skipped targets' span");
         }
 
         // End the `external deps` parent span.
         if let Some(cx) = self.external_deps_context.take() {
             cx.span().set_status(Status::Ok);
-            cx.span().end();
+            if let Some(nanos) = effective_end {
+                cx.span().end_with_timestamp(nanos_to_system_time(nanos));
+            } else {
+                cx.span().end();
+            }
             debug!("Ended 'external deps' span");
         }
 
@@ -798,8 +827,7 @@ impl OtelMapper {
             };
             cx.span().set_status(status);
 
-            let end_nanos = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);
-            if let Some(nanos) = end_nanos {
+            if let Some(nanos) = effective_end {
                 cx.span().end_with_timestamp(nanos_to_system_time(nanos));
             } else {
                 cx.span().end();

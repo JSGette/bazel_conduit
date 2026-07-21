@@ -377,19 +377,17 @@ fn clamp_time_range_within_bounds_unchanged() {
 }
 
 #[test]
-fn clamp_time_range_cached_collapses_to_zero() {
-    // Both endpoints predate the invocation → cached replay, zero duration at bound_start.
+fn clamp_time_range_cached_preserves_duration_at_bound_start() {
     let (s, e) = clamp_time_range(Some(2), Some(8), Some(10), Some(20));
     assert_eq!(s, Some(10));
-    assert_eq!(e, Some(10));
+    assert_eq!(e, Some(16));
 }
 
 #[test]
 fn clamp_time_range_cached_end_equal_bound_start() {
-    // end exactly at bound_start still counts as fully-before.
     let (s, e) = clamp_time_range(Some(2), Some(10), Some(10), Some(20));
     assert_eq!(s, Some(10));
-    assert_eq!(e, Some(10));
+    assert_eq!(e, Some(18));
 }
 
 #[test]
@@ -834,6 +832,86 @@ fn late_spawn_before_finish_clears_missing() {
         Some("1"),
     );
     assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
+}
+
+#[test]
+fn cached_spawn_chain_is_nested_inside_root_window() {
+    let (mut mapper, collector) = mapper_with_collector();
+    let invocation_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    mapper.root_span_start_nanos = Some(invocation_start);
+    mapper.root_span_end_from_wall_nanos = Some(invocation_start + 2_000_000_000);
+    mapper.compact_streaming_active = true;
+
+    mapper.on_action_completed(&action_event_for(
+        "//pkg:cached",
+        "GoCompilePkg",
+        "bazel-out/cached.a",
+    ));
+    mapper.on_compact_spawn(spawn_exec_with_metrics(
+        "//pkg:cached",
+        "GoCompilePkg",
+        "bazel-out/cached.a",
+        "remote cache hit",
+        true,
+    ));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    let target = find_span(&spans, |s| s.name == "target //pkg:cached").expect("target span");
+    let action =
+        find_span(&spans, |s| s.name.starts_with("action GoCompilePkg")).expect("action span");
+    let spawn =
+        find_span(&spans, |s| s.name.starts_with("spawn GoCompilePkg")).expect("spawn span");
+
+    assert_eq!(target.parent_span_id, root.span_context.span_id());
+    assert_eq!(action.parent_span_id, target.span_context.span_id());
+    assert_eq!(spawn.parent_span_id, action.span_context.span_id());
+
+    assert!(root.start_time <= target.start_time);
+    assert!(target.start_time <= action.start_time);
+    assert!(action.start_time <= spawn.start_time);
+    assert!(spawn.end_time <= action.end_time);
+    assert!(action.end_time <= target.end_time);
+    assert!(target.end_time <= root.end_time);
+    assert_eq!(target.end_time, action.end_time);
+    assert!(action.start_time < action.end_time);
+    assert!(spawn.start_time < spawn.end_time);
+}
+
+#[test]
+fn instantaneous_action_does_not_stretch_synthetic_target_to_build_end() {
+    let (mut mapper, collector) = mapper_with_collector();
+    let invocation_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    mapper.root_span_start_nanos = Some(invocation_start);
+    mapper.root_span_end_from_wall_nanos = Some(invocation_start + 360_000_000_000);
+
+    let mut action = action_event_for(
+        "@@repo//pkg:cached",
+        "GoCompilePkg",
+        "bazel-out/cached.a",
+    );
+    action.end_time_nanos = action.start_time_nanos;
+    mapper.on_action_completed(&action);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let target = find_span(&spans, |s| s.name.contains("target repo//pkg:cached"))
+        .expect("synthetic target span");
+    let action =
+        find_span(&spans, |s| s.name.starts_with("action GoCompilePkg")).expect("action span");
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+
+    assert_eq!(target.start_time, target.end_time);
+    assert_eq!(target.start_time, action.start_time);
+    assert_eq!(target.end_time, action.end_time);
+    assert!(target.end_time < root.end_time);
 }
 
 /// Find a root-span event by name. Returns the event's attribute map as
