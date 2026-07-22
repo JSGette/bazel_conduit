@@ -179,7 +179,19 @@ impl OtelMapper {
             first = is_first,
             "Applied compact spawn to action span",
         );
-        crate::exec_log::emit_spawn_span(&self.tracer, &parent_info, &spawn, &self.redactor);
+        // The first spawn always backfills curated attrs onto the (retained)
+        // parent action above; the child spawn span itself is subject to the
+        // trace policy so lightweight traces keep only interesting spawns.
+        let (exit_code, cache_hit, cacheable, duration_ms) =
+            crate::exec_log::spawn_trace_signal(&spawn);
+        if self
+            .trace_policy
+            .should_emit_spawn(exit_code, cache_hit, cacheable, duration_ms)
+        {
+            crate::exec_log::emit_spawn_span(&self.tracer, &parent_info, &spawn, &self.redactor);
+        } else {
+            self.suppressed_spawns = self.suppressed_spawns.saturating_add(1);
+        }
     }
 
     fn push_pending_spawn(&mut self, spawn: SpawnExec) {

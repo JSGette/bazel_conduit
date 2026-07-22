@@ -451,6 +451,18 @@ fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
     attrs
 }
 
+/// Signals a [`TracePolicy`](crate::state::TracePolicy) needs to decide whether
+/// this spawn is worth a span: `(exit_code, cache_hit, cacheable, duration_ms)`.
+/// Duration comes from `SpawnMetrics.total_time` (wall + overhead).
+pub(crate) fn spawn_trace_signal(s: &SpawnExec) -> (i32, bool, bool, Option<i64>) {
+    let duration_ms = s
+        .metrics
+        .as_ref()
+        .and_then(|m| m.total_time.as_ref())
+        .map(|d| duration_to_ms_raw(d.seconds, d.nanos));
+    (s.exit_code, s.cache_hit, s.cacheable, duration_ms)
+}
+
 /// Extract (start_nanos, end_nanos) from SpawnMetrics.
 fn extract_timing(s: &SpawnExec) -> (Option<i64>, Option<i64>) {
     if let Some(ref m) = s.metrics {

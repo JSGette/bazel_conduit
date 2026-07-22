@@ -78,7 +78,7 @@ bazel.invocation (root)
 | `exec_log/tailer.rs` | Live tail-follows `--execution_log_compact_file`, decodes zstd, ships `SpawnExec`s to the mapper via mpsc |
 | `exec_log/compact.rs` | Incremental decoder state (dedup table + `SpawnExec` reconstruction) shared by tailer and tests |
 | `state/build_state.rs` | Build lifecycle tracking, action buffering, named set cache |
-| `state/action_mode.rs` | Lightweight vs full action processing mode detection |
+| `state/trace_profile.rs` | Trace emission policy: full vs lightweight, applied to actions, spawns, and targets |
 
 ## Usage
 
@@ -125,6 +125,8 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 | `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable) | built-in defaults |
 | `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_compact_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
 | `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
+| `--trace-profile <PROFILE>` | Trace verbosity: `auto`, `lightweight`, or `full`. See [Trace Profiles](#trace-profiles). | `auto` |
+| `--trace-min-duration-ms <MS>` | Minimum operation duration kept by the lightweight profile on runtime alone (errors and cache misses are kept regardless). | `500` |
 
 ### Secret Redaction
 
@@ -198,12 +200,52 @@ Equivalent functionality exists in the OpenTelemetry Collector's
 [`redactionprocessor`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/redactionprocessor)
 when traces transit a collector hop.
 
-### Action Processing Modes
+### Trace Profiles
 
-| Mode | Trigger | Behavior |
-|------|---------|----------|
-| **Lightweight** | Default (no flag) | Only failed actions create spans |
-| **Full** | `--build_event_publish_all_actions` | Every action gets a span with accurate start/end timestamps |
+A Bazel build emits one action/spawn per node in the build graph — tens of
+thousands of spans for a large build, almost all fast cache hits with little
+diagnostic value. The trace profile controls how much of that survives, at
+every emission point (BEP actions, exec-log spawns, orphan-synthesised
+actions, and empty targets):
+
+| Profile | Selected by | Behavior |
+|---------|-------------|----------|
+| **full** | `--trace-profile=full`, or `auto` + `--build_event_publish_all_actions` | Every action, spawn, and target gets a span. Verbose but complete. |
+| **lightweight** | `--trace-profile=lightweight`, or `auto` without the Bazel flag | Keeps only spans that carry signal: errors, cacheable cache **misses**, and operations at or above `--trace-min-duration-ms` (500 ms default). Successful fast cache hits are dropped. |
+| **auto** (default) | `--trace-profile=auto` | Follows Bazel's `--build_event_publish_all_actions`: present → full, absent → lightweight. Keeps existing setups working. |
+
+Regardless of profile, all aggregate `BuildMetrics` (cache hit/miss counts,
+per-mnemonic action counts, timings, artifact/memory metrics) stay on the
+root span, and the root → target → action → spawn hierarchy is preserved for
+whatever is retained. The root span also carries
+`bazel.trace.suppressed_{actions,spawns,targets}` so you can see how much the
+lightweight profile trimmed on any given invocation.
+
+Crucially, the lightweight profile also gates the compact execution log:
+before this, "lightweight" only dropped BEP action spans while the exec-log
+pipeline resurrected a synthetic action + spawn tree for every successful
+spawn, so traces stayed enormous. Lightweight now filters spawns at every
+exec-log choke point.
+
+**Reducing volume further (backend side).** Source-side filtering is the
+primary lever; layer sampling/retention on top if needed:
+
+- **Head-based sampling** at the SDK/agent — e.g.
+  `DD_TRACE_SAMPLING_RULES='[{"service":"bazel","sample_rate":0.1}]'` keeps a
+  representative fraction of full traces.
+- **Agent caps** — `DD_APM_TARGET_TPS`, `DD_APM_MAX_TPS`, and
+  `DD_APM_FILTER_TAGS_REJECT` bound or drop trace volume the agent forwards.
+- **Span-generated metrics** for dashboard widgets (cache-hit rates, duration
+  percentiles) give long retention on the numbers that matter while allowing
+  aggressive span sampling.
+- **Retention filters** reduce *indexed* storage (only errors, slow
+  invocations, cache misses), not ingestion — use them to control storage
+  cost after ingestion is already trimmed.
+
+Suggested rollout: run `auto` (or `lightweight`) and compare
+`bazel.trace.suppressed_*` against total spans, make lightweight the
+operational default, switch to `full` temporarily for deep debugging, then
+apply 10–25% head sampling if volume is still high.
 
 ### Execution Log Enrichment (live tailed)
 
@@ -292,9 +334,9 @@ Datadog also uses **temporal containment** for flame graph nesting: a child span
 
 The `start_time` / `start_time_millis` in `BuildStarted` can hold the **Bazel server start time** (potentially weeks old on long-lived daemons), not the current invocation start. Conduit prefers the BES-level `event_time` (when the event was actually emitted) as a more reliable fallback for root span start time in gRPC mode.
 
-### Lesson 4: Timestamp Validation Is Essential
+### Lesson 4: Cached Timestamps Must Be Clamped to the Invocation Window
 
-Bazel sometimes sends `start_time_nanos = 0` on action spans with `end_time_nanos` set to a duration value rather than an absolute timestamp. Without validation, this produces spans starting at Unix epoch (1970) with multi-day durations. Conduit rejects timestamps below a `MIN_ABSOLUTE_NANOS` threshold (~year 2001) to catch these.
+Bazel replays the *original* execution timestamps on cached `ActionExecuted` events (and propagates them to target metadata), so a build that replays a weeks-old cache can produce spans whose `start_time` predates the invocation by days. Conduit clamps every BEP-supplied `(start, end)` to the root span's window via `clamp_time_range` (`rust/conduit/src/otel/mapper/utils.rs`); a range that lies entirely before the invocation collapses to zero duration at the build start. The root span itself falls back to wall clock when `BuildStarted` drifts more than 5 minutes from now (stale long-lived daemon).
 
 ### Lesson 5: BatchSpanProcessor Can Silently Drop Spans
 
@@ -357,7 +399,7 @@ All OTel span attributes follow the `bazel.<component>.<field>` naming conventio
 1. **No distributed / remote build support**: Conduit is a local sidecar. It does not support remote BES endpoints or multi-machine builds.
 2. **No phase spans**: Loading, analysis, and execution phases are not modeled as separate spans (metrics for these are captured as attributes on the root span via `BuildMetrics`).
 3. **No span links / DAG representation**: BEP's DAG structure (secondary parents) is not represented as OTel span links. All relationships are parent-child.
-4. **No sampling policies**: All qualifying events produce spans. There is no configurable top-N-slowest or probabilistic sampling.
+4. **No conduit-side probabilistic sampling**: The `lightweight` profile drops uninteresting spans deterministically (errors, cache misses, and slow work are always kept), but there is no top-N-slowest or percentage sampling inside conduit — layer head-based sampling / retention filters at the SDK, agent, or backend. See [Trace Profiles](#trace-profiles).
 5. **Single invocation at a time**: The gRPC server processes one build stream at a time (sequential invocations via `Arc<Mutex<EventRouter>>`).
 6. **Exec log streaming is best-effort, not "live per spawn"**: Bazel flushes the compact log every ~128 KiB of uncompressed input (200–600 spawns on big builds), and the final &lt;128 KiB is only visible after `close()` at `BuildCompleteEvent`. Spawn enrichment lands on action spans in those chunk-sized bursts, with a final post-`close()` drain at `finish()`.
 7. **`TestProgress` and `ExecRequest` are no-ops**: These event types are received but not mapped to any OTel construct.
@@ -386,7 +428,7 @@ bazel_conduit/
 │   │   ├── grpc/                 # BES gRPC server
 │   │   ├── exec_log/             # Compact exec log live-tail + enrichment
 │   │   └── state/                # Build state tracking
-│   └── tests/                    # Unit tests (decoder, action_mode, router)
+│   └── tests/                    # Unit tests (decoder, trace profile, router)
 ├── integration/                  # Integration tests + full scenario script
 ├── toolchain/                    # Prost toolchain config
 └── docs/                         # Additional documentation

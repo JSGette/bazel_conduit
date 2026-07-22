@@ -8,6 +8,7 @@ use conduit_lib::otel::{
     init_logger_provider, init_tracer_provider, ExportConfig, Redactor,
     DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
 };
+use conduit_lib::state::{TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};
 use opentelemetry::logs::LoggerProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use std::fs::File;
@@ -87,6 +88,23 @@ struct Args {
     /// (2 GiB) is ~4x the largest realistic decompressed compact log.
     #[arg(long, value_name = "MIB", default_value_t = 2048)]
     exec_log_max_decompressed_mib: u32,
+
+    /// Trace verbosity: `auto`, `lightweight`, or `full`.
+    ///
+    /// `full` emits a span per action/spawn/target (verbose, complete).
+    /// `lightweight` keeps only errors, cache misses, and operations at or
+    /// above `--trace-min-duration-ms`, while aggregate metrics stay on the
+    /// root span -- a large ingestion cut with full diagnostics for slow/failed
+    /// builds. `auto` (default) follows Bazel's
+    /// `--build_event_publish_all_actions`: present -> full, absent ->
+    /// lightweight.
+    #[arg(long, default_value = "auto")]
+    trace_profile: String,
+
+    /// Minimum operation duration (ms) kept by the lightweight profile on
+    /// runtime alone. Errors and cache misses are kept regardless.
+    #[arg(long, default_value_t = DEFAULT_TRACE_MIN_DURATION_MS)]
+    trace_min_duration_ms: i64,
 }
 
 impl Args {
@@ -158,10 +176,23 @@ async fn main() -> anyhow::Result<()> {
         args.exec_log_max_message_mib, args.exec_log_max_decompressed_mib
     );
 
+    let trace_profile = TraceProfile::parse(&args.trace_profile).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --trace-profile '{}' (expected auto, lightweight, or full)",
+            args.trace_profile
+        )
+    })?;
+    info!(
+        "Trace profile: {} (lightweight threshold: {} ms)",
+        trace_profile.as_str(),
+        args.trace_min_duration_ms
+    );
+
     let mut router = EventRouter::new()
         .with_redactor(redactor)
         .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
-        .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes);
+        .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
+        .with_trace_profile(trace_profile, args.trace_min_duration_ms);
     if let (Some(tp), Some(lp)) = (&tracer_provider, &logger_provider) {
         router = router.with_export(tp.tracer("conduit"), lp.logger("conduit"));
     }

@@ -25,10 +25,14 @@
 //!     and is attached to the root span as a single `build.log` event in
 //!     `finish`.
 //!
-//! Action processing modes:
-//!   - lightweight (default): only failed actions create spans
-//!   - full (--build_event_publish_all_actions): every action gets a span
-//!     with accurate start_time / end_time from the ActionExecuted event
+//! Trace profiles (see [`crate::state::TracePolicy`]):
+//!   - full: every action / spawn / target gets a span.
+//!   - lightweight: only spans that carry signal survive -- errors, cacheable
+//!     cache misses, and operations at or above the duration threshold. This
+//!     is enforced at every choke point (BEP actions in the router, matched
+//!     spawns in [`Self::apply_spawn_to_action`], orphan synthesis, and empty
+//!     targets), so the compact exec log can't resurrect the dropped tree.
+//!     Aggregate `BuildMetrics` stay on the root span regardless.
 //! ```
 
 use std::borrow::Cow;
@@ -366,6 +370,19 @@ pub struct OtelMapper {
     /// without grep'ing conduit's logs.
     compact_spawns_received: u64,
 
+    /// Resolved trace emission policy. Consulted at every span choke point
+    /// (BEP actions in the router, spawns in [`Self::apply_spawn_to_action`],
+    /// orphan synthesis, and target completion) so a lightweight profile
+    /// actually stays lightweight. Defaults to permissive (`Full`) until the
+    /// router resolves it from CLI + Bazel options at `OptionsParsed`.
+    trace_policy: crate::state::TracePolicy,
+
+    /// Spans dropped by the lightweight profile, surfaced on the root span at
+    /// [`Self::finish`] so operators can see how much volume was cut.
+    suppressed_actions: u64,
+    suppressed_spawns: u64,
+    suppressed_targets: u64,
+
     /// Scrubs sensitive values out of command-line attributes before they
     /// hit the exporter. See [`crate::otel::redact`].
     redactor: Redactor,
@@ -422,6 +439,10 @@ impl OtelMapper {
             pending_spawns: HashMap::new(),
             compact_spawns_received: 0,
             workspace_directory: None,
+            trace_policy: crate::state::TracePolicy::default(),
+            suppressed_actions: 0,
+            suppressed_spawns: 0,
+            suppressed_targets: 0,
             redactor: Redactor::default_enabled(),
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
             exec_log_max_decompressed_bytes:
@@ -670,6 +691,38 @@ impl OtelMapper {
         self.pending_spawns.clear();
         self.compact_spawns_received = 0;
         self.workspace_directory = None;
+        self.trace_policy = crate::state::TracePolicy::default();
+        self.suppressed_actions = 0;
+        self.suppressed_spawns = 0;
+        self.suppressed_targets = 0;
+    }
+
+    /// Record the resolved trace policy and mirror it onto the root span. The
+    /// legacy `bazel.action_mode` attribute is kept for dashboards that still
+    /// key off it.
+    pub fn set_trace_policy(&mut self, policy: crate::state::TracePolicy) {
+        self.trace_policy = policy;
+        self.set_root_attr(KeyValue::new(
+            BAZEL_TRACE_PROFILE,
+            policy.profile().as_str(),
+        ));
+        self.set_root_attr(KeyValue::new(
+            BAZEL_TRACE_MIN_DURATION_MS,
+            policy.min_duration_ms(),
+        ));
+        let legacy = if policy.is_full() {
+            "full (all actions)"
+        } else {
+            "lightweight (failed actions only)"
+        };
+        self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, legacy));
+    }
+
+    /// A BEP action span was dropped by the lightweight profile (counted for
+    /// the root-span summary). Called from the router, which owns the BEP
+    /// action gate.
+    pub fn note_suppressed_action(&mut self) {
+        self.suppressed_actions = self.suppressed_actions.saturating_add(1);
     }
 
     // =====================================================================
@@ -818,6 +871,21 @@ impl OtelMapper {
                 }
             }
         }
+
+        // Surface how much the lightweight profile trimmed (always set, even
+        // when zero, so dashboards can rely on the attribute existing).
+        self.set_root_attr(KeyValue::new(
+            BAZEL_TRACE_SUPPRESSED_ACTIONS,
+            self.suppressed_actions as i64,
+        ));
+        self.set_root_attr(KeyValue::new(
+            BAZEL_TRACE_SUPPRESSED_SPAWNS,
+            self.suppressed_spawns as i64,
+        ));
+        self.set_root_attr(KeyValue::new(
+            BAZEL_TRACE_SUPPRESSED_TARGETS,
+            self.suppressed_targets as i64,
+        ));
 
         // End root span with proper status + timestamp.
         if let Some(cx) = self.root_context.take() {

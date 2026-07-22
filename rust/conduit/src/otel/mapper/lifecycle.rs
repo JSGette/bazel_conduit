@@ -169,11 +169,6 @@ impl OtelMapper {
         }
     }
 
-    /// ActionMode -> record the detected processing mode on the root span.
-    pub fn on_action_mode(&mut self, mode: crate::state::ActionProcessingMode) {
-        self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
-    }
-
     /// Compact-exec-log path detected (typically from BEP `OptionsParsed`).
     /// Spawns the tail-follow worker; arriving [`SpawnExec`] entries are
     /// drained at every BEP-event boundary via [`Self::pump_compact_spawns`].

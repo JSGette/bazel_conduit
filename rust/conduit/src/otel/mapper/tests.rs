@@ -2,6 +2,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
 use super::*;
+use crate::state::{TracePolicy, TraceProfile};
 
 // ---- Helper function tests ----
 
@@ -1001,5 +1002,159 @@ fn exec_log_emits_skipped_event_when_workspace_missing() {
     assert!(
         root_event(&spans, "bazel.exec_log.tailer_finished").is_none(),
         "tailer_finished must not appear when the tailer was skipped",
+    );
+}
+
+// =====================================================================
+// Trace profile: lightweight suppression.
+//
+// These assert the fix for the compact-log bypass -- lightweight must
+// stop resurrecting the successful cache-hit action/spawn tree -- while
+// keeping errors, cache misses, and slow work. The default policy is
+// Full, so all the tests above still exercise the complete hierarchy.
+// =====================================================================
+
+fn lightweight(mapper: &mut OtelMapper) {
+    mapper.set_trace_policy(TracePolicy::resolve(TraceProfile::Lightweight, 500, false));
+}
+
+/// A successful, fast, cache-hit orphan spawn is dropped: no synthetic
+/// action, no spawn span, and the drop is counted on the root span.
+#[test]
+fn lightweight_drops_orphan_cache_hit_spawn() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    lightweight(&mut mapper);
+
+    mapper.on_compact_spawn(spawn_exec_with_metrics(
+        "//pkg:orphan",
+        "JavaCompile",
+        "bazel-out/orphan.jar",
+        "remote cache hit",
+        true,
+    ));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert!(
+        find_span(&spans, |s| s.name.contains("(synth)")).is_none(),
+        "no synthetic action for a dropped orphan spawn",
+    );
+    assert!(
+        !spans.iter().any(|s| s.name.starts_with("spawn JavaCompile")),
+        "no child spawn span",
+    );
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_SPAWNS).as_deref(),
+        Some("1"),
+    );
+}
+
+/// A failing orphan spawn survives lightweight: the synthetic parent
+/// action and its child spawn are both emitted.
+#[test]
+fn lightweight_keeps_failed_orphan_spawn() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    lightweight(&mut mapper);
+
+    let mut spawn =
+        spawn_exec_with_metrics("//pkg:boom", "CppCompile", "bazel-out/boom.o", "local", false);
+    spawn.exit_code = 1;
+    spawn.status = "NON_ZERO_EXIT".to_string();
+    mapper.on_compact_spawn(spawn);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert!(
+        find_span(&spans, |s| s.name.contains("CppCompile") && s.name.contains("(synth)"))
+            .is_some(),
+        "failing orphan spawn keeps its synthetic parent action",
+    );
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|s| s.name.starts_with("spawn CppCompile"))
+            .count(),
+        1,
+    );
+}
+
+/// A matched spawn under a (retained) action still backfills action-level
+/// attrs, but a fast cache-hit child spawn span is dropped in lightweight.
+#[test]
+fn lightweight_drops_matched_cache_hit_child_spawn() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    lightweight(&mut mapper);
+
+    mapper.on_action_completed(&action_event_for(
+        "//pkg:foo",
+        "CppCompile",
+        "bazel-out/foo.o",
+    ));
+    mapper.on_compact_spawn(spawn_exec_with_metrics(
+        "//pkg:foo",
+        "CppCompile",
+        "bazel-out/foo.o",
+        "remote cache hit",
+        true,
+    ));
+    mapper.end_open_actions_for_target("//pkg:foo", Some(2_000_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let action = find_span(&spans, |s| s.name.starts_with("action CppCompile"))
+        .expect("action span still emitted");
+    // Backfill still happened from the (only) spawn.
+    assert_eq!(
+        attr_value(&action, BAZEL_ACTION_SPAWN_CACHE_HIT).as_deref(),
+        Some("true"),
+    );
+    // But the child spawn span itself was suppressed.
+    assert!(
+        !spans.iter().any(|s| s.name.starts_with("spawn CppCompile")),
+        "fast cache-hit child spawn dropped in lightweight",
+    );
+}
+
+/// An empty successful target (no retained child span) is dropped in
+/// lightweight and counted on the root span.
+#[test]
+fn lightweight_suppresses_empty_successful_target() {
+    let (mut mapper, collector) = mapper_with_collector();
+    lightweight(&mut mapper);
+
+    mapper.on_target_configured("//pkg:lib", Some("rust_library"), &[], Some(1_000_000_000), None);
+    mapper.on_target_completed("//pkg:lib", true, &[], &[], Some(1_500_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert!(
+        find_span(&spans, |s| s.name == "target //pkg:lib").is_none(),
+        "empty successful target dropped in lightweight",
+    );
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(),
+        Some("1"),
+    );
+}
+
+/// A failed target always survives, even with no child spans.
+#[test]
+fn lightweight_keeps_failed_target() {
+    let (mut mapper, collector) = mapper_with_collector();
+    lightweight(&mut mapper);
+
+    mapper.on_target_configured("//pkg:lib", Some("rust_library"), &[], Some(1_000_000_000), None);
+    mapper.on_target_completed("//pkg:lib", false, &[], &[], Some(1_500_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert!(
+        find_span(&spans, |s| s.name == "target //pkg:lib").is_some(),
+        "failed target kept in lightweight",
     );
 }

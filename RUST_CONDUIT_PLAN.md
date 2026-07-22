@@ -1,6 +1,6 @@
 ---
 name: BEP-to-OTEL Rust MVP
-overview: "Implement a Rust BEP-to-OpenTelemetry converter as a Bazelisk extension. Accepts JSON file or gRPC connection for BEP events. Lightweight processing only (failed actions) in MVP. Phases: Bazel/Rust setup, Analysis, Mapper, Datadog Exporter."
+overview: "Implement a Rust BEP-to-OpenTelemetry converter as a Bazelisk extension. Accepts JSON file or gRPC connection for BEP events. Trace profiles (full / lightweight / auto) govern emission. Phases: Bazel/Rust setup, Analysis, Mapper, Datadog Exporter."
 todos:
   - id: phase0-rules-rust
     content: Add rules_rust and crate_universe to MODULE.bazel
@@ -105,29 +105,19 @@ The conduit runs as a **local sidecar** started by bazelisk, not a centralized s
 
 ---
 
-## Scope: Lightweight Processing Only
+## Scope: Trace Profiles (implemented)
 
-When `--build_event_publish_all_actions` is detected in `OptionsParsed`:
+Emission is governed by `TracePolicy` (`rust/conduit/src/state/trace_profile.rs`), resolved per invocation from the CLI `--trace-profile` and, in `auto`, from `--build_event_publish_all_actions`:
 
 ```rust
-pub enum ActionProcessingMode {
-    Lightweight,  // MVP: Only failed actions create spans
-    Full,         // Stub: unimplemented!()
-}
+pub enum TraceProfile { Auto, Lightweight, Full }
 
-fn handle_action(&self, action: &ActionExecuted) -> Result<()> {
-    match self.mode {
-        ActionProcessingMode::Lightweight if !action.success => {
-            self.create_action_span(action)
-        }
-        ActionProcessingMode::Lightweight => Ok(()),  // Skip successful
-        ActionProcessingMode::Full => {
-            tracing::warn!("Full action processing not yet implemented");
-            unimplemented!("Full action span processing")
-        }
-    }
-}
+// full        -> every action / spawn / target span
+// lightweight -> errors, cacheable cache misses, and ops >= --trace-min-duration-ms
+// auto         -> publish_all_actions ? Full : Lightweight
 ```
+
+The policy is enforced at every choke point (BEP actions, matched spawns, orphan synthesis, empty targets), not just BEP actions — so lightweight also gates the compact execution log instead of letting it resurrect the full spawn tree. Aggregate `BuildMetrics` always stay on the root span.
 
 ---
 
@@ -438,7 +428,7 @@ bazel_conduit/
             ├── state/        # Phase 1
             │   ├── mod.rs
             │   ├── build_state.rs
-            │   └── action_mode.rs
+            │   └── trace_profile.rs
             ├── otel/         # Phase 2
             │   ├── mod.rs
             │   ├── trace_context.rs
@@ -463,10 +453,13 @@ bazel_conduit/
 conduit [OPTIONS]
 
 Options:
-  --input <FILE>          Read BEP from JSON file
-  --grpc-port <PORT>      Start BES gRPC server [default: 8080]
-  --dd-agent <ENDPOINT>   Datadog Agent endpoint [default: localhost:4317]
-  --log-level <LEVEL>     Log level [default: info]
+  --input <FILE>              Read BEP from an NDJSON file
+  --serve --port <PORT>       Start BES gRPC server [default: 8080]
+  --export <MODE>             none | stdout | otlp [default: none]
+  --otlp-endpoint <URL>       OTLP endpoint [default: http://localhost:4317]
+  --trace-profile <PROFILE>   auto | lightweight | full [default: auto]
+  --trace-min-duration-ms <MS>  Lightweight duration threshold [default: 500]
+  --log-level <LEVEL>         Log level [default: info]
 ```
 
 ---
@@ -477,14 +470,16 @@ Options:
 
 |---------|--------|
 
-| Full action processing | `unimplemented!()` |
+| Full action processing | Implemented (`--trace-profile full`) |
+
+| Lightweight profile (spawn-aware) | Implemented (`--trace-profile lightweight`) |
 
 | Phase spans | Deferred |
 
 | Span links (DAG) | Deferred |
 
-| Test events | Deferred |
+| Test events | Implemented |
 
-| Sampling policies | Deferred |
+| Probabilistic / top-N sampling | Deferred (use SDK/agent/backend) |
 
 | JSON exporter | Deferred (Datadog first) |

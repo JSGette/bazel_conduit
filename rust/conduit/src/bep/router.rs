@@ -22,7 +22,7 @@ use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
 use crate::otel::{ActionCompletedEvent, OtelMapper, Redactor, TestResultEvent};
-use crate::state::{ActionProcessingMode, BuildState};
+use crate::state::{BuildState, TracePolicy, TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
@@ -140,6 +140,11 @@ pub struct EventRouter {
     redactor: Redactor,
     exec_log_max_message_bytes: usize,
     exec_log_max_decompressed_bytes: usize,
+    /// Trace profile requested on the CLI. `Auto` (default) resolves against
+    /// Bazel's `--build_event_publish_all_actions` at `OptionsParsed`.
+    requested_profile: TraceProfile,
+    /// Minimum operation duration (ms) kept by the lightweight profile.
+    trace_min_duration_ms: i64,
 }
 
 impl EventRouter {
@@ -152,7 +157,18 @@ impl EventRouter {
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
             exec_log_max_decompressed_bytes:
                 crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
+            requested_profile: TraceProfile::default(),
+            trace_min_duration_ms: DEFAULT_TRACE_MIN_DURATION_MS,
         }
+    }
+
+    /// Set the requested trace profile and lightweight duration threshold.
+    /// Resolution against the Bazel flag happens per-invocation at
+    /// `OptionsParsed`.
+    pub fn with_trace_profile(mut self, profile: TraceProfile, min_duration_ms: i64) -> Self {
+        self.requested_profile = profile;
+        self.trace_min_duration_ms = min_duration_ms;
+        self
     }
 
     /// Attach OTel export. The router holds [`Tracer`]/[`Logger`] clones for
@@ -308,13 +324,14 @@ impl EventRouter {
             .map(String::as_str)
             .collect();
         let has_all_actions = has_publish_all_actions_flag(&all_options);
-        self.state.set_action_mode(if has_all_actions {
-            ActionProcessingMode::Full
-        } else {
-            ActionProcessingMode::Lightweight
-        });
+        let policy = TracePolicy::resolve(
+            self.requested_profile,
+            self.trace_min_duration_ms,
+            has_all_actions,
+        );
+        self.state.set_trace_policy(policy);
         if let Some(mapper) = &mut self.mapper {
-            mapper.on_action_mode(self.state.action_mode());
+            mapper.set_trace_policy(policy);
         }
 
         if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
@@ -334,11 +351,20 @@ impl EventRouter {
     }
 
     fn apply_action_completed_event(&mut self, args: ActionCompletedArgs) {
+        let duration_ms = match (args.start_time_nanos, args.end_time_nanos) {
+            (Some(start), Some(end)) if end >= start => Some((end - start) / 1_000_000),
+            _ => None,
+        };
+        // BEP `ActionCompleted` carries no cache flag, so cache-miss retention
+        // is driven by the spawn-level policy; here it's error-or-slow.
         let should_process = self
             .state
-            .action_mode()
-            .should_create_span(args.success);
+            .trace_policy()
+            .should_emit_action(args.success, None, duration_ms);
         if !should_process {
+            if let Some(mapper) = &mut self.mapper {
+                mapper.note_suppressed_action();
+            }
             return;
         }
 

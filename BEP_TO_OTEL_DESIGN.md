@@ -100,24 +100,31 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 | Test failed | `ERROR` |
 | Action exit_code != 0 | `ERROR` |
 
-## Sampling Policy
+## Trace Profile (emission policy)
 
-| Span Type | Policy |
-|-----------|--------|
-| Target spans | Always |
-| Action spans | Failed + top N slowest |
-| Test attempts | Only on failure |
-| Progress | Never |
+Emission is governed by a single `TracePolicy` (`rust/conduit/src/state/trace_profile.rs`) applied at every span choke point:
+
+| Profile | Behavior |
+|---------|----------|
+| `full` | Every action / spawn / target span. |
+| `lightweight` | Only signal-bearing spans: errors, cacheable cache misses, and operations at or above `--trace-min-duration-ms`. Aggregate metrics stay on the root span. |
+| `auto` (default) | Follows Bazel `--build_event_publish_all_actions`: present → full, absent → lightweight. |
+
+Fetch/test spans are always emitted; `Progress` becomes correlated log records, never spans.
 
 ## CLI Flags
 
+See the [README CLI Flags table](README.md#cli-flags) for the authoritative list. The trace-relevant ones:
+
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--input` | BEP input (file or `-` for stdin) | - |
-| `--grpc-port` | BES gRPC server port | 8080 |
-| `--otel-endpoint` | OTLP endpoint | localhost:4317 |
-| `--actions` | Action sampling: `none`, `failed`, `all` | `failed` |
-| `--log-level` | Log verbosity | `info` |
+| `--input <FILE>` | Read BEP from an NDJSON file | - |
+| `--serve` / `--port <PORT>` | Start BES gRPC server / its port | 8080 |
+| `--export <MODE>` | `none`, `stdout`, `otlp` | `none` |
+| `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
+| `--trace-profile <PROFILE>` | `auto`, `lightweight`, `full` | `auto` |
+| `--trace-min-duration-ms <MS>` | Lightweight duration threshold | `500` |
+| `--log-level <LEVEL>` | Log verbosity | `info` |
 
 ## Minimal MVP
 

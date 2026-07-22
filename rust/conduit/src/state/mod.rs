@@ -3,8 +3,8 @@
 
 //! Build state tracking
 
-mod action_mode;
 mod build_state;
+mod trace_profile;
 
-pub use action_mode::ActionProcessingMode;
 pub use build_state::BuildState;
+pub use trace_profile::{TracePolicy, TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};

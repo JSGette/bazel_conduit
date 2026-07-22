@@ -93,6 +93,30 @@ pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
 }
 
 fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spawns: Vec<SpawnExec>) {
+    // Apply the trace policy first: drop uninteresting spawns and, when none
+    // survive, skip the whole group. This is the fix for the lightweight
+    // bypass -- otherwise the compact log resurrects a synthetic action +
+    // spawn tree for every successful cache hit whose ActionExecuted never
+    // reached BEP. Dropped spawns are counted for the root-span summary.
+    let total = spawns.len();
+    let spawns: Vec<SpawnExec> = spawns
+        .into_iter()
+        .filter(|s| {
+            let (exit_code, cache_hit, cacheable, duration_ms) =
+                crate::exec_log::spawn_trace_signal(s);
+            mapper
+                .trace_policy
+                .should_emit_spawn(exit_code, cache_hit, cacheable, duration_ms)
+        })
+        .collect();
+    let dropped = total - spawns.len();
+    if dropped > 0 {
+        mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(dropped as u64);
+    }
+    if spawns.is_empty() {
+        return;
+    }
+
     let (raw_start, raw_end) = spawns
         .iter()
         .filter_map(spawn_time_range)

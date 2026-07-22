@@ -5,7 +5,7 @@
 //!
 //! Maintains state throughout a build invocation.
 
-use super::ActionProcessingMode;
+use super::{TracePolicy, TraceProfile};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -44,7 +44,7 @@ pub struct BuildState {
 
     // Options
     startup_options: Vec<String>,
-    action_mode: ActionProcessingMode,
+    trace_policy: TracePolicy,
 
     // Workspace
     workspace_status: HashMap<String, String>,
@@ -78,7 +78,7 @@ impl BuildState {
             exit_code: None,
             finished: false,
             startup_options: Vec::new(),
-            action_mode: ActionProcessingMode::default(),
+            trace_policy: TracePolicy::default(),
             workspace_status: HashMap::new(),
             patterns: Vec::new(),
             targets: HashMap::new(),
@@ -161,12 +161,12 @@ impl BuildState {
         &self.startup_options
     }
 
-    pub fn set_action_mode(&mut self, mode: ActionProcessingMode) {
-        self.action_mode = mode;
+    pub fn set_trace_policy(&mut self, policy: TracePolicy) {
+        self.trace_policy = policy;
     }
 
-    pub fn action_mode(&self) -> ActionProcessingMode {
-        self.action_mode
+    pub fn trace_policy(&self) -> TracePolicy {
+        self.trace_policy
     }
 
     pub fn set_exec_log_path(&mut self, path: Option<PathBuf>) {
@@ -322,7 +322,7 @@ impl BuildState {
             failed_targets,
             total_actions: self.actions.len(),
             failed_actions,
-            action_mode: self.action_mode,
+            trace_profile: self.trace_policy.profile(),
         }
     }
 
@@ -336,7 +336,7 @@ impl BuildState {
         self.exit_code = None;
         self.finished = false;
         self.startup_options.clear();
-        self.action_mode = ActionProcessingMode::default();
+        self.trace_policy = TracePolicy::default();
         self.workspace_status.clear();
         self.patterns.clear();
         self.targets.clear();
@@ -364,7 +364,7 @@ pub struct BuildSummary {
     pub failed_targets: usize,
     pub total_actions: usize,
     pub failed_actions: usize,
-    pub action_mode: ActionProcessingMode,
+    pub trace_profile: TraceProfile,
 }
 
 impl std::fmt::Display for BuildSummary {
@@ -383,7 +383,7 @@ impl std::fmt::Display for BuildSummary {
             self.total_targets, self.successful_targets, self.failed_targets)?;
         writeln!(f, "  Actions: {} total, {} failed",
             self.total_actions, self.failed_actions)?;
-        writeln!(f, "  Action Mode: {}", self.action_mode)?;
+        writeln!(f, "  Trace Profile: {}", self.trace_profile.as_str())?;
         Ok(())
     }
 }

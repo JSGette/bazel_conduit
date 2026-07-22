@@ -231,6 +231,23 @@ impl OtelMapper {
         // was already created lazily from an action/test event.
         let configured = self.configured_targets.remove(label);
 
+        // Lightweight profile: a successful target whose span was never opened
+        // by a retained child (failed/slow/miss action or a test) carries no
+        // diagnostic signal, so drop it. `target_contexts` only holds a target
+        // once a retained child lazily created it, so its presence is our
+        // "has an interesting child" test. Failed targets always survive.
+        if success
+            && !self.trace_policy.is_full()
+            && !self.target_contexts.contains_key(label)
+        {
+            self.synthetic_target_labels.remove(label);
+            self.synthetic_target_end_nanos.remove(label);
+            self.closed_targets.insert(label.to_string());
+            self.suppressed_targets = self.suppressed_targets.saturating_add(1);
+            debug!("Suppressed empty successful target span for {label} (lightweight)");
+            return;
+        }
+
         // Get or create the span under the appropriate parent.
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
             cx
