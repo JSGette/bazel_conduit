@@ -299,6 +299,7 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "skipped targets",
+            self.root_span_start_nanos,
         );
 
         let Some(parent) = &self.skipped_context else {

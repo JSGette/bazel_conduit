@@ -67,7 +67,8 @@ use self::action_attrs::{action_status, build_action_attrs, build_action_span_na
 use self::test_attrs::{build_test_attrs, build_test_span_name, test_status};
 use self::utils::{
     append_progress_capped, bytestream_uri_to_display, detect_workspace_name, nanos_to_system_time,
-    normalize_label, spawn_time_range, strip_ansi, COMMAND_LINE_CAP_BYTES, PROGRESS_CAP_BYTES,
+    normalize_label, spawn_time_range, strip_ansi, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
+    PROGRESS_CAP_BYTES,
 };
 #[cfg(test)]
 use self::utils::tail_byte_offset;
@@ -198,6 +199,7 @@ impl ActionSpanKey {
 /// parent span.  If an action arrives before the target completes, the
 /// target span is lazily created under root (see
 /// [`OtelMapper::ensure_target_span`]).
+#[derive(Clone)]
 struct ConfiguredTarget {
     kind: Option<String>,
     tags: Vec<String>,
@@ -254,6 +256,11 @@ pub struct OtelMapper {
 
     /// Latest observed child end for each open synthetic target.
     synthetic_target_end_nanos: HashMap<String, i64>,
+
+    /// Start timestamp of each target span (real or synthetic), keyed by
+    /// normalized label. Used to keep child action/spawn spans from starting
+    /// before the parent target they hang under (Datadog containment).
+    target_start_nanos: HashMap<String, i64>,
 
     /// Targets whose lifecycle has reached a terminal event
     /// (`TargetCompleted` or skipped/aborted). Used to avoid recreating
@@ -413,6 +420,7 @@ impl OtelMapper {
             target_contexts: HashMap::new(),
             synthetic_target_labels: HashSet::new(),
             synthetic_target_end_nanos: HashMap::new(),
+            target_start_nanos: HashMap::new(),
             closed_targets: HashSet::new(),
             fetches_context: None,
             skipped_context: None,
@@ -500,8 +508,44 @@ impl OtelMapper {
             start,
             end,
             self.root_span_start_nanos,
-            self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
+            // Until the build finishes we don't know the root end. Cache hits
+            // can carry timestamps outside this invocation's window; fall back
+            // to wall-clock now as an upper bound since nothing can end in the
+            // future.
+            self.root_span_end_from_wall_nanos
+                .or(self.finish_time_nanos)
+                .or_else(wall_clock_now_nanos),
         )
+    }
+
+    /// Remember a target span's start so late children can be kept inside it.
+    /// Overwrites: the value tracks the currently-open span for `label` (a
+    /// synthetic span may be recreated after the original target closed).
+    pub(super) fn record_target_start(&mut self, label: &str, start_nanos: Option<i64>) {
+        if let Some(nanos) = start_nanos {
+            self.target_start_nanos
+                .insert(normalize_label(label).to_string(), nanos);
+        }
+    }
+
+    /// Start of the target span a child hangs under, if known.
+    pub(super) fn target_start_for(&self, label: &str) -> Option<i64> {
+        self.target_start_nanos
+            .get(normalize_label(label))
+            .copied()
+    }
+
+    /// End of the (synthetic) target span a child hangs under, if known. Falls
+    /// back to a normalized scan since callers may pass either label form.
+    pub(super) fn target_end_for(&self, label: &str) -> Option<i64> {
+        if let Some(end) = self.synthetic_target_end_nanos.get(label) {
+            return Some(*end);
+        }
+        let normalized = normalize_label(label);
+        self.synthetic_target_end_nanos
+            .iter()
+            .find(|(existing, _)| normalize_label(existing) == normalized)
+            .map(|(_, end)| *end)
     }
 
     /// Set an attribute on the root span (no-op if root span not yet created).
@@ -570,14 +614,23 @@ impl OtelMapper {
         root_context: &Option<Context>,
         tracer: &opentelemetry_sdk::trace::Tracer,
         name: &'static str,
+        start_nanos: Option<i64>,
     ) {
         if slot.is_some() {
             return;
         }
         if let Some(root_cx) = root_context {
-            let builder = tracer
+            let mut builder = tracer
                 .span_builder(name)
                 .with_kind(SpanKind::Internal);
+            // Anchor group spans at the invocation start. They are created
+            // lazily on their first child, which can arrive late (e.g. the
+            // first skipped target on an interrupted build); without an
+            // explicit start the span would begin at "now" and a child whose
+            // event time predates creation would fall outside the parent.
+            if let Some(nanos) = start_nanos {
+                builder = builder.with_start_time(nanos_to_system_time(nanos));
+            }
             let span = tracer.build_with_context(builder, root_cx);
             *slot = Some(Context::new().with_span(span));
             debug!("Created '{name}' parent span");
@@ -667,6 +720,7 @@ impl OtelMapper {
         self.configured_targets.clear();
         self.synthetic_target_labels.clear();
         self.synthetic_target_end_nanos.clear();
+        self.target_start_nanos.clear();
         self.closed_targets.clear();
         self.configurations.clear();
         self.cached_command = None;
@@ -713,7 +767,7 @@ impl OtelMapper {
         let legacy = if policy.is_full() {
             "full (all actions)"
         } else {
-            "lightweight (failed actions only)"
+            "lightweight (errors, cache misses, slow ops)"
         };
         self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, legacy));
     }

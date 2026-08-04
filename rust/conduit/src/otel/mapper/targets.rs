@@ -50,7 +50,7 @@ impl OtelMapper {
     /// When `start_nanos_override` is set (e.g. earliest action start), use it
     /// instead of configured event time so target duration reflects action timing.
     fn create_target_span(
-        &self,
+        &mut self,
         label: &str,
         configured: &ConfiguredTarget,
         parent: &opentelemetry::Context,
@@ -75,7 +75,14 @@ impl OtelMapper {
         }
 
         let raw_start = start_nanos_override.or(configured.event_time_nanos);
-        let (start_nanos, _) = self.clamp_to_invocation(raw_start, None);
+        // Always anchor at a real timestamp (fall back to invocation start) so
+        // untimed child actions can be kept inside the target window instead of
+        // racing a wall-clock creation time.
+        let start_nanos = self
+            .clamp_to_invocation(raw_start, None)
+            .0
+            .or(self.root_span_start_nanos);
+        self.record_target_start(label, start_nanos);
         let mut builder = self
             .tracer
             .span_builder(format!("target {short}"))
@@ -118,8 +125,8 @@ impl OtelMapper {
             self.target_contexts.insert(label.to_string(), cx.clone());
             return Some(cx);
         }
-        if let Some(configured) = self.configured_targets.get(label) {
-            let cx = self.create_target_span(label, configured, &parent, start_nanos);
+        if let Some(configured) = self.configured_targets.get(label).cloned() {
+            let cx = self.create_target_span(label, &configured, &parent, start_nanos);
             debug!("Lazily created target span for {label} (action needed parent)");
             self.target_contexts.insert(label.to_string(), cx.clone());
             return Some(cx);
@@ -131,6 +138,10 @@ impl OtelMapper {
     }
 
     pub(super) fn record_synthetic_target_end(&mut self, label: &str, end_nanos: Option<i64>) {
+        // Clamp to the invocation window: cache hits can carry spawn/action
+        // ends beyond it, which would push the synthetic target span past root
+        // and its own children.
+        let (_, end_nanos) = self.clamp_to_invocation(None, end_nanos);
         let Some(end_nanos) = end_nanos else {
             return;
         };
@@ -176,13 +187,14 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "external deps",
+            self.root_span_start_nanos,
         );
     }
 
     /// Create a target span with only the label (no kind/tags). Used when we see
     /// an action with a label but no prior TargetConfigured event.
     fn create_synthetic_target_span(
-        &self,
+        &mut self,
         label: &str,
         parent: &opentelemetry::Context,
         start_nanos: Option<i64>,
@@ -198,7 +210,11 @@ impl OtelMapper {
             .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
-        let (clamped_start, _) = self.clamp_to_invocation(start_nanos, None);
+        let clamped_start = self
+            .clamp_to_invocation(start_nanos, None)
+            .0
+            .or(self.root_span_start_nanos);
+        self.record_target_start(label, clamped_start);
         if let Some(nanos) = clamped_start {
             builder = builder.with_start_time(super::nanos_to_system_time(nanos));
         }
@@ -332,6 +348,7 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "skipped targets",
+            self.root_span_start_nanos,
         );
 
         let parent = match &self.skipped_context {

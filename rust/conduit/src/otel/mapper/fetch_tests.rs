@@ -40,6 +40,7 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "fetches",
+            self.root_span_start_nanos,
         );
     }
 

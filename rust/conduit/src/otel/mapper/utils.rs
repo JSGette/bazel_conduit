@@ -298,3 +298,12 @@ pub(super) fn nanos_to_system_time(nanos: i64) -> SystemTime {
         UNIX_EPOCH
     }
 }
+
+/// Current wall-clock time as nanoseconds since the Unix epoch. Used as an
+/// upper bound while clamping mid-build, since no event can end in the future.
+pub(super) fn wall_clock_now_nanos() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+}

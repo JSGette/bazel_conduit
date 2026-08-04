@@ -80,7 +80,7 @@ pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper) {
 }
 
 pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
-    let fallback = mapper.root_span_end_from_wall_nanos.or(mapper.finish_time_nanos);
+    let root_end = mapper.root_span_end_from_wall_nanos.or(mapper.finish_time_nanos);
     let keys: Vec<ActionSpanKey> = mapper
         .action_span_cache
         .iter()
@@ -88,7 +88,16 @@ pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
         .map(|(k, _)| k.clone())
         .collect();
     for key in keys {
-        mapper.finalize_and_end_action_entry(&key, fallback);
+        // Bound each still-open action by its parent target's end (an untimed
+        // internal action must not fall back to the whole-build end and spill
+        // past the target it hangs under). Falls back to the root end when the
+        // target end is unknown.
+        let bound = match (mapper.target_end_for(&key.target_label), root_end) {
+            (Some(target_end), Some(re)) => Some(target_end.min(re)),
+            (Some(target_end), None) => Some(target_end),
+            (None, re) => re,
+        };
+        mapper.finalize_and_end_action_entry(&key, bound);
     }
 }
 
@@ -146,6 +155,18 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
             "Cannot synthesise orphan action: no parent context (root span missing?)",
         );
         return;
+    };
+    // Keep the synth action inside its parent target: the target span may have
+    // been created earlier (from another spawn) with a later start than this
+    // orphan's spawn timestamps, which would push the child before its parent.
+    let clamped_start = match (clamped_start, mapper.target_start_for(&parent_label)) {
+        (Some(start), Some(target_start)) => Some(start.max(target_start)),
+        (None, target_start) => target_start,
+        (start, None) => start,
+    };
+    let clamped_end = match (clamped_start, clamped_end) {
+        (Some(start), Some(end)) => Some(end.max(start)),
+        (_, end) => end,
     };
     mapper.record_synthetic_target_end(&parent_label, clamped_end);
 

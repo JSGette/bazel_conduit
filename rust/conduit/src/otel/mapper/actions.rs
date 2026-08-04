@@ -34,7 +34,6 @@ impl OtelMapper {
             self.root_span_start_nanos,
             self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
         );
-
         let parent = match ev.label {
             Some(label) => self
                 .target_parent_context(label, clamped_start)
@@ -44,6 +43,18 @@ impl OtelMapper {
         let Some(parent) = parent else {
             warn!("ActionCompleted with no parent context");
             return;
+        };
+
+        // Anchor the span start. Some internal actions (RunfilesTree, symlink
+        // manifests) carry no start_time; fall back to their end, then the
+        // parent target's start, rather than a wall-clock creation time. Also
+        // clamp up to the parent target's start: a cache-hit target span may be
+        // created at TargetComplete (later) than an action that really began
+        // near the build start, which would push the child before its parent.
+        let target_start = ev.label.and_then(|l| self.target_start_for(l));
+        let clamped_start = match (clamped_start.or(clamped_end), target_start) {
+            (Some(start), Some(parent_start)) => Some(start.max(parent_start)),
+            (start, parent_start) => start.or(parent_start),
         };
 
         if let Some(label) = ev.label {
@@ -219,25 +230,30 @@ impl OtelMapper {
         }
     }
 
-    /// Record an end timestamp hint for every still-open action span belonging
-    /// to `target_label`. The action spans stay open until `finish()` so late
+    /// Bound every still-open action span belonging to `target_label` by the
+    /// target's end time. The action spans stay open until `finish()` so late
     /// tailer arrivals can still backfill attrs before finalisation.
     ///
-    /// `fallback_end_nanos` is used when the action's own clamped end is
-    /// `None` (an action completed without timing data) - typically the
-    /// target's effective end time.
+    /// `target_end_nanos` is the parent target's clamped completion time. An
+    /// action must not outlive its target: Bazel schedules some cheap actions
+    /// (runfiles/symlink/module-map) lazily and reports an `end_time` *after*
+    /// the target's `TargetComplete`, which would push the child span past its
+    /// parent and break Datadog's containment requirement. We cap the action
+    /// end to the target end (and fill it in when the action carried no timing
+    /// of its own).
     pub(super) fn end_open_actions_for_target(
         &mut self,
         target_label: &str,
-        fallback_end_nanos: Option<i64>,
+        target_end_nanos: Option<i64>,
     ) {
         let normalized = normalize_label(target_label);
         for action in self.action_span_cache.values_mut() {
-            if action.span.is_some()
-                && normalize_label(&action.target_label) == normalized
-                && action.info.end_nanos.is_none()
-            {
-                action.info.end_nanos = fallback_end_nanos;
+            if action.span.is_some() && normalize_label(&action.target_label) == normalized {
+                action.info.end_nanos = match (action.info.end_nanos, target_end_nanos) {
+                    (Some(end), Some(bound)) => Some(end.min(bound)),
+                    (None, bound) => bound,
+                    (end, None) => end,
+                };
             }
         }
     }
@@ -263,7 +279,19 @@ impl OtelMapper {
             return;
         };
         Self::finalize_action_summary_attrs(&mut span, action.spawn_count);
-        let end_nanos = action.info.end_nanos.or(fallback_end_nanos);
+        // `fallback_end_nanos` is the parent target's end: cap to it so a span
+        // whose own end overshoots (or is missing) still stays inside its
+        // parent.
+        let end_nanos = match (action.info.end_nanos, fallback_end_nanos) {
+            (Some(end), Some(bound)) => Some(end.min(bound)),
+            (Some(end), None) => Some(end),
+            (None, bound) => bound,
+        };
+        // Never let the cap invert the span (end < start).
+        let end_nanos = match (end_nanos, action.info.start_nanos) {
+            (Some(end), Some(start)) if end < start => Some(start),
+            (end, _) => end,
+        };
         if let Some(nanos) = end_nanos {
             span.end_with_timestamp(super::nanos_to_system_time(nanos));
         } else {
