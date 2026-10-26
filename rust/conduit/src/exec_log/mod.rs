@@ -103,8 +103,8 @@ fn nanos_to_system_time(nanos: i64) -> SystemTime {
     }
 }
 
-/// Normalize label for matching: strip leading `@` so BEP `@@repo//:t` and
-/// exec log `@repo//:t` match.
+/// Normalize label for matching: strip leading `@` so canonical `@@repo//:t`
+/// and apparent `@repo//:t` match.
 fn normalize_label(s: &str) -> &str {
     s.trim_start_matches('@')
 }

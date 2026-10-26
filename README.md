@@ -348,7 +348,7 @@ Prost-generated code for `google.protobuf.Duration` may produce different Rust t
 
 ### Lesson 7: BEP Label Formats Are Inconsistent
 
-BEP events use `@@repo//:target` (double-at canonical form) while the execution log uses `@repo//:target` (single-at). Label normalization (`trim_start_matches('@')`) is essential for cross-format matching.
+On Bazel 9.x, BEP action IDs (`actionCompleted.label`) and the exec log's `targetLabel` both use the canonical form (`@@repo+//:target`), so they match exactly. BEP still emits the apparent form (`@repo//:target`) in other string fields (options, progress). The matching was first written against Bazel 8.4, where the exec log was observed to use single-at labels (not re-verified). Conduit keeps label normalization (`trim_start_matches('@')`) so both forms and both Bazel versions keep matching.
 
 ### Lesson 8: LoggerProvider Flush Timing in Server Mode
 
