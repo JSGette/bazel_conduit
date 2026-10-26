@@ -18,7 +18,6 @@ rust_library(
         "src/state/trace_profile.rs",
     ],
     deps = [
-        "@crates//:dashmap",
         "@crates//:serde_json",
     ],
 )
@@ -88,8 +87,6 @@ rust_library(
         ":conduit_otel_trace_context",
         ":conduit_state",
         "@crates//:anyhow",
-        "@crates//:bytes",
-        "@crates//:clap",
         "@crates//:opentelemetry",
         "@crates//:opentelemetry-otlp",
         "@crates//:opentelemetry-stdout",
@@ -103,7 +100,6 @@ rust_library(
         "@crates//:tokio-stream",
         "@crates//:tonic",
         "@crates//:tracing",
-        "@crates//:tracing-subscriber",
         "@crates//:uuid",
         "@crates//:zstd",
     ],
