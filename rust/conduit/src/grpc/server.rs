@@ -14,25 +14,114 @@ use crate::bes_proto::{
     PublishLifecycleEventRequest,
 };
 use crate::proto_types::Empty;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, trace, warn};
 
-/// BES gRPC server implementation
+/// (BES sequence number, BEP event, BES event time in nanos)
+type RoutedEvent = (i64, crate::build_event_stream::BuildEvent, Option<i64>);
+
+struct Session {
+    tx: mpsc::WeakSender<RoutedEvent>,
+    resumed: watch::Sender<u64>,
+}
+
+/// One routing worker (and [`EventRouter`]) per Bazel invocation, keyed by
+/// the full BES `StreamId`. The map holds weak senders:
+/// a worker finalizes once every stream feeding it is gone, so no separate
+/// reaper.
+struct Sessions {
+    make_router: Box<dyn Fn() -> EventRouter + Send + Sync>,
+    live: Mutex<HashMap<String, Session>>,
+}
+
+impl Sessions {
+    fn new(make_router: impl Fn() -> EventRouter + Send + Sync + 'static) -> Self {
+        Self {
+            make_router: Box::new(make_router),
+            live: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Sender into the invocation's worker; a retried stream for a live
+    /// invocation resumes it instead of starting a partial trace. The watch
+    /// receiver fires when a later stream resumes the same invocation. An
+    /// empty key gets a private worker that nothing can resume.
+    fn attach(&self, key: &str) -> (mpsc::Sender<RoutedEvent>, watch::Receiver<u64>) {
+        let mut live = self.live.lock().unwrap();
+        live.retain(|_, s| s.tx.strong_count() > 0);
+        if let Some(s) = live.get(key) {
+            if let Some(tx) = s.tx.upgrade() {
+                info!(key, "Resuming BES stream for live invocation");
+                s.resumed.send_modify(|n| *n += 1);
+                return (tx, s.resumed.subscribe());
+            }
+        }
+        let (tx, rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
+        tokio::spawn(route_stream((self.make_router)(), rx));
+        let (resumed, resumed_rx) = watch::channel(0);
+        if !key.is_empty() {
+            let session = Session { tx: tx.downgrade(), resumed };
+            live.insert(key.to_string(), session);
+        }
+        (tx, resumed_rx)
+    }
+}
+
+/// BES gRPC server.
 pub struct BesServer {
-    router: Arc<Mutex<EventRouter>>,
+    sessions: Arc<Sessions>,
 }
 
 impl BesServer {
-    pub fn new(router: EventRouter) -> Self {
+    pub fn new(make_router: impl Fn() -> EventRouter + Send + Sync + 'static) -> Self {
         Self {
-            router: Arc::new(Mutex::new(router)),
+            sessions: Arc::new(Sessions::new(make_router)),
         }
     }
+}
+
+/// Route one stream's events in order, then finalize. Returns the router so
+/// callers (tests) can inspect the per-stream state.
+pub(crate) async fn route_stream(
+    mut router: EventRouter,
+    mut route_rx: mpsc::Receiver<RoutedEvent>,
+) -> EventRouter {
+    let mut routed: u64 = 0;
+    let mut last_sequence = None;
+    let first_pump = tokio::time::Instant::now() + EXEC_LOG_PUMP_INTERVAL;
+    let mut exec_log_tick = tokio::time::interval_at(first_pump, EXEC_LOG_PUMP_INTERVAL);
+    exec_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            event = route_rx.recv() => {
+                let Some((sequence, build_event, event_time_nanos)) = event else {
+                    break;
+                };
+                // A resumed stream retransmits events whose ACK was lost in flight.
+                if last_sequence.is_some_and(|last| sequence <= last) {
+                    debug!(sequence, "Skipping retransmitted BES event");
+                    continue;
+                }
+                last_sequence = Some(sequence);
+                if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
+                    warn!(error = %e, "Failed to route BEP event");
+                }
+                routed += 1;
+            }
+            _ = exec_log_tick.tick() => router.pump_exec_log(),
+        }
+    }
+    router.finish();
+    info!("\n{}", router.state().summary());
+    info!("Routing worker drained ({routed} events routed)");
+    router
 }
 
 #[tonic::async_trait]
@@ -82,111 +171,87 @@ impl PublishBuildEvent for BesServer {
     /// Handle the bidirectional stream of build tool events
     ///
     /// Receive loop is decoupled from routing: incoming events are decoded and
-    /// ACKed inline, then forwarded to a single worker task that calls into the
-    /// OTel mapper serially (preserving order). This keeps Bazel's BES upload
-    /// timer bounded by network + decode latency rather than span emission cost.
+    /// ACKed inline, then forwarded to this stream's worker task that calls
+    /// into the OTel mapper serially (preserving order). This keeps Bazel's BES
+    /// upload timer bounded by network + decode latency rather than span
+    /// emission cost.
     async fn publish_build_tool_event_stream(
         &self,
         request: Request<Streaming<PublishBuildToolEventStreamRequest>>,
     ) -> Result<Response<Self::PublishBuildToolEventStreamStream>, Status> {
         let mut stream = request.into_inner();
         let (ack_tx, ack_rx) = mpsc::channel(128);
-        let (route_tx, mut route_rx) =
-            mpsc::channel::<(crate::build_event_stream::BuildEvent, Option<i64>)>(
-                ROUTE_CHANNEL_CAPACITY,
-            );
-        let router = self.router.clone();
+        let sessions = self.sessions.clone();
 
         info!("Build tool event stream started");
 
-        let router_for_worker = router.clone();
-        tokio::spawn(async move {
-            let mut routed: u64 = 0;
-            let first_pump = tokio::time::Instant::now() + EXEC_LOG_PUMP_INTERVAL;
-            let mut exec_log_tick =
-                tokio::time::interval_at(first_pump, EXEC_LOG_PUMP_INTERVAL);
-            exec_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    event = route_rx.recv() => {
-                        let Some((build_event, event_time_nanos)) = event else {
-                            break;
-                        };
-                        let mut router = router_for_worker.lock().await;
-                        if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
-                            warn!(error = %e, "Failed to route BEP event");
-                        }
-                        routed += 1;
-                    }
-                    _ = exec_log_tick.tick() => {
-                        router_for_worker.lock().await.pump_exec_log();
-                    }
-                }
-            }
-            let mut router = router_for_worker.lock().await;
-            router.finish();
-            let summary = router.state().summary();
-            info!("\n{}", summary);
-            info!("Routing worker drained ({routed} events routed)");
-        });
-
         tokio::spawn(async move {
             let mut event_count: u64 = 0;
-            loop {
+            let mut session = None;
+            let completed = loop {
                 match stream.message().await {
                     Ok(Some(req)) => {
                         event_count += 1;
-
-                        let sequence_number = req
-                            .ordered_build_event
-                            .as_ref()
-                            .map(|e| e.sequence_number)
-                            .unwrap_or(0);
-                        let stream_id = req
-                            .ordered_build_event
-                            .as_ref()
-                            .and_then(|e| e.stream_id.clone());
-
+                        let Some(ordered) = req.ordered_build_event.as_ref() else {
+                            let status = Status::invalid_argument("missing ordered_build_event");
+                            let _ = ack_tx.send(Err(status)).await;
+                            break true;
+                        };
                         trace!(
-                            sequence = sequence_number,
+                            sequence = ordered.sequence_number,
                             event_count,
                             "Received build tool event"
                         );
 
+                        let (tx, _) = session.get_or_insert_with(|| {
+                            let key = ordered
+                                .stream_id
+                                .as_ref()
+                                .filter(|s| !s.invocation_id.is_empty())
+                                .map(|s| {
+                                    format!("{}/{}/{}", s.build_id, s.invocation_id, s.component)
+                                })
+                                .unwrap_or_default();
+                            sessions.attach(&key)
+                        });
+
                         let response = PublishBuildToolEventStreamResponse {
-                            stream_id,
-                            sequence_number,
+                            stream_id: ordered.stream_id.clone(),
+                            sequence_number: ordered.sequence_number,
                         };
                         if ack_tx.send(Ok(response)).await.is_err() {
                             debug!("ACK channel closed");
-                            break;
+                            break false;
                         }
 
-                        if let Some(decoded) =
-                            crate::grpc::server::decode_bep_event_from_request(&req)
-                        {
-                            if route_tx.send(decoded).await.is_err() {
+                        if let Some((event, time)) = decode_bep_event_from_request(&req) {
+                            if tx.send((ordered.sequence_number, event, time)).await.is_err() {
                                 warn!("Routing worker channel closed");
-                                break;
+                                break true;
                             }
                         }
                     }
                     Ok(None) => {
                         info!("gRPC stream completed ({event_count} events received)");
-                        // Dropping route_tx signals the worker to drain and finalize.
-                        drop(route_tx);
-                        break;
+                        break true;
                     }
                     Err(e) => {
                         error!(error = %e, "Stream error");
                         let _ = ack_tx
                             .send(Err(Status::internal(format!("Stream error: {e}"))))
                             .await;
-                        drop(route_tx);
-                        break;
+                        break false;
                     }
                 }
+            };
+            // Bazel retries a broken stream under the same invocation_id;
+            // hold the worker open until the retry attaches or grace expires.
+            if let (false, Some((tx, mut resumed))) = (completed, session) {
+                tokio::select! {
+                    _ = tokio::time::sleep(STREAM_RESUME_GRACE) => {}
+                    _ = resumed.changed() => {}
+                }
+                drop(tx);
             }
         });
 
@@ -202,6 +267,10 @@ const ROUTE_CHANNEL_CAPACITY: usize = 65536;
 /// independently of the BEP event cadence.
 const EXEC_LOG_PUMP_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long an invocation outlives a broken stream. Bazel retransmits only
+/// un-ACKed events on retry, backing off 1s * 1.6^n over 4 attempts (~10s).
+const STREAM_RESUME_GRACE: Duration = Duration::from_secs(60);
+
 /// Per-message cap for inbound BES events. BEP `BuildMetrics`, action stderr,
 /// or fat `OptionsParsed` blobs occasionally reach hundreds of KiB; 8 MiB
 /// leaves an order of magnitude of headroom while preventing a single
@@ -216,7 +285,7 @@ const MAX_CONCURRENT_STREAMS: u32 = 64;
 
 /// Tower-level cap on concurrently executing RPCs per connection. Pairs
 /// with [`MAX_CONCURRENT_STREAMS`] to also bound work performed by
-/// long-running handlers (the streaming routing worker holds the mutex).
+/// long-running handlers.
 const CONCURRENCY_LIMIT_PER_CONNECTION: usize = 32;
 
 /// HTTP/2 keepalive interval. Combined with [`KEEPALIVE_TIMEOUT`], this
@@ -542,8 +611,11 @@ pub(crate) fn test_status_to_str(status: i32) -> &'static str {
 }
 
 /// Run the BES gRPC server
-pub async fn run_server(addr: SocketAddr, router: EventRouter) -> anyhow::Result<()> {
-    let server = BesServer::new(router);
+pub async fn run_server(
+    addr: SocketAddr,
+    make_router: impl Fn() -> EventRouter + Send + Sync + 'static,
+) -> anyhow::Result<()> {
+    let server = BesServer::new(make_router);
 
     info!("Starting BES gRPC server on {}", addr);
     info!(
@@ -564,4 +636,75 @@ pub async fn run_server(addr: SocketAddr, router: EventRouter) -> anyhow::Result
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build_event_stream::build_event::Payload;
+    use crate::build_event_stream::build_event_id::{BuildStartedId, Id};
+    use crate::build_event_stream::{BuildEvent, BuildEventId, BuildStarted};
+
+    fn started(sequence: i64, uuid: &str, command: &str) -> RoutedEvent {
+        let event = BuildEvent {
+            id: Some(BuildEventId {
+                id: Some(Id::Started(BuildStartedId {})),
+            }),
+            payload: Some(Payload::Started(BuildStarted {
+                uuid: uuid.to_string(),
+                command: command.to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        (sequence, event, None)
+    }
+
+    #[tokio::test]
+    async fn concurrent_streams_do_not_share_state() {
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
+        let a = tokio::spawn(route_stream(EventRouter::new(), rx_a));
+        let b = tokio::spawn(route_stream(EventRouter::new(), rx_b));
+
+        tx_a.send(started(1, "uuid-a", "build")).await.unwrap();
+        tx_b.send(started(1, "uuid-b", "test")).await.unwrap();
+        drop((tx_a, tx_b));
+
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!(a.state().invocation_id(), Some("uuid-a"));
+        assert_eq!(a.state().command(), Some("build"));
+        assert_eq!(b.state().invocation_id(), Some("uuid-b"));
+        assert_eq!(b.state().command(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn retransmitted_sequence_is_skipped() {
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(route_stream(EventRouter::new(), rx));
+        tx.send(started(1, "uuid-a", "build")).await.unwrap();
+        tx.send(started(1, "uuid-dup", "test")).await.unwrap();
+        drop(tx);
+
+        let router = worker.await.unwrap();
+        assert_eq!(router.state().invocation_id(), Some("uuid-a"));
+    }
+
+    #[tokio::test]
+    async fn retried_stream_resumes_live_invocation() {
+        let sessions = Sessions::new(EventRouter::new);
+        let (first, first_resumed) = sessions.attach("inv-1");
+        assert!(!first_resumed.has_changed().unwrap());
+        let (resumed, resumed_rx) = sessions.attach("inv-1");
+        assert!(first.same_channel(&resumed));
+        assert!(first_resumed.has_changed().unwrap(), "broken stream must see the resume");
+        assert!(!resumed_rx.has_changed().unwrap());
+        assert!(!first.same_channel(&sessions.attach("inv-2").0));
+        assert!(!sessions.attach("").0.same_channel(&sessions.attach("").0));
+
+        let weak = first.downgrade();
+        drop((first, resumed));
+        assert!(weak.upgrade().is_none(), "worker must finalize once all streams are gone");
+        assert_eq!(sessions.attach("inv-1").0.strong_count(), 1);
+    }
 }

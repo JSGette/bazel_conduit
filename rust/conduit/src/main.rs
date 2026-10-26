@@ -188,16 +188,22 @@ async fn main() -> anyhow::Result<()> {
         args.trace_min_duration_ms
     );
 
-    let mut router = EventRouter::new()
-        .with_redactor(redactor)
-        .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
-        .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
-        .with_trace_profile(trace_profile, args.trace_min_duration_ms);
-    if let (Some(tp), Some(lp)) = (&tracer_provider, &logger_provider) {
-        router = router.with_export(tp.tracer("conduit"), lp.logger("conduit"));
-    }
+    let export = tracer_provider.clone().zip(logger_provider.clone());
+    let trace_min_duration_ms = args.trace_min_duration_ms;
+    let make_router = move || {
+        let router = EventRouter::new()
+            .with_redactor(redactor.clone())
+            .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
+            .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
+            .with_trace_profile(trace_profile, trace_min_duration_ms);
+        match &export {
+            Some((tp, lp)) => router.with_export(tp.tracer("conduit"), lp.logger("conduit")),
+            None => router,
+        }
+    };
 
     if let Some(input_path) = args.input {
+        let mut router = make_router();
         process_json_file(&input_path, &mut router)?;
         router.finish();
     } else if args.serve {
@@ -209,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
                  ensure access is restricted via firewall / sidecar / network policy."
             );
         }
-        run_server(addr, router).await?;
+        run_server(addr, make_router).await?;
     } else {
         info!("Usage:");
         info!("  Process JSON file: conduit --input <file.json> [--export stdout|otlp]");
