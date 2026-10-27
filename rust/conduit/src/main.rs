@@ -1,8 +1,8 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
-use clap::Parser;
-use conduit_lib::bep::{BepDecoder, EventRouter};
+use clap::{Args, Parser, Subcommand};
+use conduit_lib::bep::{replay, EventRouter};
 use conduit_lib::grpc::run_server;
 use conduit_lib::otel::{
     init_logger_provider, init_tracer_provider, ExportConfig, Redactor,
@@ -22,28 +22,40 @@ use tracing_subscriber::FmtSubscriber;
 #[derive(Parser, Debug)]
 #[command(name = "conduit")]
 #[command(about = "Convert Bazel Build Event Protocol events to OpenTelemetry traces")]
-struct Args {
-    /// Input BEP JSON file (mutually exclusive with gRPC server mode)
-    #[arg(short, long)]
-    input: Option<PathBuf>,
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Start gRPC server for BES (Build Event Service)
-    #[arg(short, long)]
-    serve: bool,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the BES gRPC server; point Bazel at it with
+    /// `--bes_backend=grpc://127.0.0.1:<port>`.
+    Serve {
+        /// gRPC server port
+        #[arg(short = 'p', long, default_value = "8080")]
+        port: u16,
 
-    /// gRPC server port
-    #[arg(short = 'p', long, default_value = "8080")]
-    port: u16,
+        /// Bind address. Defaults to loopback because conduit has no auth
+        /// or TLS; any other address must be paired with external access
+        /// control (firewall, sidecar mTLS, network policy).
+        #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        listen_addr: IpAddr,
 
-    /// Bind address for the BES gRPC server. Defaults to loopback
-    /// (`127.0.0.1`) because conduit has no auth or TLS — exposing
-    /// it to other hosts is an explicit, deliberate choice that
-    /// must be paired with external access control (firewall,
-    /// sidecar mTLS, etc.). Use `0.0.0.0` to listen on all
-    /// interfaces, or a specific host IP to restrict to one NIC.
-    #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    listen_addr: IpAddr,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Replay a binary BEP file written with `--build_event_binary_file`.
+    Replay {
+        file: PathBuf,
 
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Args, Debug)]
+struct Common {
     /// Export mode: none, stdout, otlp
     #[arg(long, default_value = "none")]
     export: String,
@@ -114,7 +126,7 @@ struct Args {
     trace_min_duration_ms: i64,
 }
 
-impl Args {
+impl Common {
     fn build_redactor(&self) -> Redactor {
         if self.no_redact {
             return Redactor::disabled();
@@ -128,7 +140,10 @@ impl Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let args = match &cli.command {
+        Command::Serve { common, .. } | Command::Replay { common, .. } => common,
+    };
 
     // Set up logging
     let level = match args.log_level.to_lowercase().as_str() {
@@ -213,33 +228,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if let Some(input_path) = args.input {
-        let mut router = make_router();
-        process_json_file(&input_path, &mut router)?;
-        router.finish();
-    } else if args.serve {
-        let addr = SocketAddr::new(args.listen_addr, args.port);
-        if !args.listen_addr.is_loopback() {
-            warn!(
-                %addr,
-                "Binding gRPC server to a non-loopback address. Conduit has no auth or TLS; \
-                 ensure access is restricted via firewall / sidecar / network policy."
-            );
+    match cli.command {
+        Command::Replay { file, .. } => {
+            let mut router = make_router();
+            let count = replay(File::open(&file)?, &mut router)?;
+            router.finish();
+            info!("Replayed {count} events from {}\n{}", file.display(), router.state().summary());
         }
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let shutdown = async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down"),
-                _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
-            }
-        };
-        run_server(addr, make_router, shutdown).await?;
-    } else {
-        info!("Usage:");
-        info!("  Process JSON file: conduit --input <file.json> [--export stdout|otlp]");
-        info!("  Start gRPC server: conduit --serve [--port 8080] [--export stdout|otlp]");
-        info!("");
-        info!("For Bazel, use: bazel build //... --bes_backend=grpc://127.0.0.1:{}", args.port);
+        Command::Serve { port, listen_addr, .. } => {
+            serve(SocketAddr::new(listen_addr, port), make_router).await?;
+        }
     }
 
     if let Some(tp) = tracer_provider {
@@ -256,29 +254,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process_json_file(path: &PathBuf, router: &mut EventRouter) -> anyhow::Result<()> {
-    info!("Processing BEP JSON file: {}", path.display());
-
-    let file = File::open(path)?;
-    let decoder = BepDecoder::new();
-    let events = decoder.decode_json_file(file)?;
-
-    info!("Loaded {} events from file", events.len());
-
-    for event in &events {
-        if let Err(e) = router.route(event) {
-            error!("Error routing event: {}", e);
-        }
-
-        if event.is_last_message() {
-            info!("Received last message");
-            break;
-        }
+async fn serve(
+    addr: SocketAddr,
+    make_router: impl Fn() -> EventRouter + Send + Sync + 'static,
+) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "Binding gRPC server to a non-loopback address. Conduit has no auth or TLS; \
+             ensure access is restricted via firewall / sidecar / network policy."
+        );
     }
-
-    // Print summary
-    let summary = router.state().summary();
-    println!("\n{}", summary);
-
-    Ok(())
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down"),
+            _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+        }
+    };
+    run_server(addr, make_router, shutdown).await
 }

@@ -62,7 +62,7 @@ pub fn read_message_len<R: Read>(r: &mut R, max_bytes: usize) -> std::io::Result
     if len > max_bytes as u64 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("execlog message length {len} exceeds {max_bytes} byte cap"),
+            format!("message length {len} exceeds {max_bytes} byte cap"),
         ));
     }
     Ok(Some(len as usize))

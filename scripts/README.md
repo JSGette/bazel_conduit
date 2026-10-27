@@ -119,7 +119,7 @@ In a dedicated terminal:
 
 ```bash
 bazel run //rust/conduit:conduit -c opt -- \
-  --serve --port 8080 \
+  serve --port 8080 \
   --export otlp --otlp-endpoint http://localhost:4317
 ```
 

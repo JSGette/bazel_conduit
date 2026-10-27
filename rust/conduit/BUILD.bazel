@@ -54,8 +54,8 @@ rust_library(
 rust_library(
     name = "conduit_lib",
     srcs = [
-        "src/bep/decoder.rs",
         "src/bep/mod.rs",
+        "src/bep/replay.rs",
         "src/bep/router.rs",
         "src/exec_log/compact.rs",
         "src/exec_log/mod.rs",
@@ -128,15 +128,6 @@ rust_test(
 )
 
 rust_test(
-    name = "decoder_tests",
-    srcs = ["tests/decoder_tests.rs"],
-    deps = [
-        ":conduit_lib",
-        "@crates//:serde_json",
-    ],
-)
-
-rust_test(
     name = "action_mode_tests",
     srcs = ["tests/action_mode_tests.rs"],
     deps = [
@@ -149,6 +140,5 @@ rust_test(
     srcs = ["tests/router_tests.rs"],
     deps = [
         ":conduit_lib",
-        "@crates//:serde_json",
     ],
 )

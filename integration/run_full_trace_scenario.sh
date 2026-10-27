@@ -6,10 +6,8 @@
 # (the production path), capture the emitted trace, and assert structural
 # invariants with analyze_trace.py.
 #
-# The gRPC path is used deliberately: `--input` file replay stamps BEP-derived
-# spans at replay wall-clock while exec-log spawns keep true build time, so its
-# timing is only meaningful immediately after the build. Live serve mode has a
-# single coherent clock and also exercises the compact exec-log tailer.
+# Live serve mode is used rather than `conduit replay` because it is the
+# production path and also exercises the compact exec-log tailer.
 #
 # Usage: run_full_trace_scenario.sh [target] [profile] [port]
 #   target  : bazel target to build   (default: //rust/conduit:conduit_lib)
@@ -34,8 +32,8 @@ bazel build //rust/conduit:conduit
 # binary itself is read from a separate output path, so no restash is needed.
 CONDUIT_BIN="${REPO_ROOT}/bazel-bin/rust/conduit/conduit"
 
-echo "Starting conduit --serve on :${PORT} (profile=${PROFILE})..."
-"${CONDUIT_BIN}" --serve --port "${PORT}" --export stdout --exec-log \
+echo "Starting conduit serve on :${PORT} (profile=${PROFILE})..."
+"${CONDUIT_BIN}" serve --port "${PORT}" --export stdout --exec-log \
   --trace-profile "${PROFILE}" --log-level error > "${TRACE_OUT}" 2>/dev/null &
 CONDUIT_PID=$!
 trap 'kill "${CONDUIT_PID}" 2>/dev/null || true' EXIT

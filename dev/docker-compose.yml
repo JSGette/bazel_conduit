@@ -5,7 +5,7 @@
 #   open http://localhost:16686   # Jaeger UI
 #
 # Conduit export:
-#   conduit --serve --export otlp --otlp-endpoint http://localhost:4317
+#   conduit serve --export otlp --otlp-endpoint http://localhost:4317
 #   bazel build //... --bes_backend=grpc://localhost:8080
 
 services:

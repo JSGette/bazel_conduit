@@ -5,7 +5,7 @@
 # Integration test: run conduit on BEP input, export trace to stdout, analyze for regressions.
 # Usage: trace_test.sh <conduit_bin> <bep_file> <analyzer_py> [trace_out]
 #   conduit_bin: path to conduit binary
-#   bep_file: path to BEP NDJSON file
+#   bep_file: path to a binary BEP file (--build_event_binary_file format)
 #   analyzer_py: path to analyze_trace.py
 #   trace_out: optional path to write trace stdout (default: $TEST_TMPDIR/trace_stdout.txt or ./trace_stdout.txt)
 
@@ -17,7 +17,7 @@ ANALYZER="${3:?analyzer script path required}"
 TRACE_OUT="${4:-${TEST_TMPDIR:-.}/trace_stdout.txt}"
 
 # Run conduit: BEP file -> stdout (trace), capture to file
-"${CONDUIT_BIN}" --input "${BEP_FILE}" --export stdout --log-level error 2>/dev/null \
+"${CONDUIT_BIN}" replay "${BEP_FILE}" --export stdout --log-level error 2>/dev/null \
   | tee "${TRACE_OUT}" >/dev/null
 
 # Analyze trace for structure / regression

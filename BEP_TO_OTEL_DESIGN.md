@@ -118,8 +118,8 @@ See the [README CLI Flags table](README.md#cli-flags) for the authoritative list
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--input <FILE>` | Read BEP from an NDJSON file | - |
-| `--serve` / `--port <PORT>` | Start BES gRPC server / its port | 8080 |
+| `serve` / `--port <PORT>` | Start BES gRPC server / its port | 8080 |
+| `replay <FILE>` | Read a binary BEP file (`--build_event_binary_file`) | - |
 | `--export <MODE>` | `none`, `stdout`, `otlp` | `none` |
 | `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
 | `--trace-profile <PROFILE>` | `auto`, `lightweight`, `full` | `auto` |

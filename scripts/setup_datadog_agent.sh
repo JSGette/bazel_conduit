@@ -249,7 +249,7 @@ your Datadog org via the local agent (site: ${DD_SITE}).
 EOF
 
 # ---------- step 6: launch conduit -------------------------------------------
-CONDUIT_ARGS=(--serve --port "${CONDUIT_BES_PORT}"
+CONDUIT_ARGS=(serve --port "${CONDUIT_BES_PORT}"
               --export otlp --otlp-endpoint "http://localhost:${OTLP_GRPC_PORT}")
 if [[ -n "${CONDUIT_EXEC_LOG}" ]]; then
   CONDUIT_ARGS+=(--exec-log)

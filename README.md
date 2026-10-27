@@ -37,15 +37,15 @@ bazel.invocation (root)
                               │
               ┌───────────────┼───────────────┐
               ▼                               ▼
-     BES gRPC stream                  JSON file (NDJSON)
-     (--bes_backend)            (--build_event_json_file)
+     BES gRPC stream                 binary BEP file
+     (--bes_backend)          (--build_event_binary_file)
               │                               │
               ▼                               ▼
      ┌────────────────┐              ┌────────────────┐
-     │  gRPC Server   │              │  BEP Decoder   │
-     │  (BES proto)   │              │  (JSON parser)  │
+     │ conduit serve  │              │ conduit replay │
+     │  (BES proto)   │              │ (varint proto) │
      └───────┬────────┘              └───────┬────────┘
-             │  Proto-direct routing          │  JSON routing
+             │         BuildEvent protos      │
              └───────────┬───────────────────┘
                          ▼
                   ┌──────────────┐
@@ -92,7 +92,7 @@ bazel build //rust/conduit:conduit
 
 ```bash
 # Start conduit
-./bazel-bin/rust/conduit/conduit --serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
+./bazel-bin/rust/conduit/conduit serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
 
 # Run Bazel with conduit as BES backend
 bazel build //your:target \
@@ -100,22 +100,26 @@ bazel build //your:target \
   --build_event_publish_all_actions
 ```
 
-### Process a JSON BEP File (offline/debug mode)
+### Replay a binary BEP file (offline/debug mode)
 
 ```bash
 # Record BEP during a build
-bazel build //your:target --build_event_json_file=bep.ndjson
+bazel build //your:target --build_event_binary_file=bep.bin
 
 # Process offline
-./bazel-bin/rust/conduit/conduit --input bep.ndjson --export otlp
+./bazel-bin/rust/conduit/conduit replay bep.bin --export otlp
 ```
+
+A BEP file carries no BES event times, so untimed events are placed on the
+build's own clock (latest start/finish/action time seen so far).
 
 ### CLI Flags
 
+`serve` and `replay <FILE>` accept every flag below except `--listen-addr`
+and `--port`, which are `serve`-only.
+
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--input <FILE>` | Read BEP from NDJSON file | - |
-| `--serve` | Start BES gRPC server | false |
 | `--listen-addr <IP>` | Bind address for the BES gRPC server. Defaults to loopback; pass `0.0.0.0` only when external access is intentionally needed (conduit has no auth/TLS). | `127.0.0.1` |
 | `--port <PORT>` | gRPC server port | 8080 |
 | `--export <MODE>` | Export mode: `none`, `stdout`, `otlp` | `none` |
@@ -170,14 +174,14 @@ backend is fully trusted or has its own scrubbing layer.
 
 ```bash
 # Default list
-./conduit --serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
+./conduit serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
 
 # Custom list (replaces default)
-./conduit --serve \
+./conduit serve \
   --redact-name-pattern TOKEN --redact-name-pattern JIRA --redact-name-pattern AWS_
 
 # Disabled
-./conduit --serve --no-redact
+./conduit serve --no-redact
 ```
 
 #### Defense in depth: Datadog Agent server-side scrubbing
