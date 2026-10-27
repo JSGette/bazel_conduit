@@ -122,6 +122,8 @@ struct ActionCompletedArgs {
     stderr_path: Option<String>,
     start_time_nanos: Option<i64>,
     end_time_nanos: Option<i64>,
+    cached: Option<bool>,
+    runner: Option<String>,
 }
 
 /// Per-invocation counts, logged when an invocation finalizes.
@@ -375,11 +377,9 @@ impl EventRouter {
             (Some(start), Some(end)) if end >= start => Some((end - start) / 1_000_000),
             _ => None,
         };
-        // BEP `ActionCompleted` carries no cache flag, so cache-miss retention
-        // is driven by the spawn-level policy; here it's error-or-slow.
         let should_process = self
             .trace_policy
-            .should_emit_action(args.success, None, duration_ms);
+            .should_emit_action(args.success, args.cached, duration_ms);
         if !should_process {
             if let Some(mapper) = &mut self.mapper {
                 mapper.note_suppressed_action();
@@ -406,10 +406,10 @@ impl EventRouter {
                 stderr_path: args.stderr_path.as_deref(),
                 start_time_nanos: args.start_time_nanos,
                 end_time_nanos: args.end_time_nanos,
-                cached: None,
+                cached: args.cached,
                 hostname: None,
                 cached_remotely: None,
-                runner: None,
+                runner: args.runner.as_deref(),
             });
         }
     }
@@ -664,6 +664,11 @@ impl EventRouter {
                     let end_nanos = act.end_time.as_ref().map(|ts| {
                         ts.seconds * 1_000_000_000 + i64::from(ts.nanos)
                     });
+                    let (cached, runner) = spawn_strategy(
+                        act.strategy_details
+                            .iter()
+                            .map(|a| (a.type_url.as_str(), &a.value[..])),
+                    );
                     self.apply_action_completed_event(ActionCompletedArgs {
                         label: Some(a.label.clone()),
                         primary_output: Some(a.primary_output.clone()),
@@ -678,6 +683,8 @@ impl EventRouter {
                         start_time_nanos: start_nanos,
                         // Internal actions (Symlink, ...) carry no times.
                         end_time_nanos: end_nanos.or(event_time_nanos),
+                        cached,
+                        runner,
                     });
                 }
                 Ok(())
@@ -850,6 +857,32 @@ impl Default for EventRouter {
     }
 }
 
+/// Action-level cache hit and runner(s) from `ActionExecuted.strategy_details`,
+/// where Bazel 10+ packs one `SpawnExec` per spawn with only `runner` and
+/// `cache_hit` set. `(None, None)` for older Bazel.
+fn spawn_strategy<'a>(
+    details: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> (Option<bool>, Option<String>) {
+    use prost::Message;
+    use spawn_proto::tools::protos::SpawnExec;
+    let spawns: Vec<SpawnExec> = details
+        .filter(|(type_url, _)| type_url.ends_with("/tools.protos.SpawnExec"))
+        .filter_map(|(_, value)| SpawnExec::decode(value).ok())
+        .collect();
+    if spawns.is_empty() {
+        return (None, None);
+    }
+    let mut runners: Vec<&str> = spawns
+        .iter()
+        .map(|s| s.runner.as_str())
+        .filter(|r| !r.is_empty())
+        .collect();
+    runners.sort_unstable();
+    runners.dedup();
+    let cached = spawns.iter().all(|s| s.cache_hit);
+    (Some(cached), (!runners.is_empty()).then(|| runners.join(",")))
+}
+
 /// Prost's enum getters map values newer than the vendored proto to the
 /// default (`NO_STATUS`); report those as `UNKNOWN` instead.
 fn test_status_name(raw: i32) -> &'static str {
@@ -924,7 +957,89 @@ fn bep_event_type_name(id: &crate::build_event_stream::build_event_id::Id) -> &'
 
 #[cfg(test)]
 mod tests {
-    use super::test_status_name;
+    use super::{spawn_strategy, test_status_name};
+    use prost::Message;
+    use spawn_proto::tools::protos::SpawnExec;
+
+    const SPAWN_URL: &str = "type.googleapis.com/tools.protos.SpawnExec";
+
+    fn spawn(runner: &str, cache_hit: bool) -> Vec<u8> {
+        SpawnExec {
+            runner: runner.into(),
+            cache_hit,
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn spawn_strategy_absent_before_bazel_10() {
+        assert_eq!(spawn_strategy(std::iter::empty()), (None, None));
+    }
+
+    #[test]
+    fn spawn_strategy_all_hits_is_cached() {
+        let (a, b) = (spawn("remote cache hit", true), spawn("disk cache hit", true));
+        let details = [(SPAWN_URL, &a[..]), (SPAWN_URL, &b[..])];
+        assert_eq!(
+            spawn_strategy(details.into_iter()),
+            (Some(true), Some("disk cache hit,remote cache hit".into()))
+        );
+    }
+
+    #[test]
+    fn spawn_strategy_any_miss_is_not_cached() {
+        let (a, b) = (spawn("remote cache hit", true), spawn("linux-sandbox", false));
+        let other = b"ignored".to_vec();
+        let details = [
+            (SPAWN_URL, &a[..]),
+            (SPAWN_URL, &b[..]),
+            ("type.googleapis.com/other.Message", &other[..]),
+        ];
+        assert_eq!(
+            spawn_strategy(details.into_iter()),
+            (Some(false), Some("linux-sandbox,remote cache hit".into()))
+        );
+    }
+
+    #[test]
+    fn lightweight_keeps_fast_action_only_on_cache_miss() {
+        use crate::build_event_stream::build_event::Payload;
+        use crate::build_event_stream::build_event_id::{ActionCompletedId, Id};
+        use crate::build_event_stream::{ActionExecuted, BuildEvent, BuildEventId};
+        use crate::state::TraceProfile;
+
+        let action = |cache_hit: bool| {
+            let mut act = ActionExecuted {
+                success: true,
+                ..Default::default()
+            };
+            act.strategy_details.push(Default::default());
+            let any = act.strategy_details.last_mut().unwrap();
+            any.type_url = SPAWN_URL.into();
+            any.value = spawn("remote", cache_hit).into();
+            BuildEvent {
+                id: Some(BuildEventId {
+                    id: Some(Id::ActionCompleted(ActionCompletedId::default())),
+                }),
+                payload: Some(Payload::Action(act)),
+                ..Default::default()
+            }
+        };
+        let mut router = super::EventRouter::new().with_trace_profile(TraceProfile::Lightweight, 500);
+        let options = BuildEvent {
+            id: Some(BuildEventId {
+                id: Some(Id::OptionsParsed(Default::default())),
+            }),
+            payload: Some(Payload::OptionsParsed(Default::default())),
+            ..Default::default()
+        };
+        router.route_build_event(&options, None).unwrap();
+        router.route_build_event(&action(true), None).unwrap();
+        assert_eq!(router.summary().actions, 0);
+        router.route_build_event(&action(false), None).unwrap();
+        assert_eq!(router.summary().actions, 1);
+    }
 
     #[test]
     fn test_status_names() {
