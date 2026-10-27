@@ -37,8 +37,6 @@ pub struct BuildState {
     invocation_id: Option<String>,
     command: Option<String>,
     command_args: Vec<String>,
-    start_time_millis: Option<i64>,
-    end_time_millis: Option<i64>,
     exit_code: Option<i32>,
     finished: bool,
 
@@ -73,8 +71,6 @@ impl BuildState {
             invocation_id: None,
             command: None,
             command_args: Vec::new(),
-            start_time_millis: None,
-            end_time_millis: None,
             exit_code: None,
             finished: false,
             startup_options: Vec::new(),
@@ -115,22 +111,6 @@ impl BuildState {
 
     pub fn command_args(&self) -> &[String] {
         &self.command_args
-    }
-
-    pub fn set_start_time_millis(&mut self, millis: i64) {
-        self.start_time_millis = Some(millis);
-    }
-
-    pub fn start_time_millis(&self) -> Option<i64> {
-        self.start_time_millis
-    }
-
-    pub fn set_end_time_millis(&mut self, millis: i64) {
-        self.end_time_millis = Some(millis);
-    }
-
-    pub fn end_time_millis(&self) -> Option<i64> {
-        self.end_time_millis
     }
 
     pub fn set_exit_code(&mut self, code: i32) {
@@ -331,8 +311,6 @@ impl BuildState {
         self.invocation_id = None;
         self.command = None;
         self.command_args.clear();
-        self.start_time_millis = None;
-        self.end_time_millis = None;
         self.exit_code = None;
         self.finished = false;
         self.startup_options.clear();

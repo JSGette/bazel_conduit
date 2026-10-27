@@ -97,7 +97,6 @@ struct StartedEventArgs {
     uuid: String,
     command: String,
     start_time_nanos: Option<i64>,
-    start_time_millis: Option<i64>,
     event_time_nanos: Option<i64>,
     workspace_dir: Option<String>,
     working_dir: Option<String>,
@@ -297,9 +296,6 @@ impl EventRouter {
 
         self.state.set_invocation_id(args.uuid.clone());
         self.state.set_command(args.command.clone());
-        if let Some(millis) = args.start_time_millis {
-            self.state.set_start_time_millis(millis);
-        }
 
         if let Some(mapper) = &mut self.mapper {
             mapper.on_build_started(
@@ -509,8 +505,6 @@ impl EventRouter {
                         .start_time
                         .as_ref()
                         .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
-                    #[allow(deprecated)]
-                    let start_time_millis = (s.start_time_millis != 0).then_some(s.start_time_millis);
                     self.apply_started_event(StartedEventArgs {
                         uuid: if s.uuid.is_empty() {
                             "unknown".to_string()
@@ -523,7 +517,6 @@ impl EventRouter {
                             s.command.clone()
                         },
                         start_time_nanos,
-                        start_time_millis,
                         event_time_nanos,
                         workspace_dir: (!s.workspace_directory.is_empty())
                             .then_some(s.workspace_directory.clone()),
@@ -603,19 +596,9 @@ impl EventRouter {
                     let finish_time_nanos = f
                         .finish_time
                         .as_ref()
-                        .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos))
-                        .or_else(|| {
-                            // Bazel pre-7.0 only set the deprecated `finish_time_millis`.
-                            #[allow(deprecated)]
-                            let ms = f.finish_time_millis;
-                            (ms != 0).then_some(ms * 1_000_000)
-                        });
+                        .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
                     if let Some(code) = exit_code {
                         self.state.set_exit_code(code);
-                    }
-                    #[allow(deprecated)]
-                    if f.finish_time_millis != 0 {
-                        self.state.set_end_time_millis(f.finish_time_millis);
                     }
                     self.state.mark_finished();
                     if let Some(mapper) = &mut self.mapper {
@@ -954,10 +937,6 @@ impl EventRouter {
         if let Some(started) = payload {
             let uuid = started.get("uuid").and_then(|v| v.as_str());
             let command = started.get("command").and_then(|v| v.as_str());
-            let start_time_millis = started.get("startTimeMillis").and_then(|v| v.as_i64());
-            // Prefer the proto Timestamp field; do NOT fall back to the
-            // deprecated start_time_millis — it can hold a stale Bazel-server
-            // start time on long-lived daemons, producing wildly wrong spans.
             let start_time_nanos = started
                 .get("startTimeNanos")
                 .and_then(|v| v.as_i64());
@@ -968,7 +947,6 @@ impl EventRouter {
                 command = command,
                 start_time_nanos,
                 event_time_nanos,
-                start_time_millis,
                 "Build started"
             );
 
@@ -984,7 +962,6 @@ impl EventRouter {
                 uuid: uuid.unwrap_or("unknown").to_string(),
                 command: command.unwrap_or("unknown").to_string(),
                 start_time_nanos,
-                start_time_millis,
                 event_time_nanos,
                 workspace_dir: workspace_dir.map(str::to_string),
                 working_dir: working_dir.map(str::to_string),
@@ -1142,9 +1119,6 @@ impl EventRouter {
 
             if let Some(code) = exit_code {
                 self.state.set_exit_code(code);
-            }
-            if let Some(millis) = finish_time_millis {
-                self.state.set_end_time_millis(millis);
             }
             self.state.mark_finished();
 
