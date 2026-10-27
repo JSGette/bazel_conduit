@@ -10,27 +10,12 @@ use tracing::{debug, info, warn};
 
 use super::super::attributes::*;
 use super::{build_test_attrs, build_test_span_name, test_status};
-use super::{BufferedTestResult, OtelMapper, TestResultEvent};
+use super::{OtelMapper, TestResultEvent};
 
 impl OtelMapper {
     /// Fetch -> child span under root for external resource fetching.
-    ///
-    /// In gRPC mode, fetch events may arrive *before* the BuildStarted event
-    /// (during Bazel module resolution).  These are buffered and replayed once
-    /// the root span exists.
     pub fn on_fetch(&mut self, url: &str, success: bool, downloader: Option<&str>) {
-        let arrival = SystemTime::now();
-        if self.root_context.is_none() {
-            debug!("Buffering fetch event (root span not yet created): {url}");
-            self.pending_fetches.push((
-                url.to_string(),
-                success,
-                arrival,
-                downloader.map(String::from),
-            ));
-            return;
-        }
-        self.emit_fetch_span(url, success, arrival, downloader);
+        self.emit_fetch_span(url, success, SystemTime::now(), downloader);
     }
 
     /// Ensure the `fetches` parent span exists (lazily created).
@@ -95,26 +80,7 @@ impl OtelMapper {
 
     /// TestResult -> child span under target span for a single test attempt.
     /// When timing fields are present, span uses accurate timing.
-    /// Buffers and replays if root span is not yet created (BES can send test events before Started).
     pub fn on_test_result(&mut self, ev: &TestResultEvent<'_>) {
-        if self.root_context.is_none() {
-            self.pending_test_results.push(BufferedTestResult {
-                label: ev.label.to_string(),
-                status: ev.status.map(String::from),
-                attempt: ev.attempt,
-                run: ev.run,
-                shard: ev.shard,
-                cached: ev.cached,
-                strategy: ev.strategy.map(String::from),
-                start_time_nanos: ev.start_time_nanos,
-                duration_nanos: ev.duration_nanos,
-                hostname: ev.hostname.map(String::from),
-                cached_remotely: ev.cached_remotely,
-            });
-            debug!("Buffered test result (root not ready): {}", ev.label);
-            return;
-        }
-
         let raw_end = match (ev.start_time_nanos, ev.duration_nanos) {
             (Some(start), Some(dur)) => Some(start + dur),
             _ => None,

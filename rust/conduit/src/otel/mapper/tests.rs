@@ -179,34 +179,6 @@ fn on_exec_log_detected_skips_when_workspace_unknown() {
     mapper.on_exec_log_detected(PathBuf::from("exec.log"));
     assert!(mapper.exec_log_state.is_none());
     assert!(!mapper.compact_streaming_active);
-    assert_eq!(mapper.pending_exec_log_path, Some(PathBuf::from("exec.log")));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_build_started_extended_retries_pending_relative_exec_log() {
-    let ws = tempfile::tempdir().unwrap();
-    let mut mapper = test_mapper();
-    mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
-    mapper.on_exec_log_detected(PathBuf::from("exec.log"));
-    assert!(mapper.exec_log_state.is_none());
-    assert_eq!(mapper.pending_exec_log_path, Some(PathBuf::from("exec.log")));
-
-    mapper.on_build_started_extended(
-        ws.path().to_str(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let state = mapper
-        .exec_log_state
-        .as_ref()
-        .expect("tailer should start after workspace arrives");
-    assert_eq!(state.path, ws.path().join("exec.log"));
-    assert!(mapper.pending_exec_log_path.is_none());
-    mapper.drain_and_stop_tailer();
 }
 
 // ---- Mapper lifecycle tests ----

@@ -8,7 +8,7 @@ use opentelemetry::KeyValue;
 use tracing::{debug, info, warn};
 
 use super::super::attributes::*;
-use super::{ExecLogState, OtelMapper, TestResultEvent};
+use super::{ExecLogState, OtelMapper};
 use crate::otel::trace_context;
 
 impl OtelMapper {
@@ -46,36 +46,6 @@ impl OtelMapper {
 
         info!(trace_id = %trace_id, "Created root span for invocation {uuid}");
         self.root_context = Some(cx);
-
-        // Replay any fetch events that arrived before the root span.
-        if !self.pending_fetches.is_empty() {
-            let buffered: Vec<_> = std::mem::take(&mut self.pending_fetches);
-            info!("Replaying {} buffered fetch events", buffered.len());
-            for (url, success, arrival, downloader) in buffered {
-                self.emit_fetch_span(&url, success, arrival, downloader.as_deref());
-            }
-        }
-
-        // Replay test results that arrived before the root span (e.g. BES stream order).
-        if !self.pending_test_results.is_empty() {
-            let buffered: Vec<_> = std::mem::take(&mut self.pending_test_results);
-            info!("Replaying {} buffered test result events", buffered.len());
-            for b in &buffered {
-                self.on_test_result(&TestResultEvent {
-                    label: &b.label,
-                    status: b.status.as_deref(),
-                    attempt: b.attempt,
-                    run: b.run,
-                    shard: b.shard,
-                    cached: b.cached,
-                    strategy: b.strategy.as_deref(),
-                    start_time_nanos: b.start_time_nanos,
-                    duration_nanos: b.duration_nanos,
-                    hostname: b.hostname.as_deref(),
-                    cached_remotely: b.cached_remotely,
-                });
-            }
-        }
     }
 
     /// Extended BuildStarted fields -> set attributes on root span.
@@ -100,10 +70,6 @@ impl OtelMapper {
                 }
                 self.workspace_directory = Some(path);
             }
-        }
-        // Retry a previously skipped relative exec-log path once workspace is known.
-        if let Some(path) = self.pending_exec_log_path.take() {
-            self.on_exec_log_detected(path);
         }
         if let Some(v) = working_dir {
             self.set_root_attr(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
@@ -163,10 +129,9 @@ impl OtelMapper {
             match self.workspace_directory.as_ref() {
                 Some(ws) => ws.join(&path),
                 None => {
-                    self.pending_exec_log_path = Some(path.clone());
                     warn!(
                         path = %path.display(),
-                        "Compact exec log path is relative but workspace_directory is not set yet; skipping tailer"
+                        "Compact exec log path is relative but workspace_directory is unknown; skipping tailer"
                     );
                     self.add_root_event(
                         "bazel.exec_log.tailer_skipped",

@@ -38,7 +38,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::SystemTime;
 #[cfg(test)]
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -207,21 +206,6 @@ struct ConfiguredTarget {
     test_size: Option<String>,
 }
 
-/// Test result data buffered when root span is not yet created (replay in on_build_started).
-struct BufferedTestResult {
-    label: String,
-    status: Option<String>,
-    attempt: Option<i32>,
-    run: Option<i32>,
-    shard: Option<i32>,
-    cached: Option<bool>,
-    strategy: Option<String>,
-    start_time_nanos: Option<i64>,
-    duration_nanos: Option<i64>,
-    hostname: Option<String>,
-    cached_remotely: Option<bool>,
-}
-
 /// A single entry in the NamedSet cache.
 ///
 /// `NamedSetOfFiles` in BEP can contain both direct `files` and references
@@ -329,15 +313,6 @@ pub struct OtelMapper {
     /// Used to resolve output files (transitively) when target spans complete.
     named_set_cache: HashMap<String, NamedSetEntry>,
 
-    /// Fetch events that arrived before the root span was created.
-    /// Replayed once `on_build_started` fires.
-    /// Tuple: (url, success, wallclock arrival time, downloader).
-    pending_fetches: Vec<(String, bool, SystemTime, Option<String>)>,
-
-    /// TestResult events that arrived before the root span was created.
-    /// Replayed once `on_build_started` fires (BES can send test events before Started).
-    pending_test_results: Vec<BufferedTestResult>,
-
     /// True once a compact-log tailer has been wired in (whether via
     /// [`Self::on_exec_log_detected`] in prod or a test helper). Drives
     /// the deferred-end gate in [`Self::on_action_completed`]: when set,
@@ -351,10 +326,6 @@ pub struct OtelMapper {
     /// end immediately in `on_action_completed` and no spawn child spans
     /// or attribute backfill happens.
     exec_log_state: Option<ExecLogState>,
-
-    /// Relative compact-log path observed before `workspace_directory` was
-    /// known. Retried from `on_build_started_extended`.
-    pending_exec_log_path: Option<PathBuf>,
 
     /// Workspace directory from BuildStarted (for resolving relative exec log path).
     workspace_directory: Option<PathBuf>,
@@ -446,11 +417,8 @@ impl OtelMapper {
             build_start_nanos: None,
             root_span_end_from_wall_nanos: None,
             named_set_cache: HashMap::new(),
-            pending_fetches: Vec::new(),
-            pending_test_results: Vec::new(),
             compact_streaming_active: false,
             exec_log_state: None,
-            pending_exec_log_path: None,
             action_span_cache: HashMap::new(),
             pending_spawns: HashMap::new(),
             compact_spawns_received: 0,
@@ -742,12 +710,9 @@ impl OtelMapper {
         self.build_start_nanos = None;
         self.root_span_end_from_wall_nanos = None;
         self.named_set_cache.clear();
-        self.pending_fetches.clear();
-        self.pending_test_results.clear();
         if let Some(state) = self.exec_log_state.take() {
             state.handle.shutdown();
         }
-        self.pending_exec_log_path = None;
         self.compact_streaming_active = false;
         self.action_span_cache.clear();
         self.pending_spawns.clear();

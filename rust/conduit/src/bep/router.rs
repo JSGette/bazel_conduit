@@ -281,17 +281,9 @@ impl EventRouter {
 
 impl EventRouter {
     fn apply_started_event(&mut self, args: StartedEventArgs) {
-        let carry_exec_log_path = if self.state.invocation_id().is_none() {
-            self.state.exec_log_path().cloned()
-        } else {
-            None
-        };
         self.state.reset();
         if let Some(mapper) = &mut self.mapper {
             mapper.reset();
-        }
-        if let Some(path) = carry_exec_log_path {
-            self.state.set_exec_log_path(Some(path));
         }
 
         self.state.set_invocation_id(args.uuid.clone());
@@ -312,21 +304,6 @@ impl EventRouter {
                 args.host.as_deref(),
                 args.user.as_deref(),
             );
-        }
-        self.retry_pending_exec_log_on_started();
-    }
-
-    fn retry_pending_exec_log_on_started(&mut self) {
-        let Some(path) = self.state.exec_log_path().cloned() else {
-            return;
-        };
-        // Absolute paths are already actionable from OptionsParsed; retry only
-        // relative paths that may have been skipped while workspace was unknown.
-        if !path.is_relative() {
-            return;
-        }
-        if let Some(mapper) = &mut self.mapper {
-            mapper.on_exec_log_detected(path);
         }
     }
 

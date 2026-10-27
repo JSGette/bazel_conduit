@@ -88,31 +88,23 @@ fn exec_log_is_ignored_without_opt_in() {
 }
 
 #[test]
-fn options_parsed_before_started_retains_exec_log_path() {
+fn exec_log_path_is_captured_with_opt_in() {
     let mut router = EventRouter::new().with_exec_log(true);
-
-    let options = make_event(r#"{
-        "id": {"optionsParsed": {}},
-        "optionsParsed": {
-            "cmdLine": [],
-            "explicitCmdLine": ["--execution_log_compact_file=exec.log"]
-        }
-    }"#);
-    router.route(&options).unwrap();
-    assert_eq!(
-        router.state().exec_log_path().map(|p| p.to_string_lossy().to_string()),
-        Some("exec.log".to_string())
-    );
-
-    let started = make_event(r#"{
+    router.route(&make_event(r#"{
         "id": {"started": {}},
         "started": {
             "uuid": "44444444-4444-4444-4444-444444444444",
             "command": "build",
             "workspaceDirectory": "/tmp/ws"
         }
-    }"#);
-    router.route(&started).unwrap();
+    }"#)).unwrap();
+    router.route(&make_event(r#"{
+        "id": {"optionsParsed": {}},
+        "optionsParsed": {
+            "cmdLine": [],
+            "explicitCmdLine": ["--execution_log_compact_file=exec.log"]
+        }
+    }"#)).unwrap();
     assert_eq!(
         router.state().exec_log_path().map(|p| p.to_string_lossy().to_string()),
         Some("exec.log".to_string())
