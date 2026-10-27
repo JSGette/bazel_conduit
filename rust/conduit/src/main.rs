@@ -239,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
         info!("  Process JSON file: conduit --input <file.json> [--export stdout|otlp]");
         info!("  Start gRPC server: conduit --serve [--port 8080] [--export stdout|otlp]");
         info!("");
-        info!("For Bazel, use: bazel build //... --bes_backend=grpc://localhost:{}", args.port);
+        info!("For Bazel, use: bazel build //... --bes_backend=grpc://127.0.0.1:{}", args.port);
     }
 
     if let Some(tp) = tracer_provider {

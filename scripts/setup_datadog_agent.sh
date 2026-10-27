@@ -239,7 +239,7 @@ cat <<EOF
 ==================================================================
 Add the following to your user.bazelrc (or .bazelrc):
 ------------------------------------------------------------------
-common --bes_backend=grpc://localhost:${CONDUIT_BES_PORT}
+common --bes_backend=grpc://127.0.0.1:${CONDUIT_BES_PORT}
 ${EXEC_LOG_RC}# Optional: emit BEP for every action, not just the failing/test ones.
 build  --build_event_publish_all_actions
 

@@ -98,7 +98,7 @@ You should see `OTLP receiver: enabled` and `API Keys status: API key ending wit
 Add to `user.bazelrc` (or `~/.bazelrc` for global, or `.bazelrc` if your repo allows committed config):
 
 ```
-common --bes_backend=grpc://localhost:8080
+common --bes_backend=grpc://127.0.0.1:8080
 
 # Optional: emit BEP for every action, not just failed/test ones.
 build --build_event_publish_all_actions
@@ -142,6 +142,6 @@ Traces should appear in your Datadog org under **APM → Services → bazel-cond
 | `datadog-agent restart-service` "unknown command"                | That subcommand is Linux-only.                                                                     | macOS: `launchctl kickstart -k gui/$(id -u)/com.datadoghq.agent`.                                    |
 | Repeated keychain password prompts on every `dd-auth` invocation | Keychain ACL is set to "Confirm before allowing".                                                  | Click "Always Allow" on the next prompt, or delete + recreate the entries (see step 1).              |
 | `OTLP receiver: disabled` in `datadog-agent status`              | `otlp_config:` block missing or malformed in `datadog.yaml`.                                       | Re-check step 2; YAML indentation matters.                                                           |
-| Bazel build hangs at `--bes_backend=grpc://localhost:8080`       | conduit isn't running on that port.                                                                | Start conduit (step 5) or remove the `bes_backend` line from `bazelrc`.                              |
+| Bazel build hangs at `--bes_backend=grpc://127.0.0.1:8080`       | conduit isn't running on that port.                                                                | Start conduit (step 5) or remove the `bes_backend` line from `bazelrc`.                              |
 | Traces show up but spawn child spans don't                       | conduit not started with `--exec-log`, `--execution_log_compact_file=` not set, or conduit and Bazel are on different hosts. | Start conduit with `--exec-log` and add the flag to `bazelrc`. Conduit reads the file locally — it must run on the same host as Bazel. |
 | API key in datadog.yaml doesn't match the org I'm targeting      | `dd-auth` cached an older key, or you authed against the wrong `--domain`.                         | `./setup_datadog_agent.sh --refresh-token --domain <correct-domain>` (or `dd-auth --no-cache …`).    |

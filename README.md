@@ -96,7 +96,7 @@ bazel build //rust/conduit:conduit
 
 # Run Bazel with conduit as BES backend
 bazel build //your:target \
-  --bes_backend=grpc://localhost:8080 \
+  --bes_backend=grpc://127.0.0.1:8080 \
   --build_event_publish_all_actions
 ```
 

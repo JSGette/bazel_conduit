@@ -4,7 +4,7 @@
 //! BES gRPC server implementation
 //!
 //! Implements the Google Build Event Service (BES) gRPC API.
-//! Bazel connects to this server via --bes_backend=grpc://localhost:<port>
+//! Bazel connects to this server via --bes_backend=grpc://127.0.0.1:<port>
 
 use crate::bep::EventRouter;
 use crate::bes_events::build_event::Event as BesEvent;
@@ -679,10 +679,9 @@ pub async fn run_server(
     };
 
     info!("Starting BES gRPC server on {}", addr);
-    info!(
-        "Connect Bazel with: --bes_backend=grpc://localhost:{}",
-        addr.port()
-    );
+    if !addr.ip().is_unspecified() {
+        info!("Connect Bazel with: --bes_backend=grpc://{}", addr);
+    }
 
     let service = PublishBuildEventServer::new(server)
         .max_decoding_message_size(MAX_INCOMING_MESSAGE_BYTES);
