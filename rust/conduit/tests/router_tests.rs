@@ -74,8 +74,22 @@ fn router_reset_clears_state() {
 }
 
 #[test]
-fn options_parsed_before_started_retains_exec_log_path() {
+fn exec_log_is_ignored_without_opt_in() {
     let mut router = EventRouter::new();
+    let options = make_event(r#"{
+        "id": {"optionsParsed": {}},
+        "optionsParsed": {
+            "cmdLine": [],
+            "explicitCmdLine": ["--execution_log_compact_file=/tmp/exec.log"]
+        }
+    }"#);
+    router.route(&options).unwrap();
+    assert!(router.state().exec_log_path().is_none());
+}
+
+#[test]
+fn options_parsed_before_started_retains_exec_log_path() {
+    let mut router = EventRouter::new().with_exec_log(true);
 
     let options = make_event(r#"{
         "id": {"optionsParsed": {}},

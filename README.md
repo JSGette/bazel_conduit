@@ -123,6 +123,7 @@ bazel build //your:target --build_event_json_file=bep.ndjson
 | `--log-level <LEVEL>` | Log level (trace/debug/info/warn/error) | `info` |
 | `--no-redact` | Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags | off (scrubbing on) |
 | `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable) | built-in defaults |
+| `--exec-log` | Tail Bazel's compact execution log for per-spawn detail. Without it, conduit ignores the exec log even when the build writes one. | off |
 | `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_compact_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
 | `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
 | `--trace-profile <PROFILE>` | Trace verbosity: `auto`, `lightweight`, or `full`. See [Trace Profiles](#trace-profiles). | `auto` |
@@ -249,7 +250,8 @@ apply 10–25% head sampling if volume is still high.
 
 ### Execution Log Enrichment (live tailed)
 
-When Bazel is run with `--execution_log_compact_file=exec.compact`, conduit
+Opt-in: conduit must be started with `--exec-log`. When Bazel is then run with
+`--execution_log_compact_file=exec.compact`, conduit
 detects the flag in `OptionsParsed`, opens the file as it's being written,
 and **tail-follows** it in a dedicated blocking thread for the rest of the
 build. Each `SpawnExec` it decodes:
@@ -298,7 +300,7 @@ endpoint cannot be used as a live source.
 
 | Source | Live streaming? | Dedup table? | Conduit support |
 |---|---|---|---|
-| `--execution_log_compact_file=<path>` | Yes (best-effort, 128 KiB chunks) | Yes | **Live tailed, default path** |
+| `--execution_log_compact_file=<path>` | Yes (best-effort, 128 KiB chunks) | Yes | **Live tailed (with `--exec-log`)** |
 | `--experimental_execution_log_compact_file=<path>` (alias) | Yes | Yes | Live tailed |
 | `--execution_log_binary_file=<path>` | No (would need full buffer) | No | Warned, ignored |
 | `--execution_log_json_file=<path>` | No | No | Warned, ignored |

@@ -35,7 +35,7 @@ bazel build //rust/conduit:conduit
 CONDUIT_BIN="${REPO_ROOT}/bazel-bin/rust/conduit/conduit"
 
 echo "Starting conduit --serve on :${PORT} (profile=${PROFILE})..."
-"${CONDUIT_BIN}" --serve --port "${PORT}" --export stdout \
+"${CONDUIT_BIN}" --serve --port "${PORT}" --export stdout --exec-log \
   --trace-profile "${PROFILE}" --log-level error > "${TRACE_OUT}" 2>/dev/null &
 CONDUIT_PID=$!
 trap 'kill "${CONDUIT_PID}" 2>/dev/null || true' EXIT

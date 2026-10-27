@@ -99,13 +99,15 @@ Add to `user.bazelrc` (or `~/.bazelrc` for global, or `.bazelrc` if your repo al
 
 ```
 common --bes_backend=grpc://localhost:8080
-common --execution_log_compact_file=/tmp/conduit-exec.log
 
 # Optional: emit BEP for every action, not just failed/test ones.
 build --build_event_publish_all_actions
+
+# Optional, needs conduit started with --exec-log: per-spawn detail.
+# common --execution_log_compact_file=/tmp/conduit-exec.log
 ```
 
-`bes_backend` points at the conduit gRPC server (default port `8080`); `execution_log_compact_file` makes Bazel write the post-build spawn log that conduit ingests for full per-spawn detail (commands, cache hits, timings).
+`bes_backend` points at the conduit gRPC server (default port `8080`). For per-spawn detail (commands, cache hits, timing breakdown), also set `execution_log_compact_file` and start conduit with `--exec-log` (`CONDUIT_EXEC_LOG=/tmp/conduit-exec.log` does both in `setup_datadog_agent.sh`).
 
 Bazel builds emit tens of thousands of spans, mostly fast cache hits. By default conduit runs in `auto` trace profile: with `--build_event_publish_all_actions` it emits everything (`full`), without it emits a `lightweight` trace (errors, cache misses, and operations >= 500 ms), which is a large ingestion cut with full diagnostics for slow/failed builds. Pin it with `--trace-profile lightweight|full` and tune `--trace-min-duration-ms`. See the [Trace Profiles](../README.md#trace-profiles) section for the ingestion-reduction rollout (including agent-side sampling and retention filters).
 
@@ -141,5 +143,5 @@ Traces should appear in your Datadog org under **APM → Services → bazel-cond
 | Repeated keychain password prompts on every `dd-auth` invocation | Keychain ACL is set to "Confirm before allowing".                                                  | Click "Always Allow" on the next prompt, or delete + recreate the entries (see step 1).              |
 | `OTLP receiver: disabled` in `datadog-agent status`              | `otlp_config:` block missing or malformed in `datadog.yaml`.                                       | Re-check step 2; YAML indentation matters.                                                           |
 | Bazel build hangs at `--bes_backend=grpc://localhost:8080`       | conduit isn't running on that port.                                                                | Start conduit (step 5) or remove the `bes_backend` line from `bazelrc`.                              |
-| Traces show up but spawn child spans don't                       | `--execution_log_compact_file=` not set, or conduit and Bazel are on different hosts.              | Add the flag to `bazelrc`. Conduit reads the file locally — it must run on the same host as Bazel. |
+| Traces show up but spawn child spans don't                       | conduit not started with `--exec-log`, `--execution_log_compact_file=` not set, or conduit and Bazel are on different hosts. | Start conduit with `--exec-log` and add the flag to `bazelrc`. Conduit reads the file locally — it must run on the same host as Bazel. |
 | API key in datadog.yaml doesn't match the org I'm targeting      | `dd-auth` cached an older key, or you authed against the wrong `--domain`.                         | `./setup_datadog_agent.sh --refresh-token --domain <correct-domain>` (or `dd-auth --no-cache …`).    |

@@ -74,6 +74,12 @@ struct Args {
     #[arg(long = "redact-name-pattern", value_name = "SUBSTR")]
     redact_name_patterns: Vec<String>,
 
+    /// Enrich actions with per-spawn detail from Bazel's compact execution
+    /// log (`--execution_log_compact_file`). Off by default: conduit ignores
+    /// the exec log even when the build writes one.
+    #[arg(long, default_value_t = false)]
+    exec_log: bool,
+
     /// Per-message cap (in MiB) on length-delimited entries in Bazel's
     /// `--execution_log_{binary,compact}_file`. A malformed varint length
     /// prefix would otherwise be fed straight to `Vec::resize`. The default
@@ -172,10 +178,12 @@ async fn main() -> anyhow::Result<()> {
         (args.exec_log_max_message_mib as usize).saturating_mul(1024 * 1024);
     let exec_log_max_decompressed_bytes =
         (args.exec_log_max_decompressed_mib as usize).saturating_mul(1024 * 1024);
-    info!(
-        "Execution log caps: {} MiB per message, {} MiB decompressed total",
-        args.exec_log_max_message_mib, args.exec_log_max_decompressed_mib
-    );
+    if args.exec_log {
+        info!(
+            "Execution log enrichment: enabled ({} MiB per message, {} MiB decompressed total)",
+            args.exec_log_max_message_mib, args.exec_log_max_decompressed_mib
+        );
+    }
 
     let trace_profile = TraceProfile::parse(&args.trace_profile).ok_or_else(|| {
         anyhow::anyhow!(
@@ -191,8 +199,10 @@ async fn main() -> anyhow::Result<()> {
 
     let export = tracer_provider.clone().zip(logger_provider.clone());
     let trace_min_duration_ms = args.trace_min_duration_ms;
+    let exec_log = args.exec_log;
     let make_router = move || {
         let router = EventRouter::new()
+            .with_exec_log(exec_log)
             .with_redactor(redactor.clone())
             .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
             .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)

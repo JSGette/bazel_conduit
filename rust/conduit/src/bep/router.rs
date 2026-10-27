@@ -145,6 +145,8 @@ pub struct EventRouter {
     requested_profile: TraceProfile,
     /// Minimum operation duration (ms) kept by the lightweight profile.
     trace_min_duration_ms: i64,
+    /// Tail Bazel's compact exec log when the build writes one (`--exec-log`).
+    exec_log: bool,
 }
 
 impl EventRouter {
@@ -159,7 +161,15 @@ impl EventRouter {
                 crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
             requested_profile: TraceProfile::default(),
             trace_min_duration_ms: DEFAULT_TRACE_MIN_DURATION_MS,
+            exec_log: false,
         }
+    }
+
+    /// Enable exec-log enrichment. Off by default: a build that writes an
+    /// exec log for other reasons must not suddenly emit spawn spans.
+    pub fn with_exec_log(mut self, enabled: bool) -> Self {
+        self.exec_log = enabled;
+        self
     }
 
     /// Set the requested trace profile and lightweight duration threshold.
@@ -342,10 +352,12 @@ impl EventRouter {
             mapper.set_trace_policy(policy);
         }
 
-        if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
-            self.state.set_exec_log_path(Some(path.clone()));
-            if let Some(mapper) = &mut self.mapper {
-                mapper.on_exec_log_detected(path);
+        if self.exec_log {
+            if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
+                self.state.set_exec_log_path(Some(path.clone()));
+                if let Some(mapper) = &mut self.mapper {
+                    mapper.on_exec_log_detected(path);
+                }
             }
         }
 
