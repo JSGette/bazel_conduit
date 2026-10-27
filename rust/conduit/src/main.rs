@@ -233,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
             let mut router = make_router();
             let count = replay(File::open(&file)?, &mut router)?;
             router.finish();
-            info!("Replayed {count} events from {}\n{}", file.display(), router.state().summary());
+            info!("Replayed {count} events from {}: {}", file.display(), router.summary());
         }
         Command::Serve { port, listen_addr, .. } => {
             serve(SocketAddr::new(listen_addr, port), make_router).await?;

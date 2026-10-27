@@ -82,8 +82,8 @@ mod tests {
         let bytes = encode(&[started(), finished(), started()]);
         let mut router = EventRouter::new();
         assert_eq!(replay(bytes.as_slice(), &mut router).unwrap(), 2);
-        assert_eq!(router.state().command(), Some("build"));
-        assert_eq!(router.state().exit_code(), Some(0));
+        assert_eq!(router.summary().command.as_deref(), Some("build"));
+        assert_eq!(router.summary().exit_code, Some(0));
     }
 
     #[test]

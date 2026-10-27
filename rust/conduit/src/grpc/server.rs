@@ -152,8 +152,7 @@ pub(crate) async fn route_stream(
         router.shutdown();
     }
     router.finish();
-    info!("\n{}", router.state().summary());
-    info!("Routing worker drained ({routed} events routed)");
+    info!("Routing worker drained ({routed} events routed): {}", router.summary());
     router
 }
 
@@ -414,210 +413,6 @@ pub(crate) fn decode_bep_event_from_request(
     }
 }
 
-/// Duration to milliseconds (for JSON). Accepts proto Duration (seconds + nanos).
-fn duration_to_ms(seconds: i64, nanos: i32) -> i64 {
-    seconds * 1000 + i64::from(nanos) / 1_000_000
-}
-
-/// Serialize BuildMetrics proto to JSON (full extraction for OTEL).
-pub(crate) fn build_metrics_to_json(
-    m: &crate::build_event_stream::BuildMetrics,
-) -> serde_json::Value {
-    use serde_json::json;
-
-    let action_summary = m.action_summary.as_ref().map(|a| {
-        let action_data: Vec<serde_json::Value> = a
-            .action_data
-            .iter()
-            .map(|ad| {
-                json!({
-                    "mnemonic": ad.mnemonic,
-                    "actionsExecuted": ad.actions_executed,
-                    "firstStartedMs": ad.first_started_ms,
-                    "lastEndedMs": ad.last_ended_ms,
-                    "systemTimeNanos": ad.system_time.as_ref().map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos)),
-                    "userTimeNanos": ad.user_time.as_ref().map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos)),
-                    "actionsCreated": ad.actions_created,
-                })
-            })
-            .collect();
-        let runner_count: Vec<serde_json::Value> = a
-            .runner_count
-            .iter()
-            .map(|r| json!({"name": r.name, "count": r.count, "execKind": r.exec_kind}))
-            .collect();
-        let action_cache = a.action_cache_statistics.as_ref().map(|acs| {
-            let miss_details: Vec<serde_json::Value> = acs
-                .miss_details
-                .iter()
-                .map(|md| json!({"reason": md.reason, "count": md.count}))
-                .collect();
-            json!({
-                "hits": acs.hits,
-                "misses": acs.misses,
-                "saveTimeInMs": acs.save_time_in_ms,
-                "loadTimeInMs": acs.load_time_in_ms,
-                "missDetails": miss_details,
-            })
-        });
-        json!({
-            "actionsCreated": a.actions_created,
-            "actionsExecuted": a.actions_executed,
-            "actionData": action_data,
-            "runnerCount": runner_count,
-            "actionCacheStatistics": action_cache,
-        })
-    });
-
-    let timing = m.timing_metrics.as_ref().map(|t| {
-        json!({
-            "wallTimeInMs": t.wall_time_in_ms,
-            "cpuTimeInMs": t.cpu_time_in_ms,
-            "analysisPhaseTimeInMs": t.analysis_phase_time_in_ms,
-            "executionPhaseTimeInMs": t.execution_phase_time_in_ms,
-            "actionsExecutionStartInMs": t.actions_execution_start_in_ms,
-            "criticalPathMs": t.critical_path_time.as_ref().map(|d| duration_to_ms(d.seconds, d.nanos)),
-        })
-    });
-
-    let memory = m.memory_metrics.as_ref().map(|mm| {
-        let garbage: Vec<serde_json::Value> = mm
-            .garbage_metrics
-            .iter()
-            .map(|g| json!({"type": g.r#type, "garbageCollected": g.garbage_collected}))
-            .collect();
-        json!({
-            "usedHeapSizePostBuild": mm.used_heap_size_post_build,
-            "peakPostGcHeapSize": mm.peak_post_gc_heap_size,
-            "garbageMetrics": garbage,
-        })
-    });
-
-    let target = m.target_metrics.as_ref().map(|tm| {
-        json!({
-            "targetsConfigured": tm.targets_configured,
-            "targetsConfiguredNotIncludingAspects": tm.targets_configured_not_including_aspects,
-            "targetsLoaded": tm.targets_loaded,
-        })
-    });
-
-    let packages = m.package_metrics.as_ref().map(|pm| {
-        json!({
-            "packagesLoaded": pm.packages_loaded,
-        })
-    });
-
-    let artifacts = m.artifact_metrics.as_ref().map(|am| {
-        let src = am.source_artifacts_read.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
-        let out = am.output_artifacts_seen.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
-        let cache = am.output_artifacts_from_action_cache.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
-        let top = am.top_level_artifacts.as_ref().map(|f| json!({"count": f.count, "sizeInBytes": f.size_in_bytes}));
-        json!({
-            "sourceArtifactsRead": src,
-            "outputArtifactsSeen": out,
-            "outputArtifactsFromActionCache": cache,
-            "topLevelArtifacts": top,
-        })
-    });
-
-    let network = m.network_metrics.as_ref().and_then(|nm| {
-        nm.system_network_stats.as_ref().map(|sns| {
-            json!({
-                "bytesSent": sns.bytes_sent,
-                "bytesRecv": sns.bytes_recv,
-                "packetsSent": sns.packets_sent,
-                "packetsRecv": sns.packets_recv,
-            })
-        })
-    });
-
-    let cumulative = m.cumulative_metrics.as_ref().map(|cm| {
-        json!({
-            "numAnalyses": cm.num_analyses,
-            "numBuilds": cm.num_builds,
-        })
-    });
-
-    let dynamic_exec = m.dynamic_execution_metrics.as_ref().map(|de| {
-        let race_stats: Vec<serde_json::Value> = de
-            .race_statistics
-            .iter()
-            .map(|rs| {
-                json!({
-                    "mnemonic": rs.mnemonic,
-                    "localWins": rs.local_wins,
-                    "remoteWins": rs.remote_wins,
-                })
-            })
-            .collect();
-        json!({ "raceStatistics": race_stats })
-    });
-
-    let workers: Vec<serde_json::Value> = m
-        .worker_metrics
-        .iter()
-        .map(|wm| {
-            let worker_ids: Vec<i64> = wm.worker_ids.iter().map(|&id| id as i64).collect();
-            json!({
-                "workerIds": worker_ids,
-                "mnemonic": wm.mnemonic,
-                "isMultiplex": wm.is_multiplex,
-                "isSandbox": wm.is_sandbox,
-                "isMeasurable": wm.is_measurable,
-            })
-        })
-        .collect();
-
-    let worker_pools: Vec<serde_json::Value> = m
-        .worker_pool_metrics
-        .iter()
-        .flat_map(|wpm| {
-            wpm.worker_pool_stats.iter().map(|wps| {
-                json!({
-                    "hash": wps.hash,
-                    "mnemonic": wps.mnemonic,
-                    "createdCount": wps.created_count,
-                    "aliveCount": wps.alive_count,
-                })
-            })
-        })
-        .collect();
-
-    let build_graph = m.build_graph_metrics.as_ref().map(|bg| {
-        json!({
-            "actionLookupValueCount": bg.action_lookup_value_count,
-            "actionCount": bg.action_count,
-            "inputFileConfiguredTargetCount": bg.input_file_configured_target_count,
-            "outputFileConfiguredTargetCount": bg.output_file_configured_target_count,
-            "otherConfiguredTargetCount": bg.other_configured_target_count,
-            "outputArtifactCount": bg.output_artifact_count,
-            "postInvocationSkyframeNodeCount": bg.post_invocation_skyframe_node_count,
-        })
-    });
-
-    serde_json::json!({
-        "actionSummary": action_summary,
-        "timingMetrics": timing,
-        "memoryMetrics": memory,
-        "targetMetrics": target,
-        "packageMetrics": packages,
-        "artifactMetrics": artifacts,
-        "networkMetrics": network,
-        "cumulativeMetrics": cumulative,
-        "dynamicExecutionMetrics": dynamic_exec,
-        "workerMetrics": workers,
-        "workerPoolMetrics": worker_pools,
-        "buildGraphMetrics": build_graph,
-    })
-}
-
-pub(crate) fn build_metadata_to_json(
-    bm: &crate::build_event_stream::BuildMetadata,
-) -> serde_json::Value {
-    serde_json::json!({ "metadata": bm.metadata })
-}
-
-
 /// Extract URI from a BEP File oneof, if present.
 pub(crate) fn bep_file_uri(f: &crate::build_event_stream::File) -> Option<String> {
     use crate::build_event_stream::file::File as FileContent;
@@ -625,44 +420,6 @@ pub(crate) fn bep_file_uri(f: &crate::build_event_stream::File) -> Option<String
         FileContent::Uri(u) => Some(u.clone()),
         _ => None,
     })
-}
-
-
-/// Convert a BEP AbortReason enum to a human-readable string.
-pub(crate) fn aborted_reason_to_str(
-    reason: crate::build_event_stream::aborted::AbortReason,
-) -> &'static str {
-    use crate::build_event_stream::aborted::AbortReason;
-    match reason {
-        AbortReason::Unknown => "UNKNOWN",
-        AbortReason::UserInterrupted => "USER_INTERRUPTED",
-        AbortReason::NoAnalyze => "NO_ANALYZE",
-        AbortReason::NoBuild => "NO_BUILD",
-        AbortReason::TimeOut => "TIME_OUT",
-        AbortReason::RemoteEnvironmentFailure => "REMOTE_ENVIRONMENT_FAILURE",
-        AbortReason::Internal => "INTERNAL",
-        AbortReason::LoadingFailure => "LOADING_FAILURE",
-        AbortReason::AnalysisFailure => "ANALYSIS_FAILURE",
-        AbortReason::Skipped => "SKIPPED",
-        AbortReason::Incomplete => "INCOMPLETE",
-        AbortReason::OutOfMemory => "OUT_OF_MEMORY",
-    }
-}
-
-/// Convert a BEP TestStatus enum (i32) to a human-readable string.
-pub(crate) fn test_status_to_str(status: i32) -> &'static str {
-    match status {
-        0 => "NO_STATUS",
-        1 => "PASSED",
-        2 => "FLAKY",
-        3 => "TIMEOUT",
-        4 => "FAILED",
-        5 => "INCOMPLETE",
-        6 => "REMOTE_FAILURE",
-        7 => "FAILED_TO_BUILD",
-        8 => "TOOL_HALTED_BEFORE_TESTING",
-        _ => "UNKNOWN",
-    }
 }
 
 /// Run the BES gRPC server until `shutdown` resolves, then finalize every
@@ -749,10 +506,10 @@ mod tests {
         drop((tx_a, tx_b));
 
         let (a, b) = (a.await.unwrap(), b.await.unwrap());
-        assert_eq!(a.state().invocation_id(), Some("uuid-a"));
-        assert_eq!(a.state().command(), Some("build"));
-        assert_eq!(b.state().invocation_id(), Some("uuid-b"));
-        assert_eq!(b.state().command(), Some("test"));
+        assert_eq!(a.summary().invocation_id.as_deref(), Some("uuid-a"));
+        assert_eq!(a.summary().command.as_deref(), Some("build"));
+        assert_eq!(b.summary().invocation_id.as_deref(), Some("uuid-b"));
+        assert_eq!(b.summary().command.as_deref(), Some("test"));
     }
 
     #[tokio::test]
@@ -764,7 +521,7 @@ mod tests {
         drop(tx);
 
         let router = worker.await.unwrap();
-        assert_eq!(router.state().invocation_id(), Some("uuid-a"));
+        assert_eq!(router.summary().invocation_id.as_deref(), Some("uuid-a"));
     }
 
     #[tokio::test]
@@ -793,7 +550,7 @@ mod tests {
         tx.send(started(1, "uuid-a", "build")).await.unwrap();
 
         let router = route_stream(EventRouter::new(), rx, stop_rx).await;
-        assert_eq!(router.state().invocation_id(), Some("uuid-a"));
+        assert_eq!(router.summary().invocation_id.as_deref(), Some("uuid-a"));
         assert!(tx.is_closed());
         drop(stop_tx);
     }

@@ -1126,3 +1126,40 @@ fn lightweight_keeps_failed_target() {
         "failed target kept in lightweight",
     );
 }
+
+#[test]
+fn build_metrics_set_root_attrs_and_root_contains_finish() {
+    use crate::build_event_stream::build_metrics::{
+        action_summary::RunnerCount, ActionSummary, TimingMetrics,
+    };
+    use crate::build_event_stream::BuildMetrics;
+
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_build_finished(Some(0), Some(5_000_000_000), None);
+    mapper.on_build_metrics(&BuildMetrics {
+        action_summary: Some(ActionSummary {
+            actions_created: 7,
+            runner_count: vec![RunnerCount {
+                name: "remote".into(),
+                count: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        // Wall time ends at 3s, before BuildFinished at 5s.
+        timing_metrics: Some(TimingMetrics {
+            wall_time_in_ms: 2_000,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == opentelemetry::trace::SpanId::INVALID)
+        .expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_METRICS_ACTIONS_CREATED).as_deref(), Some("7"));
+    assert_eq!(attr_value(&root, BAZEL_METRICS_WALL_TIME_MS).as_deref(), Some("2000"));
+    assert_eq!(attr_value(&root, "bazel.metrics.runner.remote").as_deref(), Some("3"));
+    assert_eq!(root.end_time, super::nanos_to_system_time(5_000_000_000));
+}

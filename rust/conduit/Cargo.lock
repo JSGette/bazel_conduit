@@ -270,8 +270,6 @@ dependencies = [
  "prost-types",
  "protoc-gen-prost",
  "protoc-gen-tonic",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

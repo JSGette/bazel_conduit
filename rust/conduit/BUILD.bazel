@@ -13,12 +13,8 @@ rust_library(
     crate_name = "conduit_state",
     crate_root = "src/state/mod.rs",
     srcs = [
-        "src/state/build_state.rs",
         "src/state/mod.rs",
         "src/state/trace_profile.rs",
-    ],
-    deps = [
-        "@crates//:serde_json",
     ],
 )
 
@@ -93,8 +89,6 @@ rust_library(
         "@crates//:opentelemetry_sdk",
         "@crates//:prost",
         "@crates//:prost-types",
-        "@crates//:serde",
-        "@crates//:serde_json",
         "@crates//:thiserror",
         "@crates//:tokio",
         "@crates//:tokio-stream",

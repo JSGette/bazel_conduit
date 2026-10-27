@@ -620,7 +620,7 @@ impl OtelMapper {
     // =====================================================================
 
     /// BuildMetadata → add as attributes on root span.
-    pub fn on_build_metadata(&mut self, metadata: &serde_json::Value) {
+    pub fn on_build_metadata(&mut self, metadata: &crate::build_event_stream::BuildMetadata) {
         metadata_handlers::apply_build_metadata(self, metadata);
     }
 
@@ -656,8 +656,7 @@ impl OtelMapper {
     }
 
     /// BuildMetrics → add metrics attributes to root span.
-    /// Supports both legacy flat payload (actionsCreated/actionsExecuted) and full nested payload.
-    pub fn on_build_metrics(&mut self, metrics: &serde_json::Value) {
+    pub fn on_build_metrics(&mut self, metrics: &crate::build_event_stream::BuildMetrics) {
         metrics::apply_build_metrics(self, metrics);
     }
 
@@ -666,7 +665,7 @@ impl OtelMapper {
     // =====================================================================
 
     /// BuildToolLogs → extract critical path info, set root attribute for URI, emit span event.
-    pub fn on_build_tool_logs(&mut self, logs: &serde_json::Value) {
+    pub fn on_build_tool_logs(&mut self, logs: &crate::build_event_stream::BuildToolLogs) {
         metadata_handlers::apply_build_tool_logs(self, logs);
     }
 

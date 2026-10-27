@@ -3,179 +3,107 @@
 
 use super::super::attributes::*;
 use super::OtelMapper;
+use crate::build_event_stream::BuildMetrics;
 use opentelemetry::KeyValue;
 
-pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, metrics: &serde_json::Value) {
+pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
     if mapper.root_context.is_none() {
         return;
     }
-    let Some(obj) = metrics.as_object() else {
-        return;
-    };
+    let mut attrs: Vec<KeyValue> = Vec::new();
 
-    let summary = obj.get("actionSummary").or(Some(metrics));
-    apply_action_summary_attrs(mapper, summary);
-    apply_timing_metrics_attrs(mapper, obj);
-    apply_memory_metrics_attrs(mapper, obj);
-    apply_target_package_metrics_attrs(mapper, obj);
-    apply_artifact_metrics_attrs(mapper, obj);
-    apply_network_metrics_attrs(mapper, obj);
-    apply_runner_count_attrs(mapper, summary);
-    apply_cumulative_metrics_attrs(mapper, obj);
-}
-
-fn apply_action_summary_attrs(mapper: &OtelMapper, summary: Option<&serde_json::Value>) {
-    let Some(s) = summary.and_then(|v| v.as_object()) else {
-        return;
-    };
-    if let Some(v) = s.get("actionsCreated").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_ACTIONS_CREATED, v));
-    }
-    if let Some(v) = s.get("actionsExecuted").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTED, v));
-    }
-    if let Some(action_data) = s.get("actionData").and_then(|v| v.as_array()) {
-        for entry in action_data {
-            let mnemonic = entry
-                .get("mnemonic")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let count = entry
-                .get("actionsExecuted")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            mapper.set_root_attr(KeyValue::new(format!("bazel.metrics.actions.{mnemonic}"), count));
+    if let Some(s) = &m.action_summary {
+        attrs.push(KeyValue::new(BAZEL_METRICS_ACTIONS_CREATED, s.actions_created));
+        attrs.push(KeyValue::new(BAZEL_METRICS_ACTIONS_EXECUTED, s.actions_executed));
+        for ad in &s.action_data {
+            attrs.push(KeyValue::new(
+                format!("bazel.metrics.actions.{}", ad.mnemonic),
+                ad.actions_executed,
+            ));
+        }
+        if let Some(acs) = &s.action_cache_statistics {
+            attrs.push(KeyValue::new(BAZEL_METRICS_CACHE_HITS, i64::from(acs.hits)));
+            attrs.push(KeyValue::new(BAZEL_METRICS_CACHE_MISSES, i64::from(acs.misses)));
+        }
+        for r in &s.runner_count {
+            attrs.push(KeyValue::new(
+                format!("bazel.metrics.runner.{}", r.name),
+                i64::from(r.count),
+            ));
         }
     }
-    if let Some(acs) = s.get("actionCacheStatistics").and_then(|v| v.as_object()) {
-        if let Some(v) = acs.get("hits").and_then(|v| v.as_i64()) {
-            mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_CACHE_HITS, v));
-        }
-        if let Some(v) = acs.get("misses").and_then(|v| v.as_i64()) {
-            mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_CACHE_MISSES, v));
-        }
-    }
-}
 
-fn apply_timing_metrics_attrs(
-    mapper: &mut OtelMapper,
-    obj: &serde_json::Map<String, serde_json::Value>,
-) {
-    let Some(t) = obj.get("timingMetrics").and_then(|v| v.as_object()) else {
-        return;
-    };
-    if let Some(v) = t.get("wallTimeInMs").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_WALL_TIME_MS, v));
+    if let Some(t) = &m.timing_metrics {
+        attrs.extend([
+            KeyValue::new(BAZEL_METRICS_WALL_TIME_MS, t.wall_time_in_ms),
+            KeyValue::new(BAZEL_METRICS_CPU_TIME_MS, t.cpu_time_in_ms),
+            KeyValue::new(BAZEL_METRICS_ANALYSIS_PHASE_MS, t.analysis_phase_time_in_ms),
+            KeyValue::new(BAZEL_METRICS_EXECUTION_PHASE_MS, t.execution_phase_time_in_ms),
+            KeyValue::new(
+                BAZEL_METRICS_ACTIONS_EXECUTION_START_MS,
+                t.actions_execution_start_in_ms,
+            ),
+        ]);
+        if let Some(d) = &t.critical_path_time {
+            attrs.push(KeyValue::new(
+                BAZEL_METRICS_CRITICAL_PATH_MS,
+                d.seconds * 1000 + i64::from(d.nanos) / 1_000_000,
+            ));
+        }
         if let Some(start) = mapper.root_span_start_nanos {
-            mapper.root_span_end_from_wall_nanos = Some(start + v.saturating_mul(1_000_000));
+            // Wall time can stop short of the last action/target end, and
+            // BuildFinished can precede it; the root must contain both.
+            let wall_end = start + t.wall_time_in_ms.saturating_mul(1_000_000);
+            mapper.root_span_end_from_wall_nanos =
+                Some(mapper.finish_time_nanos.map_or(wall_end, |f| f.max(wall_end)));
         }
     }
-    let timing_attrs: &[(&str, &str)] = &[
-        ("cpuTimeInMs", BAZEL_METRICS_CPU_TIME_MS),
-        ("analysisPhaseTimeInMs", BAZEL_METRICS_ANALYSIS_PHASE_MS),
-        ("executionPhaseTimeInMs", BAZEL_METRICS_EXECUTION_PHASE_MS),
-        ("criticalPathMs", BAZEL_METRICS_CRITICAL_PATH_MS),
-        ("actionsExecutionStartInMs", BAZEL_METRICS_ACTIONS_EXECUTION_START_MS),
-    ];
-    for &(json_key, attr_key) in timing_attrs {
-        if let Some(v) = t.get(json_key).and_then(|v| v.as_i64()) {
-            mapper.set_root_attr(KeyValue::new(attr_key, v));
+
+    if let Some(mm) = &m.memory_metrics {
+        attrs.push(KeyValue::new(BAZEL_METRICS_HEAP_POST_BUILD, mm.used_heap_size_post_build));
+        attrs.push(KeyValue::new(BAZEL_METRICS_PEAK_HEAP_POST_GC, mm.peak_post_gc_heap_size));
+    }
+    if let Some(tm) = &m.target_metrics {
+        attrs.push(KeyValue::new(BAZEL_METRICS_TARGETS_CONFIGURED, tm.targets_configured));
+    }
+    if let Some(pm) = &m.package_metrics {
+        attrs.push(KeyValue::new(BAZEL_METRICS_PACKAGES_LOADED, pm.packages_loaded));
+    }
+
+    if let Some(am) = &m.artifact_metrics {
+        for (metric, key) in [
+            (&am.source_artifacts_read, BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT),
+            (&am.output_artifacts_seen, BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT),
+            (
+                &am.output_artifacts_from_action_cache,
+                BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT,
+            ),
+            (&am.top_level_artifacts, BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT),
+        ] {
+            if let Some(f) = metric {
+                attrs.push(KeyValue::new(key, i64::from(f.count)));
+            }
         }
     }
-}
 
-fn apply_memory_metrics_attrs(mapper: &OtelMapper, obj: &serde_json::Map<String, serde_json::Value>) {
-    let Some(m) = obj.get("memoryMetrics").and_then(|v| v.as_object()) else {
-        return;
-    };
-    if let Some(v) = m.get("usedHeapSizePostBuild").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_HEAP_POST_BUILD, v));
-    }
-    if let Some(v) = m.get("peakPostGcHeapSize").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_PEAK_HEAP_POST_GC, v));
-    }
-}
-
-fn apply_target_package_metrics_attrs(
-    mapper: &OtelMapper,
-    obj: &serde_json::Map<String, serde_json::Value>,
-) {
-    if let Some(v) = obj
-        .get("targetMetrics")
-        .and_then(|v| v.get("targetsConfigured"))
-        .and_then(|v| v.as_i64())
+    if let Some(sns) = m
+        .network_metrics
+        .as_ref()
+        .and_then(|nm| nm.system_network_stats.as_ref())
     {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_TARGETS_CONFIGURED, v));
+        attrs.push(KeyValue::new(BAZEL_METRICS_BYTES_SENT, sns.bytes_sent as i64));
+        attrs.push(KeyValue::new(BAZEL_METRICS_BYTES_RECV, sns.bytes_recv as i64));
     }
-    if let Some(v) = obj
-        .get("packageMetrics")
-        .and_then(|v| v.get("packagesLoaded"))
-        .and_then(|v| v.as_i64())
-    {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_PACKAGES_LOADED, v));
+
+    if let Some(cm) = &m.cumulative_metrics {
+        attrs.push(KeyValue::new(
+            BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES,
+            i64::from(cm.num_analyses),
+        ));
+        attrs.push(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_BUILDS, i64::from(cm.num_builds)));
+    }
+
+    for kv in attrs {
+        mapper.set_root_attr(kv);
     }
 }
-
-fn apply_artifact_metrics_attrs(mapper: &OtelMapper, obj: &serde_json::Map<String, serde_json::Value>) {
-    let Some(am) = obj.get("artifactMetrics").and_then(|v| v.as_object()) else {
-        return;
-    };
-    let artifact_attrs: &[(&str, &str)] = &[
-        ("sourceArtifactsRead", BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT),
-        ("outputArtifactsSeen", BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT),
-        (
-            "outputArtifactsFromActionCache",
-            BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT,
-        ),
-        ("topLevelArtifacts", BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT),
-    ];
-    for &(json_key, attr_key) in artifact_attrs {
-        if let Some(v) = am
-            .get(json_key)
-            .and_then(|v| v.get("count"))
-            .and_then(|v| v.as_i64())
-        {
-            mapper.set_root_attr(KeyValue::new(attr_key, v));
-        }
-    }
-}
-
-fn apply_network_metrics_attrs(mapper: &OtelMapper, obj: &serde_json::Map<String, serde_json::Value>) {
-    let Some(nm) = obj.get("networkMetrics").and_then(|v| v.as_object()) else {
-        return;
-    };
-    if let Some(v) = nm.get("bytesSent").and_then(|v| v.as_u64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_BYTES_SENT, v as i64));
-    }
-    if let Some(v) = nm.get("bytesRecv").and_then(|v| v.as_u64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_BYTES_RECV, v as i64));
-    }
-}
-
-fn apply_runner_count_attrs(mapper: &OtelMapper, summary: Option<&serde_json::Value>) {
-    let Some(runners) = summary
-        .and_then(|s| s.as_object())
-        .and_then(|s| s.get("runnerCount"))
-        .and_then(|v| v.as_array())
-    else {
-        return;
-    };
-    for r in runners {
-        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let count = r.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        mapper.set_root_attr(KeyValue::new(format!("bazel.metrics.runner.{name}"), count));
-    }
-}
-
-fn apply_cumulative_metrics_attrs(mapper: &OtelMapper, obj: &serde_json::Map<String, serde_json::Value>) {
-    let Some(cm) = obj.get("cumulativeMetrics").and_then(|v| v.as_object()) else {
-        return;
-    };
-    if let Some(v) = cm.get("numAnalyses").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES, v));
-    }
-    if let Some(v) = cm.get("numBuilds").and_then(|v| v.as_i64()) {
-        mapper.set_root_attr(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_BUILDS, v));
-    }
-}
-

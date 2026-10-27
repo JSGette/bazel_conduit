@@ -53,7 +53,7 @@ fn router_started_and_finished_no_panic() {
         .unwrap();
     router.finish();
 
-    let summary = router.state().summary();
+    let summary = router.summary();
     assert_eq!(summary.exit_code, Some(0));
     assert_eq!(summary.command.as_deref(), Some("build"));
 }
@@ -71,11 +71,11 @@ fn router_reset_clears_state() {
     router
         .route_build_event(&started("22222222-2222-2222-2222-222222222222", "test", ""), None)
         .unwrap();
-    assert_eq!(router.state().command(), Some("test"));
+    assert_eq!(router.summary().command.as_deref(), Some("test"));
     router
         .route_build_event(&started("33333333-3333-3333-3333-333333333333", "build", ""), None)
         .unwrap();
-    assert_eq!(router.state().command(), Some("build"));
+    assert_eq!(router.summary().command.as_deref(), Some("build"));
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn exec_log_is_ignored_without_opt_in() {
     router
         .route_build_event(&options(&["--execution_log_compact_file=/tmp/exec.log"]), None)
         .unwrap();
-    assert!(router.state().exec_log_path().is_none());
+    assert!(router.summary().exec_log.is_none());
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn exec_log_path_is_captured_with_opt_in() {
         .route_build_event(&options(&["--execution_log_compact_file=exec.log"]), None)
         .unwrap();
     assert_eq!(
-        router.state().exec_log_path().map(|p| p.to_string_lossy().to_string()),
+        router.summary().exec_log.as_ref().map(|p| p.to_string_lossy().to_string()),
         Some("exec.log".to_string())
     );
 }
