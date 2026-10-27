@@ -74,20 +74,6 @@ fn detect_workspace_name_reads_module_bazel() {
 }
 
 #[test]
-fn detect_workspace_name_falls_back_to_workspace_file() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("WORKSPACE"),
-        "workspace(name = \"legacy_repo\")\n",
-    )
-    .unwrap();
-    assert_eq!(
-        detect_workspace_name(dir.path()).as_deref(),
-        Some("legacy_repo"),
-    );
-}
-
-#[test]
 fn detect_workspace_name_falls_back_to_basename() {
     let parent = tempfile::tempdir().unwrap();
     let dir = parent.path().join("just_a_dir");

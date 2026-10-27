@@ -217,23 +217,14 @@ pub(super) fn append_progress_capped(buf: &mut String, new_content: &str) {
 /// Resolve a human-readable name for the Bazel workspace producing this
 /// trace. Used to populate `VCS_REPOSITORY_NAME` on the root span.
 ///
-/// Lookup order (first non-empty wins):
-///   1. `MODULE.bazel` -> `module(name = "...")` (bzlmod, default since 7.0).
-///   2. `WORKSPACE.bazel` / `WORKSPACE` -> `workspace(name = "...")` (legacy).
-///   3. Basename of `workspace_dir` (e.g. `/repos/bazel_conduit` -> `bazel_conduit`).
+/// `module(name = "...")` from `MODULE.bazel`, else the basename of
+/// `workspace_dir` (e.g. `/repos/bazel_conduit` -> `bazel_conduit`).
 ///
-/// I/O happens once per build at `BuildStarted` - both candidate files are
-/// small (typically <2 KiB) and read synchronously. Failures fall through
-/// to the next source rather than propagating, since this attribute is a
-/// hint rather than load-bearing.
+/// The file is read once per build at `BuildStarted`. It only exists when
+/// conduit shares a filesystem with Bazel; otherwise the basename is used.
 pub(super) fn detect_workspace_name(workspace_dir: &Path) -> Option<String> {
     if let Some(name) = read_starlark_name(&workspace_dir.join("MODULE.bazel"), "module") {
         return Some(name);
-    }
-    for candidate in ["WORKSPACE.bazel", "WORKSPACE"] {
-        if let Some(name) = read_starlark_name(&workspace_dir.join(candidate), "workspace") {
-            return Some(name);
-        }
     }
     let basename = workspace_dir.file_name()?.to_str()?;
     if basename.is_empty() {
@@ -244,7 +235,7 @@ pub(super) fn detect_workspace_name(workspace_dir: &Path) -> Option<String> {
 }
 
 /// Pull `name = "<value>"` out of the first `<func>(...)` block in a
-/// MODULE.bazel / WORKSPACE.bazel file. Substring-based and deliberately
+/// MODULE.bazel file. Substring-based and deliberately
 /// dumb - Starlark string escaping, commented-out blocks, or unusual
 /// formatting (e.g. `module (\n name="x"\n)`) trips it. That's fine for
 /// the canonical idioms emitted by `bazel new`, `bazel mod tidy`, and

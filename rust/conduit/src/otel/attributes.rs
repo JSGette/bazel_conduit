@@ -132,9 +132,8 @@ pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
 pub const BAZEL_SERVER_PID: &str = "bazel.server_pid";
 
 // VCS / repository identity. Set once on the root span from the Bazel
-// workspace name — read out of `module(name = ...)` in MODULE.bazel,
-// `workspace(name = ...)` in WORKSPACE(.bazel), or the basename of
-// `workspace_directory` as a fallback. Uses the OTel VCS semantic
+// workspace name — read out of `module(name = ...)` in MODULE.bazel, or
+// the basename of `workspace_directory` as a fallback. Uses the OTel VCS semantic
 // convention name so trace UIs (Datadog, Jaeger) that already know the
 // `vcs.*` registry pick it up without conduit-specific filters.
 pub const VCS_REPOSITORY_NAME: &str = "vcs.repository.name";
