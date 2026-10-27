@@ -170,10 +170,7 @@ fn on_exec_log_detected_skips_when_workspace_unknown() {
 // ---- Mapper lifecycle tests ----
 
 fn test_mapper() -> OtelMapper {
-    use opentelemetry::trace::TracerProvider;
-    let tp = opentelemetry_sdk::trace::TracerProvider::builder().build();
-    let tracer = tp.tracer("test");
-    OtelMapper::new(tracer, None)
+    OtelMapper::new(Tracer::default(), None)
 }
 
 #[test]
@@ -421,46 +418,12 @@ fn clamp_to_invocation_falls_back_to_finish_time() {
 // covered by `crate::exec_log::tailer::tests`.
 // =====================================================================
 
-use opentelemetry::trace::SpanId;
-use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+use crate::otel::span::{MemorySpans, Sink, SpanData, SpanId, Tracer};
 use spawn_proto::tools::protos::{File as ProtoFile, SpawnExec, SpawnMetrics};
-use std::sync::{Arc, Mutex};
 
-// `SpanExporter::export` returns `futures_util::future::BoxFuture<'static, _>`.
-// We don't depend on `futures-util` directly, so spell the equivalent
-// type out by hand; it's `Pin<Box<dyn Future<Output = T> + Send>>` with
-// the implicit `'static` bound that `Box<dyn Trait>` carries.
-type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
-
-#[derive(Debug, Default, Clone)]
-struct Collector(Arc<Mutex<Vec<SpanData>>>);
-
-impl Collector {
-    fn snapshot(&self) -> Vec<SpanData> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
-impl SpanExporter for Collector {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<ExportResult> {
-        self.0.lock().unwrap().extend(batch);
-        Box::pin(async { Ok(()) })
-    }
-}
-
-fn mapper_with_collector() -> (OtelMapper, Collector) {
-    use opentelemetry::trace::TracerProvider;
-    let collector = Collector::default();
-    // SimpleSpanProcessor exports synchronously on each span.end(), so we
-    // see attributes immediately on inspection without needing flush().
-    let processor = opentelemetry_sdk::trace::SimpleSpanProcessor::new(Box::new(
-        collector.clone(),
-    ));
-    let tp = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_span_processor(processor)
-        .build();
-    let tracer = tp.tracer("test");
-    let mut mapper = OtelMapper::new(tracer, None);
+fn mapper_with_collector() -> (OtelMapper, MemorySpans) {
+    let (sink, collector) = Sink::memory();
+    let mut mapper = OtelMapper::new(Tracer::new(sink), None);
     // Bring the root span up; downstream spans need it as their grand-parent.
     mapper.on_build_started("test-uuid", "build", Some(1_000_000_000), None);
     (mapper, collector)
@@ -543,7 +506,7 @@ fn find_span(spans: &[SpanData], pred: impl Fn(&SpanData) -> bool) -> Option<Spa
 fn attr_value<'a>(span: &'a SpanData, key: &str) -> Option<String> {
     span.attributes
         .iter()
-        .find(|kv| kv.key.as_str() == key)
+        .find(|kv| kv.key == key)
         .map(|kv| kv.value.to_string())
 }
 
@@ -1156,7 +1119,7 @@ fn build_metrics_set_root_attrs_and_root_contains_finish() {
     mapper.finish();
 
     let spans = collector.snapshot();
-    let root = find_span(&spans, |s| s.parent_span_id == opentelemetry::trace::SpanId::INVALID)
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID)
         .expect("root span");
     assert_eq!(attr_value(&root, BAZEL_METRICS_ACTIONS_CREATED).as_deref(), Some("7"));
     assert_eq!(attr_value(&root, BAZEL_METRICS_WALL_TIME_MS).as_deref(), Some("2000"));

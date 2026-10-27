@@ -19,7 +19,6 @@ bumpalo,https://github.com/fitzgen/bumpalo,MIT OR Apache-2.0,Nick Fitzgerald <fi
 bytes,https://github.com/tokio-rs/bytes,MIT,Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
 cc,https://github.com/rust-lang/cc-rs,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
 cfg-if,https://github.com/rust-lang/cfg-if,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
-chrono,https://github.com/chronotope/chrono,MIT OR Apache-2.0,Copyright chrono contributors
 clap,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap contributors
 clap_builder,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap_builder contributors
 clap_derive,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap_derive contributors
@@ -35,15 +34,12 @@ fnv,https://github.com/servo/rust-fnv,Apache-2.0 / MIT,Alex Crichton <alex@alexc
 foldhash,https://github.com/orlp/foldhash,Zlib,Orson Peters <orsonpeters@gmail.com>
 futures-channel,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-channel contributors
 futures-core,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-core contributors
-futures-executor,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-executor contributors
-futures-macro,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-macro contributors
 futures-sink,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-sink contributors
 futures-task,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-task contributors
 futures-util,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-util contributors
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
-glob,https://github.com/rust-lang/glob,MIT OR Apache-2.0,The Rust Project Developers
 h2,https://github.com/hyperium/h2,MIT,Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
@@ -77,15 +73,9 @@ mime,https://github.com/hyperium/mime,MIT OR Apache-2.0,Sean McArthur <sean@sean
 mio,https://github.com/tokio-rs/mio,MIT,Carl Lerche <me@carllerche.com>; Thomas de Zeeuw <thomasdezeeuw@gmail.com>; Tokio Contributors <team@tokio.rs>
 multimap,https://github.com/havarnov/multimap,MIT OR Apache-2.0,Håvar Nøvik <havar.novik@gmail.com>
 nu-ansi-term,https://github.com/nushell/nu-ansi-term,MIT,ogham@bsago.me; Ryan Scheel (Havvy) <ryan.havvy@gmail.com>; Josh Triplett <josh@joshtriplett.org>; The Nushell Project Developers
-num-traits,https://github.com/rust-num/num-traits,MIT OR Apache-2.0,The Rust Project Developers
 once_cell,https://github.com/matklad/once_cell,MIT OR Apache-2.0,Aleksey Kladov <aleksey.kladov@gmail.com>
 once_cell_polyfill,https://github.com/polyfill-rs/once_cell_polyfill,MIT OR Apache-2.0,Copyright once_cell_polyfill contributors
-opentelemetry,https://github.com/open-telemetry/opentelemetry-rust,Apache-2.0,Copyright opentelemetry contributors
-opentelemetry-otlp,https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp,Apache-2.0,Copyright opentelemetry-otlp contributors
-opentelemetry-proto,https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto,Apache-2.0,Copyright opentelemetry-proto contributors
-opentelemetry-stdout,https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-stdout,Apache-2.0,Copyright opentelemetry-stdout contributors
-opentelemetry_sdk,https://github.com/open-telemetry/opentelemetry-rust,Apache-2.0,Copyright opentelemetry_sdk contributors
-ordered-float,https://github.com/reem/rust-ordered-float,MIT,Jonathan Reem <jonathan.reem@gmail.com>; Matt Brubeck <mbrubeck@limpet.net>
+opentelemetry-proto,https://github.com/open-telemetry/opentelemetry-proto,Apache-2.0,Copyright The OpenTelemetry Authors
 percent-encoding,https://github.com/servo/rust-url/,MIT OR Apache-2.0,The rust-url developers
 petgraph,https://github.com/petgraph/petgraph,MIT OR Apache-2.0,bluss; mitchmindtree
 pin-project,https://github.com/taiki-e/pin-project,Apache-2.0 OR MIT,Copyright pin-project contributors
@@ -130,8 +120,6 @@ syn,https://github.com/dtolnay/syn,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail
 sync_wrapper,https://github.com/Actyx/sync_wrapper,Apache-2.0,Actyx AG <developer@actyx.io>
 tempfile,https://github.com/Stebalien/tempfile,MIT OR Apache-2.0,Steven Allen <steven@stebalien.com>; The Rust Project Developers; Ashley Mannix <ashleymannix@live.com.au>; Jason White <me@jasonwhite.io>
 thiserror,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
-thiserror,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
-thiserror-impl,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
 thiserror-impl,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
 thread_local,https://github.com/Amanieu/thread_local-rs,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 tokio,https://github.com/tokio-rs/tokio,MIT,Tokio Contributors <team@tokio.rs>

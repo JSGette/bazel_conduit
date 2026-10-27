@@ -1,10 +1,9 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::{KeyValue, Status};
 use std::borrow::Cow;
 
-use opentelemetry::trace::Status;
-use opentelemetry::KeyValue;
 
 use super::super::attributes::*;
 use super::{shorten_label, TestResultEvent};

@@ -1,11 +1,10 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::{KeyValue, SpanKind, Status};
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::KeyValue;
 use tracing::{debug, info, warn};
 
 use super::super::attributes::*;

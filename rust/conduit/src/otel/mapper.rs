@@ -35,14 +35,13 @@
 //!     Aggregate `BuildMetrics` stay on the root span regardless.
 //! ```
 
+use crate::otel::span::{Context, KeyValue, Logger, Span, SpanContext, SpanKind, Status, Tracer};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::time::{Duration, UNIX_EPOCH};
 
-use opentelemetry::trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::{Context, KeyValue};
 use spawn_proto::tools::protos::SpawnExec;
 use tracing::{debug, info, warn};
 
@@ -163,7 +162,7 @@ pub struct OpenAction {
     /// Live span handle, `None` once ended. The OTel SDK seals attribute
     /// mutations on end so we drop the handle to make that misuse obvious
     /// (subsequent `set_attribute` calls would silently no-op).
-    pub span: Option<opentelemetry_sdk::trace::Span>,
+    pub span: Option<Span>,
     /// Parent target label, used by `end_open_actions_for_target` to flush
     /// every still-open action belonging to a freshly-completed target.
     pub target_label: String,
@@ -220,7 +219,7 @@ struct NamedSetEntry {
 
 /// Maps BEP events to OpenTelemetry spans.
 pub struct OtelMapper {
-    tracer: opentelemetry_sdk::trace::Tracer,
+    tracer: Tracer,
 
     /// Root span context (`bazel.invocation`).
     root_context: Option<Context>,
@@ -287,7 +286,7 @@ pub struct OtelMapper {
     /// Optional OTel logger. When present, every BEP `Progress` event is
     /// emitted as its own correlated log record (streaming) rather than
     /// buffered until the build ends.
-    logger: Option<opentelemetry_sdk::logs::Logger>,
+    logger: Option<Logger>,
 
     /// Cached exit code from BuildFinished (root span ends in [`finish`]).
     exit_code: Option<i32>,
@@ -387,8 +386,8 @@ pub struct OtelMapper {
 
 impl OtelMapper {
     pub fn new(
-        tracer: opentelemetry_sdk::trace::Tracer,
-        logger: Option<opentelemetry_sdk::logs::Logger>,
+        tracer: Tracer,
+        logger: Option<Logger>,
     ) -> Self {
         Self {
             tracer,
@@ -537,7 +536,7 @@ impl OtelMapper {
         kind: SpanKind,
         attrs: Vec<KeyValue>,
         start_time: Option<i64>,
-    ) -> opentelemetry_sdk::trace::Span {
+    ) -> Span {
         let mut builder = self
             .tracer
             .span_builder(name)
@@ -577,7 +576,7 @@ impl OtelMapper {
     fn ensure_group_span(
         slot: &mut Option<Context>,
         root_context: &Option<Context>,
-        tracer: &opentelemetry_sdk::trace::Tracer,
+        tracer: &Tracer,
         name: &'static str,
         start_nanos: Option<i64>,
     ) {

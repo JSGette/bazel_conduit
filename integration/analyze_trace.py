@@ -4,8 +4,8 @@
 
 """Structural invariant checker for conduit `--export stdout` traces.
 
-Parses the opentelemetry-stdout Span dump and asserts the properties a valid
-Datadog trace must hold:
+Parses the OTLP-JSON lines (one export request per line) and asserts the
+properties a valid Datadog trace must hold:
 
   * exactly one root span, named `bazel ...`, single trace id;
   * no dangling parents (every ParentSpanId resolves);
@@ -17,73 +17,43 @@ Datadog trace must hold:
 Exit code is non-zero if any hard invariant is violated, so this doubles as a
 CI gate. Missing attributes are warnings, not failures.
 """
-import re
+import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
-TS = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)")
-ATTR = re.compile(r"->\s*([\w.]+):\s*(.*)")
 ZERO = "0000000000000000"
 DAY_MS = 24 * 3600 * 1000
+STATUS = {0: "Unset", 1: "Ok", 2: "Error"}
 
 
-def _ts(line):
-    m = TS.search(line)
-    return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") if m else None
+def _ts(nanos):
+    return datetime.fromtimestamp(int(nanos) / 1e9, timezone.utc) if nanos else None
+
+
+def _attrs(kvs):
+    return {kv["key"]: str(next(iter(kv["value"].values()), "")) for kv in kvs}
 
 
 def parse_spans(text):
-    """Parse the `Spans` blocks into a list of dicts. `Logs` blocks are skipped."""
-    spans, cur, in_scope, in_events = [], None, False, False
-
-    def flush():
-        nonlocal cur
-        if cur is not None:
-            spans.append(cur)
-        cur = None
-
-    for raw in text.splitlines():
-        s = raw.strip()
-        if s in ("Logs", "Spans", "Resource") or s.startswith("Build Summary"):
-            flush()
-            in_scope = in_events = False
+    """Collect every span from the `resourceSpans` lines; log lines are skipped."""
+    spans = []
+    for line in text.splitlines():
+        if not line.startswith("{"):
             continue
-        if s.startswith("Span #"):
-            flush()
-            cur = {"attrs": {}, "start": None, "end": None, "status": None,
-                   "name": None, "span_id": None, "parent": None, "trace_id": None}
-            in_scope = in_events = False
-            continue
-        if cur is None:
-            continue
-        if s == "Instrumentation Scope":
-            in_scope = True
-            continue
-        if s.startswith("Events:"):
-            in_events = True
-            continue
-        if s.startswith("Name") and cur["name"] is None:
-            if in_scope:  # instrumentation-scope name ("conduit"), not the span name
-                in_scope = False
-                continue
-            cur["name"] = s.split(":", 1)[1].strip()
-        elif s.startswith("TraceId"):
-            cur["trace_id"] = s.split(":", 1)[1].strip()
-        elif s.startswith("SpanId"):
-            cur["span_id"] = s.split(":", 1)[1].strip()
-        elif s.startswith("ParentSpanId"):
-            cur["parent"] = s.split(":", 1)[1].strip()
-        elif s.startswith("Start time"):
-            cur["start"] = _ts(s)
-        elif s.startswith("End time"):
-            cur["end"] = _ts(s)
-        elif s.startswith("Status:"):
-            cur["status"] = s.split(":", 1)[1].strip()
-        elif not in_events:
-            m = ATTR.search(s)
-            if m:
-                cur["attrs"][m.group(1)] = m.group(2).strip()
-    flush()
+        for rs in json.loads(line).get("resourceSpans", []):
+            for ss in rs.get("scopeSpans", []):
+                for s in ss.get("spans", []):
+                    status = s.get("status", {})
+                    spans.append({
+                        "name": s["name"],
+                        "trace_id": s["traceId"],
+                        "span_id": s["spanId"],
+                        "parent": s.get("parentSpanId"),
+                        "start": _ts(s.get("startTimeUnixNano")),
+                        "end": _ts(s.get("endTimeUnixNano")),
+                        "status": STATUS.get(status.get("code", 0)),
+                        "attrs": _attrs(s.get("attributes", [])),
+                    })
     return spans
 
 

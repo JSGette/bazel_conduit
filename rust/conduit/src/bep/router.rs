@@ -14,6 +14,7 @@
 //! the [`TracerProvider`] / [`LoggerProvider`] it uses are owned by `main`
 //! and live for the whole conduit process.
 
+use crate::otel::span::{Logger, Tracer};
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
@@ -214,14 +215,12 @@ impl EventRouter {
         self
     }
 
-    /// Attach OTel export. The router holds [`Tracer`]/[`Logger`] clones for
-    /// the lifetime of the process; the underlying providers are owned by
-    /// `main`. Per-invocation attributes are set on the root span (not on
-    /// `Resource`).
+    /// Attach OTel export. Per-invocation attributes go on the root span,
+    /// not on the resource, which is shared by every invocation.
     pub fn with_export(
         mut self,
-        tracer: opentelemetry_sdk::trace::Tracer,
-        logger: opentelemetry_sdk::logs::Logger,
+        tracer: Tracer,
+        logger: Logger,
     ) -> Self {
         self.mapper = Some(
             OtelMapper::new(tracer, Some(logger))
@@ -282,16 +281,6 @@ impl EventRouter {
     }
 
     /// Finalize: end all open spans on the current invocation.
-    ///
-    /// We intentionally do NOT call `force_flush()` on either provider here.
-    /// Both `BatchSpanProcessor::force_flush` and `BatchLogProcessor::force_flush`
-    /// (with `runtime::Tokio`) are sync `block_on`s against their worker
-    /// channels. Calling them from inside a `tokio::spawn`'d task (the route
-    /// worker) deadlocks the runtime when the queue is non-empty: the export
-    /// and timeout-timer tasks share workers with us, so the worker we just
-    /// blocked is the one that would have driven the response back.
-    /// Instead we rely on the periodic `scheduled_delay` ticker (200 ms,
-    /// see [`crate::otel::trace_context`]) to drain.
     pub fn finish(&mut self) {
         if let Some(mapper) = &mut self.mapper {
             mapper.finish();

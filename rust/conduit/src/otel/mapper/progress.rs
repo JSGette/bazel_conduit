@@ -1,10 +1,10 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::{KeyValue, LogData};
 use super::super::attributes::BAZEL_PROGRESS_STDOUT;
 use super::{append_progress_capped, strip_ansi, truncate_to_byte_limit, OtelMapper, PROGRESS_CAP_BYTES};
-use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, Severity};
-use opentelemetry::trace::TraceContextExt;
+use std::time::SystemTime;
 use tracing::debug;
 
 pub(super) fn handle_progress(mapper: &mut OtelMapper, stderr: Option<&str>, stdout: Option<&str>) {
@@ -36,7 +36,7 @@ fn emit_progress_log(mapper: &OtelMapper, stderr: &str, stdout: &str) {
     let Some(cx) = mapper.root_context.as_ref() else {
         return;
     };
-    let span_cx = cx.span().span_context().clone();
+    let span_cx = cx.span().span_context();
 
     let stderr = if stderr.is_empty() {
         String::new()
@@ -51,29 +51,25 @@ fn emit_progress_log(mapper: &OtelMapper, stderr: &str, stdout: &str) {
         truncate_to_byte_limit(&scrubbed, PROGRESS_CAP_BYTES, "...(truncated)")
     };
 
-    let mut record = logger.create_log_record();
-    record.set_trace_context(
-        span_cx.trace_id(),
-        span_cx.span_id(),
-        Some(span_cx.trace_flags()),
-    );
-    record.set_severity_number(Severity::Info);
-    record.set_severity_text("INFO");
-    record.add_attribute("bazel.log.kind", AnyValue::String("progress".into()));
-
     let stderr_len = stderr.len();
     let stdout_len = stdout.len();
-    match (!stderr.is_empty(), !stdout.is_empty()) {
-        (true, true) => {
-            record.set_body(AnyValue::String(stderr.into()));
-            record.add_attribute(BAZEL_PROGRESS_STDOUT, AnyValue::String(stdout.into()));
+    let mut attributes = vec![KeyValue::new("bazel.log.kind", "progress")];
+    let body = match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => {
+            attributes.push(KeyValue::new(BAZEL_PROGRESS_STDOUT, stdout));
+            stderr
         }
-        (true, false) => record.set_body(AnyValue::String(stderr.into())),
-        (false, true) => record.set_body(AnyValue::String(stdout.into())),
-        (false, false) => return,
-    }
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (true, true) => return,
+    };
 
-    logger.emit(record);
+    logger.emit(LogData {
+        timestamp: SystemTime::now(),
+        span_context: span_cx,
+        body,
+        attributes,
+    });
     debug!(
         trace_id = %span_cx.trace_id(),
         stderr_len,

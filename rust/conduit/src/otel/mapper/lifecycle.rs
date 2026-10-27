@@ -3,13 +3,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::KeyValue;
 use tracing::{debug, info, warn};
 
 use super::super::attributes::*;
 use super::{ExecLogState, OtelMapper};
-use crate::otel::trace_context;
+use crate::otel::span::{self, Context, KeyValue, SpanContext, SpanId, SpanKind, Status};
 
 impl OtelMapper {
     /// BuildStarted -> create root span `bazel.invocation`, starting at the
@@ -24,8 +22,9 @@ impl OtelMapper {
         self.cached_command = Some(command.to_string());
         self.build_start_nanos = start_time_nanos.or(event_time_nanos);
 
-        let trace_id = trace_context::uuid_to_trace_id(uuid);
-        let parent_cx = trace_context::make_root_context(trace_id);
+        let trace_id = span::uuid_to_trace_id(uuid);
+        let parent_cx =
+            Context::new().with_remote_span_context(SpanContext::new(trace_id, SpanId::INVALID));
 
         let span_name = format!("bazel {command}");
         let mut builder = self
@@ -42,7 +41,7 @@ impl OtelMapper {
             self.root_span_start_nanos = Some(nanos);
         }
         let span = self.tracer.build_with_context(builder, &parent_cx);
-        let cx = opentelemetry::Context::new().with_span(span);
+        let cx = Context::new().with_span(span);
 
         info!(trace_id = %trace_id, "Created root span for invocation {uuid}");
         self.root_context = Some(cx);

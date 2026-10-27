@@ -5,17 +5,14 @@ use clap::{Args, Parser, Subcommand};
 use conduit_lib::bep::{replay, EventRouter};
 use conduit_lib::grpc::run_server;
 use conduit_lib::otel::{
-    init_logger_provider, init_tracer_provider, ExportConfig, Redactor,
-    DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
+    ExportConfig, Exporter, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
 };
 use conduit_lib::state::{TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};
-use opentelemetry::logs::LoggerProvider as _;
-use opentelemetry::trace::TracerProvider as _;
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info, warn, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// BEP to OpenTelemetry trace converter
@@ -56,7 +53,7 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct Common {
-    /// Export mode: none, stdout, otlp
+    /// Export mode: none, stdout (OTLP-JSON lines), otlp (gRPC)
     #[arg(long, default_value = "none")]
     export: String,
 
@@ -158,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(level)
         .with_target(true)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -175,12 +173,7 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Export mode: {:?}", export_config);
 
-    // Build OTel providers exactly once, here. Resource carries only
-    // service.name + telemetry.sdk.* so spans can outlive a single
-    // invocation; per-invocation attrs (bazel.invocation_id, command,
-    // workspace.directory) are set on the root span instead.
-    let tracer_provider = init_tracer_provider(&export_config)?;
-    let logger_provider = init_logger_provider(&export_config)?;
+    let exporter = Exporter::start(&export_config)?;
 
     let redactor = args.build_redactor();
     if redactor.is_enabled() {
@@ -212,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         args.trace_min_duration_ms
     );
 
-    let export = tracer_provider.clone().zip(logger_provider.clone());
+    let export = exporter.as_ref().map(|e| (e.tracer(), e.logger()));
     let trace_min_duration_ms = args.trace_min_duration_ms;
     let exec_log = args.exec_log;
     let make_router = move || {
@@ -223,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
             .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
             .with_trace_profile(trace_profile, trace_min_duration_ms);
         match &export {
-            Some((tp, lp)) => router.with_export(tp.tracer("conduit"), lp.logger("conduit")),
+            Some((tracer, logger)) => router.with_export(tracer.clone(), logger.clone()),
             None => router,
         }
     };
@@ -240,17 +233,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(tp) = tracer_provider {
-        if let Err(e) = tp.shutdown() {
-            error!("TracerProvider shutdown reported error: {e:?}");
-        }
+    if let Some(exporter) = exporter {
+        exporter.shutdown().await;
     }
-    if let Some(lp) = logger_provider {
-        if let Err(e) = lp.shutdown() {
-            error!("LoggerProvider shutdown reported error: {e:?}");
-        }
-    }
-
     Ok(())
 }
 

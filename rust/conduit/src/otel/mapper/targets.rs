@@ -1,12 +1,11 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::{Context, KeyValue, SpanKind, Status};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::KeyValue;
 use tracing::{debug, warn};
 
 use super::super::attributes::*;
@@ -53,9 +52,9 @@ impl OtelMapper {
         &mut self,
         label: &str,
         configured: &ConfiguredTarget,
-        parent: &opentelemetry::Context,
+        parent: &Context,
         start_nanos_override: Option<i64>,
-    ) -> opentelemetry::Context {
+    ) -> Context {
         let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
@@ -94,7 +93,7 @@ impl OtelMapper {
         }
 
         let span = self.tracer.build_with_context(builder, parent);
-        opentelemetry::Context::new().with_span(span)
+        Context::new().with_span(span)
     }
 
     /// Resolve the parent context to use for action/test child spans.
@@ -106,7 +105,7 @@ impl OtelMapper {
         &mut self,
         label: &str,
         start_nanos: Option<i64>,
-    ) -> Option<opentelemetry::Context> {
+    ) -> Option<Context> {
         if let Some(existing) = self.target_contexts.get(label) {
             return Some(existing.clone());
         }
@@ -153,7 +152,7 @@ impl OtelMapper {
 
     /// Choose the correct parent for a target: root for local targets,
     /// `external deps` group span for external dependencies.
-    fn choose_parent_for_label(&mut self, label: &str) -> Option<opentelemetry::Context> {
+    fn choose_parent_for_label(&mut self, label: &str) -> Option<Context> {
         if Self::is_external_label(label) {
             self.ensure_external_deps_span();
             self.external_deps_context.clone()
@@ -178,9 +177,9 @@ impl OtelMapper {
     fn create_synthetic_target_span(
         &mut self,
         label: &str,
-        parent: &opentelemetry::Context,
+        parent: &Context,
         start_nanos: Option<i64>,
-    ) -> opentelemetry::Context {
+    ) -> Context {
         let short = shorten_label(label);
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
@@ -201,7 +200,7 @@ impl OtelMapper {
             builder = builder.with_start_time(super::nanos_to_system_time(nanos));
         }
         let span = self.tracer.build_with_context(builder, parent);
-        opentelemetry::Context::new().with_span(span)
+        Context::new().with_span(span)
     }
 
     /// TargetCompleted -> create (or reuse) the target span, set attributes,
@@ -369,7 +368,7 @@ impl OtelMapper {
             .with_start_time(instant);
 
         let span = self.tracer.build_with_context(builder, parent);
-        let cx = opentelemetry::Context::new().with_span(span);
+        let cx = Context::new().with_span(span);
 
         cx.span().set_status(Status::Unset);
         cx.span().end_with_timestamp(instant);
@@ -383,7 +382,7 @@ impl OtelMapper {
     /// Set output file attributes on the target span and end it.
     fn set_output_attributes_and_end_target_span(
         cache: &HashMap<String, NamedSetEntry>,
-        cx: &opentelemetry::Context,
+        cx: &Context,
         file_set_ids: &[String],
         event_time_nanos: Option<i64>,
     ) {

@@ -13,11 +13,10 @@
 //! span, and synthesizes orphan parent actions for unmatched spawns at
 //! `finish()`.
 
+use crate::otel::span::{Context, KeyValue, Span, SpanKind, Status, Tracer};
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use opentelemetry::trace::{Span, SpanKind, TraceContextExt, Tracer};
-use opentelemetry::{Context, KeyValue};
 
 use crate::otel::attributes::*;
 use crate::otel::mapper::{ActionSpanInfo, ActionSpanKey, clamp_time_range, truncate_to_byte_limit};
@@ -198,7 +197,7 @@ fn duration_to_ms_raw(seconds: i64, nanos: i32) -> i64 {
 /// for first when triaging a slow action (which runner ran it, was it a
 /// cache hit, where did the time go).
 pub(crate) fn apply_spawn_attrs_to_action(
-    span: &mut opentelemetry_sdk::trace::Span,
+    span: &mut Span,
     s: &SpawnExec,
 ) {
     if !s.runner.is_empty() {
@@ -242,7 +241,7 @@ pub(crate) fn apply_spawn_attrs_to_action(
 /// so child spans don't start before or end after their parent (required by
 /// Datadog's flame graph, which uses temporal containment for nesting).
 pub(crate) fn emit_spawn_span(
-    tracer: &opentelemetry_sdk::trace::Tracer,
+    tracer: &Tracer,
     parent_info: &ActionSpanInfo,
     s: &SpawnExec,
     redactor: &Redactor,
@@ -270,7 +269,7 @@ pub(crate) fn emit_spawn_span(
     let mut span = tracer.build_with_context(builder, &parent_ctx);
 
     if s.exit_code != 0 {
-        span.set_status(opentelemetry::trace::Status::Error {
+        span.set_status(Status::Error {
             description: std::borrow::Cow::Owned(format!(
                 "exit_code={} status={}",
                 s.exit_code, s.status

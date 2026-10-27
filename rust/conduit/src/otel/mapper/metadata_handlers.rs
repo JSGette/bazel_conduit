@@ -1,10 +1,10 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::KeyValue;
 use super::super::attributes::BAZEL_CRITICAL_PATH_LOG_URI;
 use super::OtelMapper;
 use crate::build_event_stream::{BuildMetadata, BuildToolLogs};
-use opentelemetry::KeyValue;
 use tracing::debug;
 
 pub(super) fn apply_build_metadata(mapper: &OtelMapper, bm: &BuildMetadata) {

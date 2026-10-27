@@ -1,8 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
-use opentelemetry::trace::{Span, SpanKind};
-use opentelemetry::KeyValue;
+use crate::otel::span::{KeyValue, Span, SpanKind};
 use spawn_proto::tools::protos::SpawnExec;
 use tracing::{debug, warn};
 
@@ -257,7 +256,7 @@ impl OtelMapper {
         }
     }
 
-    fn finalize_action_summary_attrs(span: &mut opentelemetry_sdk::trace::Span, spawn_count: u32) {
+    fn finalize_action_summary_attrs(span: &mut Span, spawn_count: u32) {
         span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_COUNT, i64::from(spawn_count)));
         if spawn_count == 0 {
             span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_MISSING, true));

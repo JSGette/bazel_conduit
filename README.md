@@ -68,16 +68,16 @@ bazel.invocation (root)
 
 | Module | Purpose |
 |--------|---------|
-| `bep/decoder.rs` | Parses NDJSON BEP files into `BepJsonEvent` structs |
-| `bep/router.rs` | Dispatches BEP events to the mapper; dual-path (JSON + proto-direct) |
+| `bep/replay.rs` | Reads binary BEP files (`--build_event_binary_file`) |
+| `bep/router.rs` | Dispatches BEP events to the mapper |
 | `otel/mapper.rs` | Creates and manages OTel spans for the build trace |
-| `otel/trace_context.rs` | UUID→TraceID conversion, TracerProvider/LoggerProvider init |
+| `otel/span.rs` | Minimal span/log model (UUID→trace ID, parenting, attributes) |
+| `otel/export.rs` | Batching OTLP gRPC / OTLP-JSON exporter with bounded retry and drop counting |
 | `otel/attributes.rs` | ~100 typed attribute key constants (`bazel.*` namespace) |
 | `otel/redact.rs` | In-process scrubber for `--client_env=NAME=VALUE` style flags |
 | `grpc/server.rs` | BES gRPC server implementation (`PublishBuildEvent` service) |
 | `exec_log/tailer.rs` | Live tail-follows `--execution_log_compact_file`, decodes zstd, ships `SpawnExec`s to the mapper via mpsc |
 | `exec_log/compact.rs` | Incremental decoder state (dedup table + `SpawnExec` reconstruction) shared by tailer and tests |
-| `state/build_state.rs` | Build lifecycle tracking, action buffering, named set cache |
 | `state/trace_profile.rs` | Trace emission policy: full vs lightweight, applied to actions, spawns, and targets |
 
 ## Usage
@@ -122,7 +122,7 @@ and `--port`, which are `serve`-only.
 |------|-------------|---------|
 | `--listen-addr <IP>` | Bind address for the BES gRPC server. Defaults to loopback; pass `0.0.0.0` only when external access is intentionally needed (conduit has no auth/TLS). | `127.0.0.1` |
 | `--port <PORT>` | gRPC server port | 8080 |
-| `--export <MODE>` | Export mode: `none`, `stdout`, `otlp` | `none` |
+| `--export <MODE>` | Export mode: `none`, `stdout` (OTLP-JSON, one request per line), `otlp` (gRPC) | `none` |
 | `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
 | `--log-level <LEVEL>` | Log level (trace/debug/info/warn/error) | `info` |
 | `--no-redact` | Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags | off (scrubbing on) |
@@ -344,9 +344,9 @@ The `start_time` / `start_time_millis` in `BuildStarted` can hold the **Bazel se
 
 Bazel replays the *original* execution timestamps on cached `ActionExecuted` events (and propagates them to target metadata), so a build that replays a weeks-old cache can produce spans whose `start_time` predates the invocation by days. Conduit clamps every BEP-supplied `(start, end)` to the root span's window via `clamp_time_range` (`rust/conduit/src/otel/mapper/utils.rs`); a range that lies entirely before the invocation collapses to zero duration at the build start. The root span itself falls back to wall clock when `BuildStarted` drifts more than 5 minutes from now (stale long-lived daemon).
 
-### Lesson 5: BatchSpanProcessor Can Silently Drop Spans
+### Lesson 5: Export Must Never Block the Build Stream
 
-The default OpenTelemetry `BatchSpanProcessor` queue size is 2048 spans. Large Bazel builds (thousands of actions + spawns) overflow this easily. Conduit configures both the span and log batch processors with queue **65,536**, batch **512**, scheduled delay **200 ms**, and per-export timeout **2 s** (see `rust/conduit/src/otel/trace_context.rs`).
+Large Bazel builds produce thousands of spans in bursts. Conduit's exporter (`rust/conduit/src/otel/export.rs`) queues up to **65,536** records, exports batches of **512** every **200 ms**, and retries a failed export at most 3 times (2 s timeout each, retryable gRPC codes only). Anything it cannot queue or export is dropped and counted; the counts are logged at shutdown.
 
 ### Lesson 6: Proto-Generated Duration Types Vary
 
@@ -355,10 +355,6 @@ Prost-generated code for `google.protobuf.Duration` may produce different Rust t
 ### Lesson 7: BEP Label Formats Are Inconsistent
 
 BEP action IDs (`actionCompleted.label`) and the exec log's `targetLabel` both use the canonical form (`@@repo+//:target`): the exec log writes `Label.getCanonicalForm()` and BEP writes `Label.toString()`, which returns the same string (true on Bazel 8.4 and 9). Conduit therefore matches labels exactly. BEP still emits the apparent form (`@repo//:target`) in other string fields (options, progress), which conduit does not match on.
-
-### Lesson 8: LoggerProvider Flush Timing in Server Mode
-
-In gRPC serve mode, `router.finish()` emits OTel log records to the batch processor and returns. We deliberately do **not** call `force_flush()` from the route worker: both `BatchSpanProcessor::force_flush` and `BatchLogProcessor::force_flush` use a sync `block_on` against their worker channel, which deadlocks the Tokio runtime under load. Drain instead happens via the 200 ms `scheduled_delay` ticker; explicit `shutdown_providers()` is called from `main` only at process exit.
 
 ### Lesson 9: Not All BEP Actions Appear in the Execution Log
 
@@ -376,7 +372,8 @@ The `children` field on Progress events is for BEP DAG ordering (announcing whic
 
 ### Build System
 - **Must use `bazel build`, not `cargo build`**: The project uses Bazel as its build system with `rules_rust` and `rules_rs` (crate_universe). Cargo is only present for IDE support (`Cargo.toml`).
-- **Rust edition 2024 / rustc 1.93+**: OpenTelemetry 0.28 crates require a recent Rust toolchain. The Bazel toolchain is pinned to 1.93.0.
+- **Rust edition 2024 / rustc 1.93+**: The Bazel toolchain is pinned to 1.93.0.
+- **OTLP protos are vendored**: `proto/opentelemetry/` holds unmodified opentelemetry-proto v1.11.1 files; conduit writes OTLP directly instead of depending on the OpenTelemetry SDK crates.
 - **Protobuf compilation**: BEP proto has deep import chains (`failure_details.proto` → `descriptor.proto`). Proto targets use `rules_rust_prost` with `rules_rs` for crate resolution.
 
 ### Runtime
