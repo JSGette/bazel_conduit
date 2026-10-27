@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::KeyValue;
 use tracing::{debug, info, warn};
@@ -14,9 +12,8 @@ use super::{ExecLogState, OtelMapper, TestResultEvent};
 use crate::otel::trace_context;
 
 impl OtelMapper {
-    /// BuildStarted -> create root span `bazel.invocation`.
-    /// Prefers event_time_nanos (BES event time) when available so the trace reflects when the
-    /// build was observed; otherwise uses start_time_nanos from the payload.
+    /// BuildStarted -> create root span `bazel.invocation`, starting at the
+    /// command start time (falls back to the BES event time).
     pub fn on_build_started(
         &mut self,
         uuid: &str,
@@ -39,29 +36,7 @@ impl OtelMapper {
                 KeyValue::new(BAZEL_COMMAND, command.to_string()),
             ]);
 
-        // Sanity-check: if the BEP start time is more than 5 minutes
-        // from wall clock, it's probably stale (long-lived Bazel daemon).
-        // Fall back to wall clock to avoid multi-day trace durations.
-        let now_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        let five_min_nanos: i64 = 5 * 60 * 1_000_000_000;
-
-        let effective_start = event_time_nanos.or(start_time_nanos);
-        let sanitized_start = match effective_start {
-            Some(nanos) if (now_nanos - nanos).abs() > five_min_nanos => {
-                warn!(
-                    bep_start_nanos = nanos,
-                    wall_clock_nanos = now_nanos,
-                    drift_seconds = (now_nanos - nanos) / 1_000_000_000,
-                    "BEP start time deviates from wall clock by >5 min; using wall clock"
-                );
-                Some(now_nanos)
-            }
-            other => other,
-        };
-        if let Some(nanos) = sanitized_start {
+        if let Some(nanos) = start_time_nanos.or(event_time_nanos) {
             builder = builder.with_start_time(super::nanos_to_system_time(nanos));
             self.root_span_start_nanos = Some(nanos);
         }
