@@ -22,6 +22,7 @@ impl OtelMapper {
         event_time_nanos: Option<i64>,
     ) {
         self.cached_command = Some(command.to_string());
+        self.build_start_nanos = start_time_nanos.or(event_time_nanos);
 
         let trace_id = trace_context::uuid_to_trace_id(uuid);
         let parent_cx = trace_context::make_root_context(trace_id);
@@ -184,6 +185,7 @@ impl OtelMapper {
     fn start_compact_tailer(&mut self, path: PathBuf) {
         let handle = crate::exec_log::tailer::spawn(
             path.clone(),
+            self.build_start_nanos.map(super::nanos_to_system_time),
             self.exec_log_max_message_bytes,
             self.exec_log_max_decompressed_bytes,
         );

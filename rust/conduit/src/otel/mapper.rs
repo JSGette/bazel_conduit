@@ -318,6 +318,9 @@ pub struct OtelMapper {
     /// Used with BuildMetrics wallTimeInMs to derive correct end for cached builds.
     root_span_start_nanos: Option<i64>,
 
+    /// Invocation start as reported by Bazel (not clamped like the root span).
+    build_start_nanos: Option<i64>,
+
     /// Root span end derived from start + wallTimeInMs when BuildMetrics provides it.
     /// Takes precedence over finish_time_nanos so duration matches Bazel's wall time.
     root_span_end_from_wall_nanos: Option<i64>,
@@ -440,6 +443,7 @@ impl OtelMapper {
             shut_down: false,
             finish_time_nanos: None,
             root_span_start_nanos: None,
+            build_start_nanos: None,
             root_span_end_from_wall_nanos: None,
             named_set_cache: HashMap::new(),
             pending_fetches: Vec::new(),
@@ -746,6 +750,7 @@ impl OtelMapper {
         self.shut_down = false;
         self.finish_time_nanos = None;
         self.root_span_start_nanos = None;
+        self.build_start_nanos = None;
         self.root_span_end_from_wall_nanos = None;
         self.named_set_cache.clear();
         self.pending_fetches.clear();

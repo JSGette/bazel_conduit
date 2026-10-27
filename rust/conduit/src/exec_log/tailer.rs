@@ -14,8 +14,8 @@
 //!
 //! The tailer is one [`tokio::task::spawn_blocking`] worker per invocation:
 //!
-//! 1. Open the file (with backoff if Bazel hasn't created it yet — BEP
-//!    `OptionsParsed` arrives before `SpawnLogModule.executorInit`).
+//! 1. Open the file (with backoff if Bazel hasn't created or truncated it
+//!    yet — BEP `OptionsParsed` arrives before `SpawnLogModule.executorInit`).
 //! 2. Wrap in a small `Read` adapter that **blocks** (sleeps 100 ms then
 //!    retries) when the inner file is momentarily at EOF, instead of
 //!    propagating `Ok(0)`. This is the linchpin: `zstd::Decoder<R: Read>`
@@ -36,7 +36,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use prost::Message;
 use spawn_proto::tools::protos::{ExecLogEntry, SpawnExec};
@@ -117,12 +117,17 @@ impl TailerHandle {
 
 /// Spawn a tailer worker. Returns a handle the mapper drives.
 ///
+/// `not_before` is the invocation start: a file last modified earlier is the
+/// previous invocation's log, which Bazel truncates in place only once
+/// execution starts, so the tailer waits rather than reading stale spawns.
+///
 /// `max_message_bytes` and `max_decompressed_bytes` cap pathological logs
 /// (length-prefix attack and zstd zip-bomb respectively); both default to
 /// the same values as the post-build batch reader so a config that worked
 /// for `read_all` will also work live.
 pub fn spawn(
     path: PathBuf,
+    not_before: Option<SystemTime>,
     max_message_bytes: usize,
     max_decompressed_bytes: usize,
 ) -> TailerHandle {
@@ -133,7 +138,14 @@ pub fn spawn(
     let last_error_for_task = Arc::clone(&last_error);
 
     let join = tokio::task::spawn_blocking(move || {
-        if let Err(err) = run(&path, max_message_bytes, max_decompressed_bytes, &shutdown_for_task, &tx) {
+        if let Err(err) = run(
+            &path,
+            not_before,
+            max_message_bytes,
+            max_decompressed_bytes,
+            &shutdown_for_task,
+            &tx,
+        ) {
             warn!(
                 path = %path.display(),
                 error = %err,
@@ -160,6 +172,7 @@ pub fn spawn(
 pub fn spawn_with_defaults(path: PathBuf) -> TailerHandle {
     spawn(
         path,
+        None,
         DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
         DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
     )
@@ -167,12 +180,13 @@ pub fn spawn_with_defaults(path: PathBuf) -> TailerHandle {
 
 fn run(
     path: &Path,
+    not_before: Option<SystemTime>,
     max_message_bytes: usize,
     max_decompressed_bytes: usize,
     shutdown: &Arc<AtomicBool>,
     tx: &mpsc::Sender<SpawnExec>,
 ) -> std::io::Result<()> {
-    let file = open_with_backoff(path, shutdown)?;
+    let file = open_with_backoff(path, not_before, shutdown)?;
     let tailed = TailingReader::new(file, Arc::clone(shutdown));
     let limited = LimitedReader::new(tailed, max_decompressed_bytes);
     let decoder = zstd::Decoder::new(limited)?;
@@ -196,20 +210,38 @@ fn run(
     Ok(())
 }
 
-fn open_with_backoff(path: &Path, shutdown: &Arc<AtomicBool>) -> std::io::Result<File> {
+fn open_with_backoff(
+    path: &Path,
+    not_before: Option<SystemTime>,
+    shutdown: &Arc<AtomicBool>,
+) -> std::io::Result<File> {
     let mut tries = 0u32;
+    let mut stale = None;
     loop {
-        match File::open(path) {
-            Ok(f) => return Ok(f),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tries += 1;
-                if tries > MAX_OPEN_RETRIES || shutdown.load(Ordering::SeqCst) {
-                    return Err(e);
+        let not_ready = match File::open(path) {
+            Ok(f) => {
+                let meta = f.metadata()?;
+                let seen = (meta.modified()?, meta.len());
+                // A change since the first (stale) sighting is Bazel's
+                // truncation, even where coarse mtimes hide it from `not_before`.
+                let rewritten = stale.is_some_and(|first| first != seen);
+                if rewritten || not_before.is_none_or(|t| seen.0 >= t) {
+                    return Ok(f);
                 }
-                std::thread::sleep(OPEN_RETRY_INTERVAL);
+                stale.get_or_insert(seen);
+                "predates this invocation"
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "not found",
             Err(e) => return Err(e),
+        };
+        tries += 1;
+        if tries > MAX_OPEN_RETRIES || shutdown.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("compact exec log {not_ready}"),
+            ));
         }
+        std::thread::sleep(OPEN_RETRY_INTERVAL);
     }
 }
 
@@ -429,5 +461,68 @@ mod tests {
         assert_eq!(spawn.target_label, "//pkg:late");
         handle.shutdown();
         handle.join.await.unwrap();
+    }
+
+    fn spawn_log(label: &str) -> Vec<ExecLogEntry> {
+        vec![
+            entry(
+                0,
+                EntryType::Invocation(Invocation {
+                    hash_function_name: "SHA256".into(),
+                    workspace_runfiles_directory: "_main".into(),
+                    sibling_repository_layout: false,
+                    id: "inv".into(),
+                }),
+            ),
+            entry(
+                1,
+                EntryType::Spawn(SpawnEntry {
+                    target_label: label.into(),
+                    mnemonic: "Genrule".into(),
+                    ..Default::default()
+                }),
+            ),
+        ]
+    }
+
+    /// The previous invocation's log is still on disk when the tailer starts;
+    /// Bazel truncates and rewrites it in place later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waits_for_stale_log_to_be_rewritten() {
+        assert_reads_rewritten_log(Duration::ZERO).await;
+    }
+
+    /// The rewrite is detected even when its mtime is still below the cutoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detects_rewrite_despite_coarse_mtime() {
+        assert_reads_rewritten_log(Duration::from_secs(3600)).await;
+    }
+
+    async fn assert_reads_rewritten_log(cutoff_after_start: Duration) {
+        let f = NamedTempFile::new().unwrap();
+        append_frame(f.path(), &spawn_log("//pkg:stale"));
+        let start = SystemTime::now();
+        f.as_file()
+            .set_modified(start - Duration::from_secs(60))
+            .unwrap();
+
+        let mut handle = spawn(
+            f.path().to_path_buf(),
+            Some(start + cutoff_after_start),
+            DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
+            DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::File::create(f.path()).unwrap();
+        append_frame(f.path(), &spawn_log("//pkg:fresh"));
+
+        let got = tokio::time::timeout(Duration::from_secs(2), handle.rx.recv()).await;
+        // Stop the blocking worker before asserting, or a failure hangs runtime drop.
+        handle.shutdown();
+        handle.join().await;
+        let spawn = got
+            .expect("tailer should read the rewritten log")
+            .expect("tailer should not drop the channel before shutdown");
+        assert_eq!(spawn.target_label, "//pkg:fresh");
     }
 }
