@@ -60,13 +60,6 @@ fn append_progress_capped_within_limit() {
 }
 
 #[test]
-fn normalize_label_strips_at() {
-    assert_eq!(normalize_label("@@repo//:t"), "repo//:t");
-    assert_eq!(normalize_label("@repo//:t"), "repo//:t");
-    assert_eq!(normalize_label("//pkg:t"), "//pkg:t");
-}
-
-#[test]
 fn detect_workspace_name_reads_module_bazel() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

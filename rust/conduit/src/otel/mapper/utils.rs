@@ -129,11 +129,6 @@ pub fn clamp_time_range(
     }
 }
 
-/// Normalize label for matching: strip leading `@` so canonical `@@repo//:t` and apparent `@repo//:t` match.
-pub(super) fn normalize_label(s: &str) -> &str {
-    s.trim_start_matches('@')
-}
-
 /// Maximum size in bytes for each of progress_stderr and progress_stdout.
 /// Each stream is capped at 1 MB; when appending would exceed the cap, the
 /// existing buffer is truncated to keep the tail (recent output) and new

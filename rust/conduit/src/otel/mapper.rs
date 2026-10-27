@@ -67,7 +67,7 @@ use self::action_attrs::{action_status, build_action_attrs, build_action_span_na
 use self::test_attrs::{build_test_attrs, build_test_span_name, test_status};
 use self::utils::{
     append_progress_capped, bytestream_uri_to_display, detect_workspace_name, nanos_to_system_time,
-    normalize_label, spawn_time_range, strip_ansi, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
+    spawn_time_range, strip_ansi, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
     PROGRESS_CAP_BYTES,
 };
 #[cfg(test)]
@@ -185,7 +185,7 @@ impl ActionSpanKey {
         primary_output: Option<&str>,
     ) -> Self {
         Self {
-            target_label: normalize_label(target_label.unwrap_or("")).to_string(),
+            target_label: target_label.unwrap_or("").to_string(),
             mnemonic: mnemonic.unwrap_or("").to_string(),
             primary_output: primary_output.unwrap_or("").to_string(),
         }
@@ -531,29 +531,18 @@ impl OtelMapper {
     /// synthetic span may be recreated after the original target closed).
     pub(super) fn record_target_start(&mut self, label: &str, start_nanos: Option<i64>) {
         if let Some(nanos) = start_nanos {
-            self.target_start_nanos
-                .insert(normalize_label(label).to_string(), nanos);
+            self.target_start_nanos.insert(label.to_string(), nanos);
         }
     }
 
     /// Start of the target span a child hangs under, if known.
     pub(super) fn target_start_for(&self, label: &str) -> Option<i64> {
-        self.target_start_nanos
-            .get(normalize_label(label))
-            .copied()
+        self.target_start_nanos.get(label).copied()
     }
 
-    /// End of the (synthetic) target span a child hangs under, if known. Falls
-    /// back to a normalized scan since callers may pass either label form.
+    /// End of the (synthetic) target span a child hangs under, if known.
     pub(super) fn target_end_for(&self, label: &str) -> Option<i64> {
-        if let Some(end) = self.synthetic_target_end_nanos.get(label) {
-            return Some(*end);
-        }
-        let normalized = normalize_label(label);
-        self.synthetic_target_end_nanos
-            .iter()
-            .find(|(existing, _)| normalize_label(existing) == normalized)
-            .map(|(_, end)| *end)
+        self.synthetic_target_end_nanos.get(label).copied()
     }
 
     /// Set an attribute on the root span (no-op if root span not yet created).

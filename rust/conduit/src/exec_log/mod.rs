@@ -103,16 +103,10 @@ fn nanos_to_system_time(nanos: i64) -> SystemTime {
     }
 }
 
-/// Normalize label for matching: strip leading `@` so canonical `@@repo//:t`
-/// and apparent `@repo//:t` match.
-fn normalize_label(s: &str) -> &str {
-    s.trim_start_matches('@')
-}
-
 /// Candidate keys for cache lookup: (target_label, mnemonic, output) for each
 /// output in listed_outputs and actual_outputs.
 pub(crate) fn spawn_exec_candidate_keys(s: &SpawnExec) -> Vec<ActionSpanKey> {
-    let label = normalize_label(s.target_label.as_str());
+    let label = s.target_label.as_str();
     let mnemonic = s.mnemonic.as_str();
     let mut keys = Vec::new();
     for out in &s.listed_outputs {

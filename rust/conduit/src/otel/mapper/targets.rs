@@ -10,7 +10,7 @@ use opentelemetry::KeyValue;
 use tracing::{debug, warn};
 
 use super::super::attributes::*;
-use super::{bytestream_uri_to_display, normalize_label, ConfiguredTarget, NamedSetEntry, OtelMapper};
+use super::{bytestream_uri_to_display, ConfiguredTarget, NamedSetEntry, OtelMapper};
 
 impl OtelMapper {
     /// TargetConfigured -> store metadata for deferred span creation.
@@ -110,14 +110,6 @@ impl OtelMapper {
         if let Some(existing) = self.target_contexts.get(label) {
             return Some(existing.clone());
         }
-        if let Some(existing) = self
-            .target_contexts
-            .iter()
-            .find(|(existing, _)| normalize_label(existing) == normalize_label(label))
-            .map(|(_, context)| context.clone())
-        {
-            return Some(existing);
-        }
         let parent = self.choose_parent_for_label(label)?;
         if self.closed_targets.contains(label) {
             let cx = self.create_synthetic_target_span(label, &parent, start_nanos);
@@ -145,21 +137,11 @@ impl OtelMapper {
         let Some(end_nanos) = end_nanos else {
             return;
         };
-        let tracked_label = if self.synthetic_target_labels.contains(label) {
-            label.to_string()
-        } else {
-            let normalized = normalize_label(label);
-            let Some(existing) = self
-                .synthetic_target_labels
-                .iter()
-                .find(|existing| normalize_label(existing) == normalized)
-            else {
-                return;
-            };
-            existing.clone()
-        };
+        if !self.synthetic_target_labels.contains(label) {
+            return;
+        }
         self.synthetic_target_end_nanos
-            .entry(tracked_label)
+            .entry(label.to_string())
             .and_modify(|current| *current = (*current).max(end_nanos))
             .or_insert(end_nanos);
     }

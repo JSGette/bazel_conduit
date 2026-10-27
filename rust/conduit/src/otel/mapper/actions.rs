@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use super::super::attributes::*;
 use super::{action_status, build_action_attrs, build_action_span_name};
-use super::{clamp_time_range, normalize_label, ActionCompletedEvent, ActionSpanInfo, ActionSpanKey, OpenAction, OtelMapper};
+use super::{clamp_time_range, ActionCompletedEvent, ActionSpanInfo, ActionSpanKey, OpenAction, OtelMapper};
 
 impl OtelMapper {
     /// ActionCompleted -> create `action {mnemonic} {label}` span. With the
@@ -246,9 +246,8 @@ impl OtelMapper {
         target_label: &str,
         target_end_nanos: Option<i64>,
     ) {
-        let normalized = normalize_label(target_label);
         for action in self.action_span_cache.values_mut() {
-            if action.span.is_some() && normalize_label(&action.target_label) == normalized {
+            if action.span.is_some() && action.target_label == target_label {
                 action.info.end_nanos = match (action.info.end_nanos, target_end_nanos) {
                     (Some(end), Some(bound)) => Some(end.min(bound)),
                     (None, bound) => bound,
