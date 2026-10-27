@@ -260,6 +260,14 @@ impl EventRouter {
             mapper.finish();
         }
     }
+
+    /// Mark an unfinished invocation as cut short by conduit shutdown.
+    /// Call before [`Self::finish`].
+    pub fn shutdown(&mut self) {
+        if let Some(mapper) = &mut self.mapper {
+            mapper.on_shutdown();
+        }
+    }
 }
 
 impl EventRouter {

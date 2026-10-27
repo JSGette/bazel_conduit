@@ -18,7 +18,7 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "logs"] }
 opentelemetry-stdout = { version = "0.27", features = ["logs"] }
 
 # Async
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-stream = "0.1"
 
 # CLI

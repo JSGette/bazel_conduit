@@ -242,6 +242,23 @@ fn root_span_lifecycle() {
 }
 
 #[test]
+fn shutdown_marks_only_unfinished_invocations() {
+    let mut mapper = test_mapper();
+    mapper.on_shutdown();
+    assert!(!mapper.shut_down, "no root span yet");
+
+    mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+    mapper.on_shutdown();
+    assert!(mapper.shut_down);
+
+    mapper.reset();
+    mapper.on_build_started("uuid-2", "build", Some(1_000_000_000), None);
+    mapper.on_build_finished(Some(0), Some(2_000_000_000), None);
+    mapper.on_shutdown();
+    assert!(!mapper.shut_down, "finished build keeps its real status");
+}
+
+#[test]
 fn pattern_enriches_root_name() {
     let mut mapper = test_mapper();
     mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);

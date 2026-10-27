@@ -14,6 +14,7 @@ use opentelemetry::trace::TracerProvider as _;
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -215,7 +216,14 @@ async fn main() -> anyhow::Result<()> {
                  ensure access is restricted via firewall / sidecar / network policy."
             );
         }
-        run_server(addr, make_router).await?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let shutdown = async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down"),
+                _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+            }
+        };
+        run_server(addr, make_router, shutdown).await?;
     } else {
         info!("Usage:");
         info!("  Process JSON file: conduit --input <file.json> [--export stdout|otlp]");

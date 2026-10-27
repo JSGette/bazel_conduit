@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, trace, warn};
@@ -38,39 +39,78 @@ struct Session {
 struct Sessions {
     make_router: Box<dyn Fn() -> EventRouter + Send + Sync>,
     live: Mutex<HashMap<String, Session>>,
+    workers: Mutex<JoinSet<()>>,
+    stop: watch::Receiver<bool>,
 }
 
 impl Sessions {
-    fn new(make_router: impl Fn() -> EventRouter + Send + Sync + 'static) -> Self {
+    fn new(
+        make_router: impl Fn() -> EventRouter + Send + Sync + 'static,
+        stop: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             make_router: Box::new(make_router),
             live: Mutex::new(HashMap::new()),
+            workers: Mutex::new(JoinSet::new()),
+            stop,
         }
+    }
+
+    /// Wait (up to `timeout`) for every routing worker to finalize its trace.
+    async fn drain(&self, timeout: Duration) -> Result<usize, tokio::time::error::Elapsed> {
+        let mut workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        while workers.try_join_next().is_some() {}
+        let count = workers.len();
+        tokio::time::timeout(timeout, async {
+            while workers.join_next().await.is_some() {}
+        })
+        .await
+        .map(|()| count)
     }
 
     /// Sender into the invocation's worker; a retried stream for a live
     /// invocation resumes it instead of starting a partial trace. The watch
     /// receiver fires when a later stream resumes the same invocation. An
-    /// empty key gets a private worker that nothing can resume.
-    fn attach(&self, key: &str) -> (mpsc::Sender<RoutedEvent>, watch::Receiver<u64>) {
+    /// empty key gets a private worker that nothing can resume. `None` once
+    /// shutdown has begun.
+    fn attach(&self, key: &str) -> Option<(mpsc::Sender<RoutedEvent>, watch::Receiver<u64>)> {
         let mut live = self.live.lock().unwrap();
         live.retain(|_, s| s.tx.strong_count() > 0);
         if let Some(s) = live.get(key) {
             if let Some(tx) = s.tx.upgrade() {
                 info!(key, "Resuming BES stream for live invocation");
                 s.resumed.send_modify(|n| *n += 1);
-                return (tx, s.resumed.subscribe());
+                return Some((tx, s.resumed.subscribe()));
             }
         }
+        let mut workers = self.workers.lock().unwrap();
+        // Checked under the workers lock so `drain` never misses a worker.
+        if *self.stop.borrow() {
+            return None;
+        }
+        while workers.try_join_next().is_some() {}
         let (tx, rx) = mpsc::channel(ROUTE_CHANNEL_CAPACITY);
-        tokio::spawn(route_stream((self.make_router)(), rx));
+        let worker = route_stream((self.make_router)(), rx, self.stop.clone());
+        workers.spawn(async move {
+            worker.await;
+        });
         let (resumed, resumed_rx) = watch::channel(0);
         if !key.is_empty() {
             let session = Session { tx: tx.downgrade(), resumed };
             live.insert(key.to_string(), session);
         }
-        (tx, resumed_rx)
+        Some((tx, resumed_rx))
     }
+}
+
+/// Session key: the full BES `StreamId`, or empty (unresumable) without one.
+fn stream_key(ordered: &crate::bes_proto::OrderedBuildEvent) -> String {
+    ordered
+        .stream_id
+        .as_ref()
+        .filter(|s| !s.invocation_id.is_empty())
+        .map(|s| format!("{}/{}/{}", s.build_id, s.invocation_id, s.component))
+        .unwrap_or_default()
 }
 
 /// BES gRPC server.
@@ -78,19 +118,13 @@ pub struct BesServer {
     sessions: Arc<Sessions>,
 }
 
-impl BesServer {
-    pub fn new(make_router: impl Fn() -> EventRouter + Send + Sync + 'static) -> Self {
-        Self {
-            sessions: Arc::new(Sessions::new(make_router)),
-        }
-    }
-}
-
-/// Route one stream's events in order, then finalize. Returns the router so
-/// callers (tests) can inspect the per-stream state.
+/// Route one invocation's events in order, then finalize. `stop` ends the
+/// invocation early (conduit shutdown). Returns the router so callers
+/// (tests) can inspect the per-invocation state.
 pub(crate) async fn route_stream(
     mut router: EventRouter,
     mut route_rx: mpsc::Receiver<RoutedEvent>,
+    mut stop: watch::Receiver<bool>,
 ) -> EventRouter {
     let mut routed: u64 = 0;
     let mut last_sequence = None;
@@ -101,27 +135,44 @@ pub(crate) async fn route_stream(
     loop {
         tokio::select! {
             event = route_rx.recv() => {
-                let Some((sequence, build_event, event_time_nanos)) = event else {
-                    break;
-                };
-                // A resumed stream retransmits events whose ACK was lost in flight.
-                if last_sequence.is_some_and(|last| sequence <= last) {
-                    debug!(sequence, "Skipping retransmitted BES event");
-                    continue;
-                }
-                last_sequence = Some(sequence);
-                if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
-                    warn!(error = %e, "Failed to route BEP event");
-                }
-                routed += 1;
+                let Some(event) = event else { break };
+                routed += u64::from(route_event(&mut router, &mut last_sequence, event));
             }
             _ = exec_log_tick.tick() => router.pump_exec_log(),
+            Ok(_) = stop.wait_for(|stopped| *stopped) => break,
         }
+    }
+    // Events already ACKed to Bazel must still reach the trace.
+    route_rx.close();
+    while let Ok(event) = route_rx.try_recv() {
+        routed += u64::from(route_event(&mut router, &mut last_sequence, event));
+    }
+    // Outside the select: the stream may close in the same instant as stop.
+    if *stop.borrow() {
+        router.shutdown();
     }
     router.finish();
     info!("\n{}", router.state().summary());
     info!("Routing worker drained ({routed} events routed)");
     router
+}
+
+/// Route one event unless it is a retransmission; returns whether it was routed.
+fn route_event(
+    router: &mut EventRouter,
+    last_sequence: &mut Option<i64>,
+    (sequence, build_event, event_time_nanos): RoutedEvent,
+) -> bool {
+    // A resumed stream retransmits events whose ACK was lost in flight.
+    if last_sequence.is_some_and(|last| sequence <= last) {
+        debug!(sequence, "Skipping retransmitted BES event");
+        return false;
+    }
+    *last_sequence = Some(sequence);
+    if let Err(e) = router.route_build_event(&build_event, event_time_nanos) {
+        warn!(error = %e, "Failed to route BEP event");
+    }
+    true
 }
 
 #[tonic::async_trait]
@@ -170,9 +221,9 @@ impl PublishBuildEvent for BesServer {
 
     /// Handle the bidirectional stream of build tool events
     ///
-    /// Receive loop is decoupled from routing: incoming events are decoded and
-    /// ACKed inline, then forwarded to this stream's worker task that calls
-    /// into the OTel mapper serially (preserving order). This keeps Bazel's BES
+    /// Receive loop is decoupled from routing: incoming events are decoded,
+    /// queued to the invocation's worker task (which calls into the OTel
+    /// mapper serially, preserving order), then ACKed. This keeps Bazel's BES
     /// upload timer bounded by network + decode latency rather than span
     /// emission cost.
     async fn publish_build_tool_event_stream(
@@ -203,17 +254,24 @@ impl PublishBuildEvent for BesServer {
                             "Received build tool event"
                         );
 
-                        let (tx, _) = session.get_or_insert_with(|| {
-                            let key = ordered
-                                .stream_id
-                                .as_ref()
-                                .filter(|s| !s.invocation_id.is_empty())
-                                .map(|s| {
-                                    format!("{}/{}/{}", s.build_id, s.invocation_id, s.component)
-                                })
-                                .unwrap_or_default();
-                            sessions.attach(&key)
-                        });
+                        if session.is_none() {
+                            session = sessions.attach(&stream_key(ordered));
+                        }
+                        let Some((tx, _)) = &session else {
+                            let status = Status::unavailable("conduit is shutting down");
+                            let _ = ack_tx.send(Err(status)).await;
+                            break true;
+                        };
+
+                        // Enqueue before ACK: an ACKed event must reach the trace.
+                        if let Some((event, time)) = decode_bep_event_from_request(&req) {
+                            if tx.send((ordered.sequence_number, event, time)).await.is_err() {
+                                warn!("Routing worker channel closed");
+                                let status = Status::unavailable("conduit is shutting down");
+                                let _ = ack_tx.send(Err(status)).await;
+                                break true;
+                            }
+                        }
 
                         let response = PublishBuildToolEventStreamResponse {
                             stream_id: ordered.stream_id.clone(),
@@ -222,13 +280,6 @@ impl PublishBuildEvent for BesServer {
                         if ack_tx.send(Ok(response)).await.is_err() {
                             debug!("ACK channel closed");
                             break false;
-                        }
-
-                        if let Some((event, time)) = decode_bep_event_from_request(&req) {
-                            if tx.send((ordered.sequence_number, event, time)).await.is_err() {
-                                warn!("Routing worker channel closed");
-                                break true;
-                            }
                         }
                     }
                     Ok(None) => {
@@ -270,6 +321,10 @@ const EXEC_LOG_PUMP_INTERVAL: Duration = Duration::from_millis(100);
 /// How long an invocation outlives a broken stream. Bazel retransmits only
 /// un-ACKed events on retry, backing off 1s * 1.6^n over 4 attempts (~10s).
 const STREAM_RESUME_GRACE: Duration = Duration::from_secs(60);
+
+/// Budget for finalizing live invocations on SIGTERM. Leaves room inside a
+/// typical 5s+ termination grace for the exporter flush that follows.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Per-message cap for inbound BES events. BEP `BuildMetrics`, action stderr,
 /// or fat `OptionsParsed` blobs occasionally reach hundreds of KiB; 8 MiB
@@ -610,12 +665,18 @@ pub(crate) fn test_status_to_str(status: i32) -> &'static str {
     }
 }
 
-/// Run the BES gRPC server
+/// Run the BES gRPC server until `shutdown` resolves, then finalize every
+/// live invocation (root span marked as cut short) before returning.
 pub async fn run_server(
     addr: SocketAddr,
     make_router: impl Fn() -> EventRouter + Send + Sync + 'static,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let server = BesServer::new(make_router);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let sessions = Arc::new(Sessions::new(make_router, stop_rx));
+    let server = BesServer {
+        sessions: sessions.clone(),
+    };
 
     info!("Starting BES gRPC server on {}", addr);
     info!(
@@ -626,15 +687,28 @@ pub async fn run_server(
     let service = PublishBuildEventServer::new(server)
         .max_decoding_message_size(MAX_INCOMING_MESSAGE_BYTES);
 
-    tonic::transport::Server::builder()
+    let serve = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
         .concurrency_limit_per_connection(CONCURRENCY_LIMIT_PER_CONNECTION)
         .add_service(service)
-        .serve(addr)
-        .await?;
+        .serve(addr);
 
+    // Not serve_with_shutdown: that waits for open BES streams, which last as
+    // long as the build.
+    tokio::select! {
+        result = serve => return result.map_err(Into::into),
+        () = shutdown => {}
+    }
+
+    stop_tx.send_replace(true);
+    match sessions.drain(SHUTDOWN_DRAIN_TIMEOUT).await {
+        Ok(count) => info!("Shutdown: finalized {count} invocation(s)"),
+        Err(_) => warn!(
+            "Shutdown: invocations still finalizing after {SHUTDOWN_DRAIN_TIMEOUT:?}; their traces may be incomplete"
+        ),
+    }
     Ok(())
 }
 
@@ -660,12 +734,16 @@ mod tests {
         (sequence, event, None)
     }
 
+    fn no_stop() -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
+
     #[tokio::test]
     async fn concurrent_streams_do_not_share_state() {
         let (tx_a, rx_a) = mpsc::channel(8);
         let (tx_b, rx_b) = mpsc::channel(8);
-        let a = tokio::spawn(route_stream(EventRouter::new(), rx_a));
-        let b = tokio::spawn(route_stream(EventRouter::new(), rx_b));
+        let a = tokio::spawn(route_stream(EventRouter::new(), rx_a, no_stop()));
+        let b = tokio::spawn(route_stream(EventRouter::new(), rx_b, no_stop()));
 
         tx_a.send(started(1, "uuid-a", "build")).await.unwrap();
         tx_b.send(started(1, "uuid-b", "test")).await.unwrap();
@@ -681,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn retransmitted_sequence_is_skipped() {
         let (tx, rx) = mpsc::channel(8);
-        let worker = tokio::spawn(route_stream(EventRouter::new(), rx));
+        let worker = tokio::spawn(route_stream(EventRouter::new(), rx, no_stop()));
         tx.send(started(1, "uuid-a", "build")).await.unwrap();
         tx.send(started(1, "uuid-dup", "test")).await.unwrap();
         drop(tx);
@@ -692,19 +770,46 @@ mod tests {
 
     #[tokio::test]
     async fn retried_stream_resumes_live_invocation() {
-        let sessions = Sessions::new(EventRouter::new);
-        let (first, first_resumed) = sessions.attach("inv-1");
+        let sessions = Sessions::new(EventRouter::new, no_stop());
+        let tx = |key| sessions.attach(key).unwrap().0;
+        let (first, first_resumed) = sessions.attach("inv-1").unwrap();
         assert!(!first_resumed.has_changed().unwrap());
-        let (resumed, resumed_rx) = sessions.attach("inv-1");
+        let (resumed, resumed_rx) = sessions.attach("inv-1").unwrap();
         assert!(first.same_channel(&resumed));
         assert!(first_resumed.has_changed().unwrap(), "broken stream must see the resume");
         assert!(!resumed_rx.has_changed().unwrap());
-        assert!(!first.same_channel(&sessions.attach("inv-2").0));
-        assert!(!sessions.attach("").0.same_channel(&sessions.attach("").0));
+        assert!(!first.same_channel(&tx("inv-2")));
+        assert!(!tx("").same_channel(&tx("")));
 
         let weak = first.downgrade();
         drop((first, resumed));
         assert!(weak.upgrade().is_none(), "worker must finalize once all streams are gone");
-        assert_eq!(sessions.attach("inv-1").0.strong_count(), 1);
+        assert_eq!(tx("inv-1").strong_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_routes_already_buffered_events() {
+        let (stop_tx, stop_rx) = watch::channel(true);
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(started(1, "uuid-a", "build")).await.unwrap();
+
+        let router = route_stream(EventRouter::new(), rx, stop_rx).await;
+        assert_eq!(router.state().invocation_id(), Some("uuid-a"));
+        assert!(tx.is_closed());
+        drop(stop_tx);
+    }
+
+    #[tokio::test]
+    async fn shutdown_finalizes_attached_invocations() {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let sessions = Sessions::new(EventRouter::new, stop_rx);
+        let (tx, _) = sessions.attach("inv-1").unwrap();
+        tx.send(started(1, "uuid-a", "build")).await.unwrap();
+
+        stop_tx.send_replace(true);
+        assert!(sessions.attach("inv-2").is_none(), "no new invocations once stopping");
+        let drained = sessions.drain(Duration::from_secs(1)).await;
+        assert_eq!(drained.ok(), Some(1), "live stream must not block shutdown");
+        assert!(tx.is_closed());
     }
 }

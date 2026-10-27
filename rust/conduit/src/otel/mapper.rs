@@ -308,6 +308,9 @@ pub struct OtelMapper {
     /// Cached exit code from BuildFinished (root span ends in [`finish`]).
     exit_code: Option<i32>,
 
+    /// Conduit stopped before BuildFinished arrived; root ends as an error.
+    shut_down: bool,
+
     /// Cached finish timestamp (nanos since epoch) from BuildFinished.
     finish_time_nanos: Option<i64>,
 
@@ -434,6 +437,7 @@ impl OtelMapper {
             progress_stdout: String::new(),
             logger,
             exit_code: None,
+            shut_down: false,
             finish_time_nanos: None,
             root_span_start_nanos: None,
             root_span_end_from_wall_nanos: None,
@@ -681,6 +685,15 @@ impl OtelMapper {
         }
     }
 
+    /// Conduit is shutting down mid-build: mark the root so [`finish`] ends it
+    /// as an error instead of a silently truncated trace.
+    pub fn on_shutdown(&mut self) {
+        if self.root_context.is_some() && self.exit_code.is_none() {
+            self.shut_down = true;
+            self.add_root_event("conduit.shutdown", Vec::new());
+        }
+    }
+
     /// BuildMetrics → add metrics attributes to root span.
     /// Supports both legacy flat payload (actionsCreated/actionsExecuted) and full nested payload.
     pub fn on_build_metrics(&mut self, metrics: &serde_json::Value) {
@@ -730,6 +743,7 @@ impl OtelMapper {
         self.progress_stderr.clear();
         self.progress_stdout.clear();
         self.exit_code = None;
+        self.shut_down = false;
         self.finish_time_nanos = None;
         self.root_span_start_nanos = None;
         self.root_span_end_from_wall_nanos = None;
@@ -948,6 +962,7 @@ impl OtelMapper {
                 Some(code) => Status::Error {
                     description: Cow::Owned(format!("exit code {code}")),
                 },
+                None if self.shut_down => Status::error("conduit shut down before the build finished"),
                 None => Status::Unset,
             };
             cx.span().set_status(status);
