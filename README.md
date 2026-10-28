@@ -1,192 +1,246 @@
 # Bazel Conduit
 
-A Rust tool that converts Bazel [Build Event Protocol](https://bazel.build/remote/bep) (BEP) streams into [OpenTelemetry](https://opentelemetry.io/) traces, enabling observability of Bazel builds in Datadog, Jaeger, and any OTLP-compatible backend.
+Conduit turns Bazel's [Build Event Protocol](https://bazel.build/remote/bep) (BEP) into
+[OpenTelemetry](https://opentelemetry.io/) traces and logs. It is a
+[Build Event Service](https://bazel.build/remote/bep#build-event-service) (BES) backend:
+point Bazel at it with `--bes_backend` and every invocation becomes one trace, exported over
+OTLP to the Datadog Agent or any other OTLP receiver.
 
-## What It Does
+The main way to run it is as a **sidecar of the Datadog Agent**. It also runs standalone next
+to a developer's Bazel, or offline against a recorded BEP file.
 
-Conduit intercepts Bazel's build event stream — either as a live gRPC [Build Event Service](https://bazel.build/remote/bep#build-event-service) (BES) backend or from saved JSON files — and produces a structured OTel trace where:
+Requires Bazel 9 or later. Bazel 10 adds per-action cache-hit and runner data to BEP
+(`ActionExecuted.strategy_details`), which conduit records when present.
 
-- **1 trace = 1 Bazel invocation** (trace ID derived from Bazel's invocation UUID)
-- **Root span** covers `BuildStarted` → `BuildFinished` with build metadata
-- **Target spans** represent each configured target with timing, output files, tags, and success/failure
-- **Action spans** represent build actions (compile, link, etc.) nested under their target
-- **Test spans** capture test attempts with status, timing, caching, and execution strategy
-- **Spawn spans** (from execution log) provide process-level detail: command lines, I/O metrics, timing breakdowns, cache hit/miss
+## What you get
+
+One trace per Bazel invocation, with the trace ID derived from the invocation UUID:
 
 ```
-bazel.invocation (root)
-├── target //pkg:lib (TargetConfigured → TargetCompleted)
-│   ├── action CppCompile //pkg:lib
-│   │   └── spawn CppCompile lib/foo.cc (from exec log)
-│   └── test //pkg:lib_test
-│       └── test attempt 1 (PASSED)
-├── target //external:zlib (synthetic, from exec log)
-│   └── spawn CppCompile zlib/adler32.c
+bazel build //pkg:app                      root: command, patterns, exit code, build metrics
+├── target //pkg:lib                       kind, success, cached, tags
+│   ├── action CppCompile //pkg:lib        exit code, cache hit, runner
+│   │   └── spawn CppCompile foo.cc        with --exec-log: command, runner, stage timings
+│   └── test //pkg:lib_test attempt=1      status, cache, strategy; summary on the target
 └── skipped targets
-    └── target //pkg:skipped (ANALYSIS_FAILURE)
+    └── target //pkg:broken                abort reason
 ```
 
-## Architecture
+- **Root span:** command and patterns, exit code, `BuildMetrics` (wall/CPU time, action-cache
+  hits and misses, per-runner action counts, memory), fetch counters, and how much the trace
+  profile trimmed (`bazel.trace.suppressed_*`).
+- **Spans** are trimmed by the [trace profile](#trace-profiles): by default, failed actions
+  plus the 200 slowest successful ones.
+- **Log records** carry the build's `ERROR:`, `FAIL:` and `WARNING:` output, including a
+  failed action's stderr and failed test output, correlated with the trace. See [Logs](#logs).
+
+Traces use `service.name=bazel`.
+
+## Running as a Datadog Agent sidecar
+
+Run conduit in the same pod (or on the same host) as the Datadog Agent, with the Agent's
+OTLP receiver enabled. Builds send BES to conduit; conduit sends OTLP to the Agent over
+localhost.
 
 ```
-                   ┌─────────────────────────────┐
-                   │        Bazel Build           │
-                   └──────────┬──────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼                               ▼
-     BES gRPC stream                 binary BEP file
-     (--bes_backend)          (--build_event_binary_file)
-              │                               │
-              ▼                               ▼
-     ┌────────────────┐              ┌────────────────┐
-     │ conduit serve  │              │ conduit replay │
-     │  (BES proto)   │              │ (varint proto) │
-     └───────┬────────┘              └───────┬────────┘
-             │         BuildEvent protos      │
-             └───────────┬───────────────────┘
-                         ▼
-                  ┌──────────────┐
-                  │ EventRouter  │
-                  │  (dispatch)  │
-                  └──────┬───────┘
-                         │
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-        BuildState   OtelMapper   ExecLog
-        (tracking)   (spans)      (enrichment)
-                         │
-                         ▼
-                  ┌──────────────┐
-                  │ OTLP Export  │──▶ Datadog / Jaeger / etc.
-                  └──────────────┘
+Bazel ──BES gRPC :8080──▶ conduit ──OTLP gRPC :4317──▶ Datadog Agent ──▶ Datadog
 ```
 
-### Key Components
+**1. Enable OTLP ingest on the Agent** (traces are on by default once the receiver is enabled;
+logs need their own switch):
 
-| Module | Purpose |
-|--------|---------|
-| `bep/replay.rs` | Reads binary BEP files (`--build_event_binary_file`) |
-| `bep/router.rs` | Dispatches BEP events to the mapper |
-| `otel/mapper.rs` | Creates and manages OTel spans for the build trace |
-| `otel/span.rs` | Minimal span/log model (UUID→trace ID, parenting, attributes) |
-| `otel/export.rs` | Batching OTLP gRPC / OTLP-JSON exporter with bounded retry and drop counting |
-| `otel/attributes.rs` | ~100 typed attribute key constants (`bazel.*` namespace) |
-| `otel/redact.rs` | In-process scrubber for `--client_env=NAME=VALUE` style flags |
-| `grpc/server.rs` | BES gRPC server implementation (`PublishBuildEvent` service) |
-| `exec_log/tailer.rs` | Live tail-follows `--execution_log_compact_file`, decodes zstd, ships `SpawnExec`s to the mapper via mpsc |
-| `exec_log/compact.rs` | Incremental decoder state (dedup table + `SpawnExec` reconstruction) shared by tailer and tests |
-| `state/trace_profile.rs` | Trace emission policy: full vs lightweight, applied to actions, spawns, and targets |
+```yaml
+env:
+  - name: DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT
+    value: "localhost:4317"
+  - name: DD_OTLP_CONFIG_LOGS_ENABLED
+    value: "true"
+```
 
-## Usage
+**2. Add conduit as a container in the Agent pod.** Build the image from a
+[release](../../releases) binary (`conduit-linux-x86_64` or `conduit-linux-arm64`) or from
+source. With the Datadog Helm chart or Operator, use their mechanism for extra containers in
+the Agent pod.
 
-### Build
+```yaml
+containers:
+  - name: conduit
+    image: <your-conduit-image>
+    args:
+      - serve
+      - --listen-addr=0.0.0.0
+      - --port=8080
+      - --export=otlp
+      - --otlp-endpoint=http://localhost:4317
+    ports:
+      - containerPort: 8080
+        hostPort: 8080        # node-local Bazel clients reach conduit via the host IP
+terminationGracePeriodSeconds: 15
+```
+
+**3. Point Bazel at it**, e.g. in `.bazelrc` (CI jobs typically use the node's IP, as they do
+for the Agent itself):
+
+```
+build --bes_backend=grpc://<agent-host>:8080
+build --build_event_publish_all_actions
+build --bes_upload_mode=nowait_for_upload_complete
+```
+
+`--build_event_publish_all_actions` is needed for successful actions to appear; without it
+BEP reports only failed ones. `nowait_for_upload_complete` keeps builds from waiting on BES.
+
+**Operational notes**
+
+- **No auth or TLS.** Keep port 8080 reachable only from build machines (node-local
+  `hostPort`, network policy, or firewall). Conduit warns when bound to a non-loopback address.
+- **Concurrent builds are isolated.** Each BES stream gets its own trace; streams from many
+  builds can share one conduit.
+- **Shutdown.** On SIGTERM conduit stops accepting streams, finalizes in-flight traces (up to
+  3 s), then flushes the exporter (up to 5 s). Traces of builds still running are ended as
+  errors ("conduit shut down before the build finished").
+- **Drops are counted, never blocking.** The exporter queues up to 65,536 records and exports
+  batches of 512 every 200 ms with a bounded retry; anything it cannot queue or export is
+  dropped and the counts are logged on shutdown. BES streams are never slowed down by export.
+- **No exec log in sidecar mode.** `--exec-log` tails a file on the build machine, so it only
+  works when conduit runs where Bazel runs.
+
+## Running standalone
+
+On a developer machine or a single CI host, run conduit next to Bazel:
 
 ```bash
-bazel build //rust/conduit:conduit
-```
+bazel build -c opt //rust/conduit:conduit     # or download a release binary
+./bazel-bin/rust/conduit/conduit serve --export otlp --otlp-endpoint http://localhost:4317
 
-### Run as BES Backend (primary mode)
-
-```bash
-# Start conduit
-./bazel-bin/rust/conduit/conduit serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
-
-# Run Bazel with conduit as BES backend
 bazel build //your:target \
   --bes_backend=grpc://127.0.0.1:8080 \
   --build_event_publish_all_actions
 ```
 
-### Replay a binary BEP file (offline/debug mode)
+- To send to a local Datadog Agent, [`scripts/setup_datadog_agent.sh`](scripts/README.md)
+  configures its OTLP receiver.
+- To look at traces locally, `docker compose -f dev/docker-compose.yml up -d` starts Jaeger
+  on `http://localhost:16686` with OTLP on port 4317.
+- `--export stdout` writes OTLP-JSON (one export request per line) instead of sending it,
+  which is handy for inspecting what would be sent.
+
+### Replaying a recorded build
 
 ```bash
-# Record BEP during a build
 bazel build //your:target --build_event_binary_file=bep.bin
-
-# Process offline
-./bazel-bin/rust/conduit/conduit replay bep.bin --export otlp
+./bazel-bin/rust/conduit/conduit replay bep.bin --export stdout > trace.jsonl
+python3 integration/analyze_trace.py trace.jsonl   # structure and timing checks
 ```
 
-A BEP file carries no BES event times, so untimed events are placed on the
-build's own clock (latest start/finish/action time seen so far).
+A BEP file carries no BES event times, so untimed events are placed on the build's own clock
+(the latest start, finish, or action time seen so far).
 
-### CLI Flags
+## CLI flags
 
-`serve` and `replay <FILE>` accept every flag below except `--listen-addr`
-and `--port`, which are `serve`-only.
+`serve` and `replay <FILE>` accept every flag below except `--listen-addr` and `--port`,
+which are `serve`-only.
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--listen-addr <IP>` | Bind address for the BES gRPC server. Defaults to loopback; pass `0.0.0.0` only when external access is intentionally needed (conduit has no auth/TLS). | `127.0.0.1` |
-| `--port <PORT>` | gRPC server port | 8080 |
-| `--export <MODE>` | Export mode: `none`, `stdout` (OTLP-JSON, one request per line), `otlp` (gRPC) | `none` |
-| `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
-| `--log-level <LEVEL>` | Log level (trace/debug/info/warn/error) | `info` |
-| `--no-redact` | Disable in-process scrubbing of `--client_env=NAME=VALUE` style flags | off (scrubbing on) |
-| `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable) | built-in defaults |
-| `--exec-log` | Tail Bazel's compact execution log for per-spawn detail. Without it, conduit ignores the exec log even when the build writes one. | off |
-| `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_compact_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
-| `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
-| `--trace-profile <PROFILE>` | Trace verbosity: `lightweight` or `full`. See [Trace Profiles](#trace-profiles). | `lightweight` |
+| `--listen-addr <IP>` | Bind address for the BES gRPC server. Use `0.0.0.0` only when access is restricted otherwise; conduit has no auth or TLS. | `127.0.0.1` |
+| `--port <PORT>` | BES gRPC port. | `8080` |
+| `--export <MODE>` | `none`, `stdout` (OTLP-JSON, one request per line), or `otlp` (gRPC). | `none` |
+| `--otlp-endpoint <URL>` | OTLP gRPC endpoint. | `http://localhost:4317` |
+| `--trace-profile <PROFILE>` | `lightweight` or `full`. See [Trace profiles](#trace-profiles). | `lightweight` |
 | `--max-action-spans <N>` | Lightweight: how many successful actions (the slowest) keep a span per invocation. | `200` |
-| `--logs <MODE>` | Which Bazel console output becomes OTLP log records: `errors` (`ERROR:`/`FAIL:` blocks with the failed action's output and `--test_output` blocks at error severity, `WARNING:` blocks at warn), `all` (one record per progress event and stream), or `none`. Records are capped at 64 KiB and 256 per invocation; the overflow is counted in `bazel.trace.suppressed_logs` on the root span. | `errors` |
 | `--trace-min-duration-ms <MS>` | Lightweight: minimum duration for a successful cache-hit spawn to keep a span. | `500` |
+| `--logs <MODE>` | `errors`, `all`, or `none`. See [Logs](#logs). | `errors` |
+| `--exec-log` | Tail Bazel's compact execution log for per-spawn detail. See [Execution log](#execution-log-enrichment). | off |
+| `--exec-log-max-message-mib <MIB>` | Cap on one length-delimited exec-log entry, so a corrupt length prefix cannot exhaust memory. | `64` |
+| `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed exec-log bytes (zstd bomb guard). | `2048` |
+| `--no-redact` | Disable secret scrubbing. See [Secret redaction](#secret-redaction). | scrubbing on |
+| `--redact-name-pattern <SUBSTR>` | Replace the default sensitive-name list (repeatable). | built-in list |
+| `--log-level <LEVEL>` | Conduit's own stderr logging: `trace`, `debug`, `info`, `warn`, `error`. | `info` |
 
-### Secret Redaction
+## Trace profiles
 
-Bazel surfaces environment variables and user-defined values on the command
-line via flags like `--client_env=NAME=VALUE`, `--action_env=`, `--test_env=`,
-`--repo_env=`, `--host_action_env=`, and `--define=NAME=VALUE`. Workspace
-status entries produced by `--workspace_status_command` (`STABLE_*` keys)
-routinely carry CI-injected tokens. Progress stdout/stderr can echo any of
-the above. Without intervention all of these end up verbatim in the
-`bazel.explicit_cmd_line`, `bazel.action.command_line`, `bazel.spawn.command`, `bazel.workspace.*`,
-and progress log records — and from there into whatever
-backend the OTLP exporter is wired to.
+A large build runs tens of thousands of actions, almost all fast cache hits. The profile
+decides how many of them become spans:
 
-Conduit ships with an in-process scrubber (`rust/conduit/src/otel/redact.rs`)
-that runs **before** any attribute is set on a span. Three scrubbing
-surfaces are used:
+| Profile | Behavior |
+|---------|----------|
+| **lightweight** (default) | Failed actions, plus the `--max-action-spans` slowest successful ones, and only the targets those belong to. Exec-log spawns are kept when they fail, miss the cache, or take at least `--trace-min-duration-ms`. Successful actions are held until the invocation ends, so their spans export then. |
+| **full** | Every target, action, and spawn. Complete but verbose. |
 
-- **Argv tokens** (`scrub_arg` / `scrub_args`) — applied to
-  `explicit_cmd_line`, ActionExecuted command lines, and SpawnExec command_args. The `VALUE` half of a
-  recognized `--flag=NAME=VALUE` is replaced with `***` when `NAME` matches.
-- **`(name, value)` pairs** (`scrub_value_by_name`) — applied to
-  `workspaceStatus` entries. Replaces VALUE with `***` when the key name
-  matches.
-- **Free-form text** (`scrub_text`) — applied to progress stdout/stderr.
-  Tokenises on whitespace, runs each token through `scrub_arg`, preserves
-  whitespace runs.
+Either way, the aggregate `BuildMetrics` stay on the root span, and
+`bazel.trace.suppressed_{actions,spawns,targets,logs}` record how much was trimmed.
 
-The pass-through form `--client_env=NAME` (no `=VALUE`, inherits from
-the parent process env) is left untouched because no value is on the wire.
+To reduce volume further, layer backend controls on top: Agent caps (`DD_APM_MAX_TPS`,
+`DD_APM_FILTER_TAGS_REJECT`), span-generated metrics for long-term numbers, and retention
+filters for indexed storage.
 
-Default sensitive-name substrings: `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
-`CREDENTIAL`, `COOKIE`, `APIKEY`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`,
-`AUTH`. The list is intentionally narrow (e.g. plain `KEY` is excluded
-because it would match `MONKEY`). Override or extend it via
-`--redact-name-pattern` (repeatable, supplied list fully replaces the
-default). Disable entirely with `--no-redact` — only safe when the receiving
-backend is fully trusted or has its own scrubbing layer.
+## Logs
 
-```bash
-# Default list
-./conduit serve --port 8080 --export otlp --otlp-endpoint http://localhost:4317
+Bazel's console output arrives in BEP `Progress` events. `--logs` picks what becomes OTLP log
+records, correlated with the invocation's trace:
 
-# Custom list (replaces default)
-./conduit serve \
-  --redact-name-pattern TOKEN --redact-name-pattern JIRA --redact-name-pattern AWS_
+- **`errors`** (default): `ERROR:` and `FAIL:` blocks at error severity, including the failed
+  action's own stderr that Bazel prints right after the `ERROR:` line, `--test_output` blocks
+  at error severity, and `WARNING:` blocks at warn severity. Progress chatter (`INFO:`,
+  `Loading:`, `Analyzing:`, `[N / M] ...`) is dropped. Blocks split across progress events
+  are reassembled.
+- **`all`**: one info record per progress event and output stream.
+- **`none`**: no log records.
 
-# Disabled
-./conduit serve --no-redact
-```
+Records are redacted, ANSI-stripped, and capped at 64 KiB. An invocation emits at most 256
+records; the rest are counted in `bazel.trace.suppressed_logs` on the root span.
 
-#### Defense in depth: Datadog Agent server-side scrubbing
+## Execution log enrichment
 
-For belt-and-braces protection, also configure the Datadog Agent's
-`apm_config.replace_tags` so a future call-site that forgets to route through
-the scrubber still cannot leak. Example `datadog.yaml`:
+BEP describes actions but not the processes they spawn. With `--exec-log`, when a build runs
+with `--execution_log_compact_file=<path>`, conduit opens that file (relative paths resolve
+against the workspace) and tails it while the build runs. Each decoded `SpawnExec`:
+
+1. Matches its action span by `(target label, mnemonic, primary output)`.
+2. On the action's first spawn, copies the runner, cache hit, and `SpawnMetrics` stage
+   timings onto the action span. Later spawns (retries, dynamic-execution races) only
+   increment `bazel.action.spawn.count`.
+3. Becomes a `spawn` child span with its own runner, cache hit, command line, stage timings,
+   and input metrics.
+
+Spawns that arrive before their action are held briefly. Spawns that never match an action
+(BEP does not report every action, e.g. those of external dependencies) are grouped under
+synthesized action spans marked `bazel.target.synthetic = true`. Actions that never spawn a
+process (`FileWrite`, `SymlinkTree`, ...) end with `bazel.action.spawn.count = 0`.
+
+Notes:
+
+- Conduit must run on the build machine, since it reads a local file. The copy Bazel uploads
+  to the remote cache only appears after the build, so it is not a live source.
+- Only the compact format is supported. `--execution_log_binary_file` and
+  `--execution_log_json_file` lack the dedup table that makes streaming possible; conduit
+  logs a warning and ignores them.
+- Streaming is chunky: Bazel's zstd stream emits a block per 128 KiB of uncompressed input
+  and is only flushed at `close()`, so spawns arrive in bursts of a few hundred, and
+  `finish()` waits up to 2 s for the final chunk.
+
+## Secret redaction
+
+Bazel puts environment and user-defined values on the command line (`--client_env=NAME=VALUE`,
+`--action_env=`, `--test_env=`, `--repo_env=`, `--host_action_env=`, `--define=NAME=VALUE`),
+workspace status (`STABLE_*` keys from `--workspace_status_command`) often carries CI tokens,
+and console output can echo any of it. Conduit scrubs all of these before they reach a span or
+log record (`rust/conduit/src/otel/redact.rs`):
+
+- **Argv tokens**: the explicit command line, action command lines, and spawn command lines.
+  The `VALUE` in `--flag=NAME=VALUE` becomes `***` when `NAME` matches.
+- **Name/value pairs**: workspace status entries, by key name.
+- **Free text**: console output in log records, token by token.
+
+The pass-through form `--client_env=NAME` (no value on the wire) is left alone.
+
+Default sensitive-name substrings: `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`,
+`COOKIE`, `APIKEY`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`, `AUTH`. Plain `KEY` is excluded
+because it would match `MONKEY`. `--redact-name-pattern` (repeatable) replaces the list;
+`--no-redact` turns scrubbing off, which is only safe when the backend is fully trusted.
+
+For defense in depth, also scrub on the Agent with `apm_config.replace_tags`:
 
 ```yaml
 apm_config:
@@ -196,235 +250,79 @@ apm_config:
       repl:    "--client_env=$1=***"
 ```
 
-Equivalent functionality exists in the OpenTelemetry Collector's
+The OpenTelemetry Collector's
 [`redactionprocessor`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/redactionprocessor)
-when traces transit a collector hop.
+does the same when traces pass through a collector.
 
-### Trace Profiles
+## Attribute reference
 
-A Bazel build emits one action/spawn per node in the build graph — tens of
-thousands of spans for a large build, almost all fast cache hits with little
-diagnostic value. The trace profile controls how much of that survives, at
-every emission point (BEP actions, exec-log spawns, orphan-synthesised
-actions, and empty targets):
+Attributes use `bazel.<component>.<field>`; `rust/conduit/src/otel/attributes.rs` has the full
+list. They are a de-facto schema and may change between releases.
 
-| Profile | Behavior |
-|---------|----------|
-| **lightweight** (default) | Keeps failed actions plus the `--max-action-spans` slowest successful ones (200 default), only the targets those belong to, and exec-log spawns that fail, miss the cache, or take at least `--trace-min-duration-ms` (500 ms default). Successful actions are held until the invocation ends, so their spans export then. |
-| **full** | Every action, spawn, and target gets a span. Verbose but complete. |
+- **Root**: `bazel.invocation_id`, `bazel.command`, `bazel.patterns`, `bazel.exit_code`,
+  `bazel.metrics.wall_time_ms`, `bazel.metrics.action_cache_hits`,
+  `bazel.metrics.runner.remote_cache_hit`, `bazel.fetch.count`, `bazel.trace.suppressed_*`, ...
+- **Target**: `bazel.target.label`, `bazel.target.kind`, `bazel.target.success`,
+  `bazel.target.cached`, and for tests the summary (`bazel.test.overall_status`, run, attempt,
+  shard, and cached counts).
+- **Action**: `bazel.target.label`, `bazel.action.mnemonic`, `bazel.action.exit_code`,
+  `bazel.action.cache_hit` and `bazel.action.runner` (Bazel 10+), `bazel.action.spawn.runner`,
+  `bazel.action.spawn.cache_hit`, ... (from `--exec-log`).
+- **Test**: `bazel.test.status`, `bazel.test.attempt`, `bazel.test.cache`
+  (`none`/`local`/`remote`), `bazel.test.strategy`.
+- **Spawn**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`,
+  `bazel.spawn.execution_wall_time_ms`, `bazel.spawn.remote_cacheable` (only when `false`), ...
 
-Regardless of profile, all aggregate `BuildMetrics` (cache hit/miss counts,
-per-mnemonic action counts, timings, memory metrics) stay on the
-root span, and the root → target → action → spawn hierarchy is preserved for
-whatever is retained. The root span also carries
-`bazel.trace.suppressed_{actions,spawns,targets}` so you can see how much the
-lightweight profile trimmed on any given invocation.
+## Design notes
 
-Crucially, the lightweight profile also gates the compact execution log:
-before this, "lightweight" only dropped BEP action spans while the exec-log
-pipeline resurrected a synthetic action + spawn tree for every successful
-spawn, so traces stayed enormous. Lightweight now filters spawns at every
-exec-log choke point.
-
-**Reducing volume further (backend side).** Source-side filtering is the
-primary lever; layer sampling/retention on top if needed:
-
-- **Head-based sampling** at the SDK/agent — e.g.
-  `DD_TRACE_SAMPLING_RULES='[{"service":"bazel","sample_rate":0.1}]'` keeps a
-  representative fraction of full traces.
-- **Agent caps** — `DD_APM_TARGET_TPS`, `DD_APM_MAX_TPS`, and
-  `DD_APM_FILTER_TAGS_REJECT` bound or drop trace volume the agent forwards.
-- **Span-generated metrics** for dashboard widgets (cache-hit rates, duration
-  percentiles) give long retention on the numbers that matter while allowing
-  aggressive span sampling.
-- **Retention filters** reduce *indexed* storage (only errors, slow
-  invocations, cache misses), not ingestion — use them to control storage
-  cost after ingestion is already trimmed.
-
-Suggested rollout: run `lightweight` and compare
-`bazel.trace.suppressed_*` against total spans, switch to `full` temporarily for deep debugging, then
-apply 10–25% head sampling if volume is still high.
-
-### Execution Log Enrichment (live tailed)
-
-Opt-in: conduit must be started with `--exec-log`. When Bazel is then run with
-`--execution_log_compact_file=exec.compact`, conduit
-detects the flag in `OptionsParsed`, opens the file as it's being written,
-and **tail-follows** it in a dedicated blocking thread for the rest of the
-build. Each `SpawnExec` it decodes:
-
-1. Looks up its parent action span in conduit's cache by
-   `(target_label, mnemonic, primary_output)`.
-2. On the **first** matching spawn for an action, backfills a curated set of
-   attributes onto the action span (`bazel.action.spawn.runner`,
-   `bazel.action.spawn.cache_hit`, the `SpawnMetrics.*_time_ms` breakdown).
-   Subsequent spawns for the same action (retries, dynamic-exec races) only
-   bump `bazel.action.spawn.count` and emit their own child span.
-3. Always emits a `spawn {mnemonic}` child span under the action span with
-   `bazel.spawn.*` attributes (runner, cache hit, command, per-stage
-   timings, input metrics); label, mnemonic and outputs stay on the action.
-
-If a spawn arrives **before** its `ActionExecuted` BEP event (the compact
-log flushes every ~128 KiB of uncompressed input, asynchronously to BEP),
-it's buffered briefly and flushed onto the action span the moment it
-arrives. Spawns that never match anything by the end of the build are
-grouped by `(label, mnemonic, primary_output)` and emitted under
-synthesised parent action spans (`bazel.target.synthetic = true`); action
-spans with no matching spawn end with `bazel.action.spawn.count = 0`.
-
-**Format support.** Only `--execution_log_compact_file` (and its
-`--experimental_execution_log_compact_file` alias) is consumed.
-`--execution_log_binary_file` and `--execution_log_json_file` lack the
-dedup table that makes streaming feasible — conduit logs a warning when
-it sees them. Tailer start, skip and failure are logged the same way.
-
-**Streaming semantics (best-effort live tail).** Bazel writes the compact
-log through `AsynchronousMessageOutputStream → ZstdOutputStream →
-BufferedOutputStream → FileOutputStream`. `ZstdOutputStream` only emits a
-compressed block once it has accumulated 128 KiB of uncompressed proto,
-and Bazel doesn't call `flush()` until `close()` at the end of the build.
-In practice this means the tailer sees a chunk every ~200–600 spawns on
-big builds, and the final <128 KiB of input is only visible after
-`close()`. Conduit waits up to 2 s for that final chunk to drain through
-`finish()` before sealing the trace.
-
-**Why not stream from `bytestream://`?** Bazel uploads the spawn log to the
-remote cache only **after** `close()` (post-build), so the bytestream
-endpoint cannot be used as a live source.
-
-#### Exec log source comparison
-
-| Source | Live streaming? | Dedup table? | Conduit support |
-|---|---|---|---|
-| `--execution_log_compact_file=<path>` | Yes (best-effort, 128 KiB chunks) | Yes | **Live tailed (with `--exec-log`)** |
-| `--experimental_execution_log_compact_file=<path>` (alias) | Yes | Yes | Live tailed |
-| `--execution_log_binary_file=<path>` | No (would need full buffer) | No | Warned, ignored |
-| `--execution_log_json_file=<path>` | No | No | Warned, ignored |
-| `bytestream://…/spawn_log` (remote cache) | No (uploaded post-`close()`) | Yes | Not consumed |
-
-## Integration Tests
-
-```bash
-# Hermetic test (minimal BEP sample, no live Bazel)
-bazel test //integration:trace_test
-
-# Full scenario (builds conduit, records BEP + exec log, analyzes trace)
-./integration/run_full_trace_scenario.sh
-```
-
-## Project History & Lessons Learned
-
-This project was developed iteratively over ~13 sessions. The journey from initial prototype to the current state surfaced several non-obvious insights about Bazel's BEP, OpenTelemetry SDKs, and trace backend differences.
-
-### Lesson 1: Bazel's BEP Does Not Report Transitive Dependency Actions
-
-BEP only emits `TargetConfigured`/`TargetCompleted`/`ActionCompleted` events for **directly requested targets**. If you build `//my:app` and it depends on `@zlib//:zlib`, the zlib actions won't appear in BEP at all. The compact execution log (`--execution_log_compact_file`) is the only way to get full coverage of what Bazel actually spawned.
-
-This is why conduit live-tails the compact log: spawns that don't match any BEP-visible action are buffered and emitted at `finish()` under synthesised parent action spans tagged `bazel.target.synthetic = true`.
-
-### Lesson 2: Datadog and Jaeger Interpret Traces Differently
-
-Datadog uses the span `name` field for operation grouping in its flame graph, while Jaeger uses `operationName` (which maps to the OTel span's display name). When all spans had `SpanKind::Internal`, Datadog showed them all as "Internal" — flattening the hierarchy visually even though parent-child relationships were correct.
-
-Datadog also uses **temporal containment** for flame graph nesting: a child span must start after and end before its parent. This required adding `clamp_time_range()` to ensure spawn child spans never escape their parent action's time bounds.
-
-### Lesson 3: Bazel's `start_time` in `BuildStarted` Can Be Stale
-
-The `start_time` / `start_time_millis` in `BuildStarted` can hold the **Bazel server start time** (potentially weeks old on long-lived daemons), not the current invocation start. Conduit prefers the BES-level `event_time` (when the event was actually emitted) as a more reliable fallback for root span start time in gRPC mode.
-
-### Lesson 4: Cached Timestamps Must Be Clamped to the Invocation Window
-
-Bazel replays the *original* execution timestamps on cached `ActionExecuted` events (and propagates them to target metadata), so a build that replays a weeks-old cache can produce spans whose `start_time` predates the invocation by days. Conduit clamps every BEP-supplied `(start, end)` to the root span's window via `clamp_time_range` (`rust/conduit/src/otel/mapper/utils.rs`); a range that lies entirely before the invocation collapses to zero duration at the build start. The root span itself falls back to wall clock when `BuildStarted` drifts more than 5 minutes from now (stale long-lived daemon).
-
-### Lesson 5: Export Must Never Block the Build Stream
-
-Large Bazel builds produce thousands of spans in bursts. Conduit's exporter (`rust/conduit/src/otel/export.rs`) queues up to **65,536** records, exports batches of **512** every **200 ms**, and retries a failed export at most 3 times (2 s timeout each, retryable gRPC codes only). Anything it cannot queue or export is dropped and counted; the counts are logged at shutdown.
-
-### Lesson 6: Proto-Generated Duration Types Vary
-
-Prost-generated code for `google.protobuf.Duration` may produce different Rust types depending on the proto path (`prost_types::Duration` vs a generated `duration_proto::Duration`). The solution is to access raw fields (`d.seconds`, `d.nanos`) rather than relying on typed parameters.
-
-### Lesson 7: BEP Label Formats Are Inconsistent
-
-BEP action IDs (`actionCompleted.label`) and the exec log's `targetLabel` both use the canonical form (`@@repo+//:target`): the exec log writes `Label.getCanonicalForm()` and BEP writes `Label.toString()`, which returns the same string (true on Bazel 8.4 and 9). Conduit therefore matches labels exactly. BEP still emits the apparent form (`@repo//:target`) in other string fields (options, progress), which conduit does not match on.
-
-### Lesson 9: Not All BEP Actions Appear in the Execution Log
-
-The execution log only records **spawned processes** (actual `execve` calls). Internal Bazel actions like `FileWrite`, `TemplateExpand`, and `SymlinkTree` are not spawns and won't appear. This means some BEP actions will never have matching exec log entries — by design. Action spans for those end with `bazel.action.spawn.count = 0`.
-
-### Lesson 11: ZstdOutputStream Buffers 128 KiB Before Flushing
-
-Bazel's compact exec log goes through `ZstdOutputStream` (zstd-jni) which buffers **128 KiB of uncompressed input** before emitting a compressed block, and Bazel never calls `flush()`. The only way to live-tail is to keep the reader blocked on EOF rather than propagating `Ok(0)` to the zstd decoder, and accept that the trailing &lt;128 KiB of input is only visible after `close()`. Conduit's tailer (`exec_log/tailer.rs`) sleeps 100 ms on EOF and resumes when more bytes appear; `finish()` budgets up to 2 s for the post-`close()` final chunk.
-
-### Lesson 10: BES Progress Event `children` Are Misleading
-
-The `children` field on Progress events is for BEP DAG ordering (announcing which events will follow), **not** content correlation. The stderr/stdout text in a Progress event is not necessarily related to the child events it declares.
-
-## Pitfalls & Caveats
-
-### Build System
-- **Must use `bazel build`, not `cargo build`**: The project uses Bazel as its build system with `rules_rust` and `rules_rs` (crate_universe). Cargo is only present for IDE support (`Cargo.toml`).
-- **Rust edition 2024 / rustc 1.93+**: The Bazel toolchain is pinned to 1.93.0.
-- **OTLP protos are vendored**: `proto/opentelemetry/` holds unmodified opentelemetry-proto v1.11.1 files; conduit writes OTLP directly instead of depending on the OpenTelemetry SDK crates.
-- **Protobuf compilation**: BEP proto has deep import chains (`failure_details.proto` → `descriptor.proto`). Proto targets use `rules_rust_prost` with `rules_rs` for crate resolution.
-
-### Runtime
-- **Co-location requirement**: Exec log enrichment requires conduit to run on the same machine as Bazel (it tail-follows the local file path from `OptionsParsed`; the `bytestream://` upload that goes to the remote cache only happens after `close()` and isn't a live source).
-- **Non-standard OTLP ports**: The Datadog Agent often uses `14317`/`14318` instead of the OTel-default `4317`/`4318`. Configure `--otlp-endpoint` accordingly.
-- **API key vs environment variable**: `dd-auth` sets `DD_API_KEY` as an env var, but the Datadog Agent reads its `api_key` from its config file at startup. These are separate mechanisms.
-
-### Data Quality
-- **Action-level durations may be unreliable**: Some BEP events report zero-length or negative durations due to clock skew. Target-level durations (derived from action buffering) are more reliable.
-- **Proto3 JSON defaults**: In proto3 JSON, `success: true` is often omitted (it's the default). Conduit defaults `success` to `true` when absent from `TargetCompleted` to avoid false negatives.
-- **Progress stderr/stdout can be empty**: Bazel sends many Progress events with no content. Conduit skips these.
-
-## Attribute Reference
-
-All OTel span attributes follow the `bazel.<component>.<field>` naming convention. See `rust/conduit/src/otel/attributes.rs` for the full list (~100 constants), organized by:
-
-- **Trace-level**: `bazel.invocation_id`, `bazel.command`, `bazel.exit_code`, `bazel.patterns`, ...
-- **Target spans**: `bazel.target.label`, `bazel.target.kind`, `bazel.target.success`, `bazel.target.cached`, and for tests the summary (`bazel.test.overall_status`, run/attempt/shard/cached counts), ...
-- **Action spans**: `bazel.target.label`, `bazel.action.mnemonic`, `bazel.action.exit_code`, `bazel.action.cache_hit`, `bazel.action.runner`, ... (`cache_hit`/`runner` come from `ActionExecuted.strategy_details`, populated by Bazel 10+; older Bazel needs `--exec-log`)
-- **Spawn spans**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`, `bazel.spawn.execution_wall_time_ms`, `bazel.spawn.remote_cacheable` (only when `false`), ...
-- **Test spans**: `bazel.test.status`, `bazel.test.attempt`, `bazel.test.cache` (`none`/`local`/`remote`), `bazel.test.strategy`, ...
-- **Build metrics**: `bazel.metrics.wall_time_ms`, `bazel.metrics.cpu_time_ms`, `bazel.metrics.action_cache_hits`, `bazel.metrics.runner.remote_cache_hit`, ...
+- **Timestamps are clamped to the invocation.** Cache hits replay the original execution
+  timestamps, which can be days old. Every BEP-supplied range is clamped to the root span's
+  window, and children are kept inside their parents, because Datadog nests flame graphs by
+  time containment.
+- **Targets complete at the end of the invocation.** Tests, test summaries, and late actions
+  can arrive after `TargetCompleted`, so target spans close at `finish()` and stretch to cover
+  their children. Repeated completions of a label (several configurations) merge into one span.
+- **Labels match exactly.** BEP action labels and exec-log target labels both use the canonical
+  form (`@@repo+//:target`) on Bazel 9.
+- **`Progress.children` is about ordering, not content.** The text in a progress event is not
+  related to the children it announces, so conduit only uses the text.
+- **No OpenTelemetry SDK.** Conduit writes OTLP directly from vendored
+  [opentelemetry-proto](https://github.com/open-telemetry/opentelemetry-proto) definitions
+  (`proto/opentelemetry/`), with its own small span model and exporter.
 
 ## Limitations
 
-1. **No distributed / remote build support**: Conduit is a local sidecar. It does not support remote BES endpoints or multi-machine builds.
-2. **No phase spans**: Loading, analysis, and execution phases are not modeled as separate spans (metrics for these are captured as attributes on the root span via `BuildMetrics`).
-3. **No span links / DAG representation**: BEP's DAG structure (secondary parents) is not represented as OTel span links. All relationships are parent-child.
-4. **No conduit-side probabilistic sampling**: The `lightweight` profile drops uninteresting spans deterministically (failures are always kept, plus the slowest successful actions up to `--max-action-spans`), but there is no percentage sampling inside conduit — layer head-based sampling / retention filters at the SDK, agent, or backend. See [Trace Profiles](#trace-profiles).
-5. **Single invocation at a time**: The gRPC server processes one build stream at a time (sequential invocations via `Arc<Mutex<EventRouter>>`).
-6. **Exec log streaming is best-effort, not "live per spawn"**: Bazel flushes the compact log every ~128 KiB of uncompressed input (200–600 spawns on big builds), and the final &lt;128 KiB is only visible after `close()` at `BuildCompleteEvent`. Spawn enrichment lands on action spans in those chunk-sized bursts, with a final post-`close()` drain at `finish()`.
-7. **`TestProgress` and `ExecRequest` are no-ops**: These event types are received but not mapped to any OTel construct.
+- **No phase spans.** Loading, analysis, and execution are not modeled as spans; their
+  metrics are root attributes.
+- **No span links.** BEP's DAG is reduced to parent/child relationships.
+- **No sampling in conduit.** The trace profile trims deterministically; use backend controls
+  for sampling.
+- **Exec-log enrichment needs co-location** and arrives in bursts (see above).
+- **`TestProgress` and `ExecRequest` events are ignored.**
 
-## Directory Structure
+## Development
 
+The build uses Bazel with `rules_rust` and `rules_rs`; `Cargo.toml` exists for IDE support
+and dependency resolution only.
+
+```bash
+bazel build //rust/conduit:conduit
+bazel test //...                      # unit tests, router tests, hermetic trace test
+./integration/run_full_trace_scenario.sh   # real build against `conduit serve --exec-log`
 ```
-bazel_conduit/
-├── MODULE.bazel                  # Bazel module (rules_rust, rules_rs, prost)
-├── BUILD.bazel                   # Top-level build targets
-├── BEP_TO_OTEL_DESIGN.md        # Original design document
-├── RUST_CONDUIT_PLAN.md          # Development plan
-├── NOTES.md                      # BEP event analysis notes
-├── proto/
-│   ├── build_event_stream/       # Bazel BEP proto (vendored)
-│   ├── spawn/                    # SpawnExec proto (execution log)
-│   └── google/                   # Google API protos (BES, well-known types)
-├── rust/conduit/
-│   ├── BUILD.bazel               # rust_binary, rust_library, rust_test targets
-│   ├── Cargo.toml / Cargo.lock   # IDE support
-│   ├── src/
-│   │   ├── main.rs               # CLI entry (clap)
-│   │   ├── lib.rs                # Crate root, proto re-exports
-│   │   ├── bep/                  # BEP decoder + event router
-│   │   ├── otel/                 # OTel mapper, trace context, attributes
-│   │   ├── grpc/                 # BES gRPC server
-│   │   ├── exec_log/             # Compact exec log live-tail + enrichment
-│   │   └── state/                # Build state tracking
-│   └── tests/                    # Unit tests (decoder, trace profile, router)
-├── integration/                  # Integration tests + full scenario script
-├── toolchain/                    # Prost toolchain config
-└── docs/                         # Additional documentation
-```
+
+| Path | Contents |
+|------|----------|
+| `rust/conduit/src/bep/` | BEP replay and the event router |
+| `rust/conduit/src/grpc/` | BES gRPC server, one routing worker per stream |
+| `rust/conduit/src/otel/` | Mapper (BEP to spans and logs), span model, OTLP exporter, attributes, redaction |
+| `rust/conduit/src/exec_log/` | Compact exec-log decoder and live tailer |
+| `rust/conduit/src/state/` | Trace profile and policy |
+| `proto/` | Vendored Bazel BEP, BES, spawn, and OTLP protos |
+| `integration/` | Hermetic trace test, full scenario script, trace analyzer |
+| `scripts/` | Local Datadog Agent setup |
+| `dev/` | Jaeger for local viewing |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute. Licensed under the
+[Apache License 2.0](LICENSE); third-party licenses are listed in
+[LICENSE-3rdparty.csv](LICENSE-3rdparty.csv).
