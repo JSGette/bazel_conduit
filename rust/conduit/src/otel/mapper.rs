@@ -791,8 +791,8 @@ impl OtelMapper {
     /// slack is generous — typical decode of a final 128 KiB chunk +
     /// 200–600 entry burst takes <100 ms — but cheap insurance against
     /// transient slowness without holding the mapper for arbitrary time.
-    fn drain_and_stop_tailer(&mut self) {
-        finalization::drain_and_stop_tailer(self);
+    fn drain_and_stop_tailer(&mut self) -> Option<Result<(), String>> {
+        finalization::drain_and_stop_tailer(self)
     }
 
     /// Build synthetic parent action spans for spawns left in

@@ -6,11 +6,13 @@ use super::super::attributes::*;
 use super::{nanos_to_system_time, shorten_label, spawn_time_range, ActionSpanInfo, ActionSpanKey, OtelMapper};
 use spawn_proto::tools::protos::SpawnExec;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) {
+/// `None` when no tailer ran, otherwise its outcome (`Err` carries the
+/// worker error).
+pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) -> Option<Result<(), String>> {
     let Some(mut state) = mapper.exec_log_state.take() else {
-        return;
+        return None;
     };
     state.handle.shutdown();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -45,18 +47,17 @@ pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) {
         mapper.on_compact_spawn(spawn);
     }
 
-    let worker_error = state.handle.take_error();
-    let mut attrs = vec![KeyValue::new(
-        "spawns_received",
-        mapper.compact_spawns_received as i64,
-    )];
-    if let Some(err) = worker_error {
-        attrs.push(KeyValue::new("status", "failed"));
-        attrs.push(KeyValue::new("error", err));
-    } else {
-        attrs.push(KeyValue::new("status", "ok"));
+    let spawns_received = mapper.compact_spawns_received;
+    match state.handle.take_error() {
+        Some(error) => {
+            warn!(spawns_received, error, "Compact exec log tailer failed");
+            Some(Err(error))
+        }
+        None => {
+            info!(spawns_received, "Compact exec log tailer finished");
+            Some(Ok(()))
+        }
     }
-    mapper.add_root_event("bazel.exec_log.tailer_finished", attrs);
 }
 
 /// `budget` is how many successful actions may still get a span under the

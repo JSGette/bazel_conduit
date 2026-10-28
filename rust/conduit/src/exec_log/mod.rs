@@ -289,65 +289,15 @@ pub(crate) fn emit_spawn_span(
 /// attribute -- defence in depth for rules that smuggle a Bazel-style
 /// `--client_env=NAME=VALUE` flag into the spawned process argv.
 fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
-    let mut attrs = Vec::with_capacity(32);
-
-    if !s.target_label.is_empty() {
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_TARGET_LABEL,
-            s.target_label.clone(),
-        ));
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_TARGET_LABEL_SHORT,
-            shorten_label(&s.target_label).to_string(),
-        ));
-    }
-    if !s.mnemonic.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_MNEMONIC, s.mnemonic.clone()));
-    }
-
-    let primary_output = s
-        .listed_outputs
-        .first()
-        .cloned()
-        .or_else(|| s.actual_outputs.first().map(|f| f.path.clone()))
-        .unwrap_or_default();
-    if !primary_output.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_PRIMARY_OUTPUT, primary_output));
-    }
-
-    if !s.listed_outputs.is_empty() {
-        let joined = s.listed_outputs.join(", ");
-        let total = s.listed_outputs.len();
-        let suffix = format!("... ({total} outputs total)");
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_LISTED_OUTPUTS,
-            truncate_to_byte_limit(&joined, SPAWN_ATTR_CAP_BYTES, &suffix),
-        ));
-    }
+    let mut attrs = Vec::with_capacity(16);
 
     attrs.push(KeyValue::new(BAZEL_SPAWN_RUNNER, s.runner.clone()));
     attrs.push(KeyValue::new(BAZEL_SPAWN_CACHE_HIT, s.cache_hit));
-    attrs.push(KeyValue::new(BAZEL_SPAWN_REMOTABLE, s.remotable));
-    attrs.push(KeyValue::new(BAZEL_SPAWN_CACHEABLE, s.cacheable));
-    attrs.push(KeyValue::new(BAZEL_SPAWN_REMOTE_CACHEABLE, s.remote_cacheable));
-
-    if !s.status.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_STATUS, s.status.clone()));
+    if !s.remote_cacheable {
+        attrs.push(KeyValue::new(BAZEL_SPAWN_REMOTE_CACHEABLE, false));
     }
     if s.exit_code != 0 {
         attrs.push(KeyValue::new(BAZEL_SPAWN_EXIT_CODE, s.exit_code as i64));
-    }
-    if s.timeout_millis != 0 {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_TIMEOUT_MS, s.timeout_millis));
-    }
-
-    if let Some(ref d) = s.digest {
-        if !d.hash.is_empty() {
-            attrs.push(KeyValue::new(BAZEL_SPAWN_DIGEST, d.hash.clone()));
-        }
-        if d.size_bytes != 0 {
-            attrs.push(KeyValue::new(BAZEL_SPAWN_DIGEST_SIZE_BYTES, d.size_bytes));
-        }
     }
 
     if !s.command_args.is_empty() {
@@ -358,19 +308,6 @@ fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
         ));
     }
 
-    if !s.inputs.is_empty() {
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_INPUT_COUNT,
-            s.inputs.len() as i64,
-        ));
-    }
-    if !s.actual_outputs.is_empty() {
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_OUTPUT_COUNT,
-            s.actual_outputs.len() as i64,
-        ));
-    }
-
     if let Some(ref m) = s.metrics {
         if m.input_bytes != 0 {
             attrs.push(KeyValue::new(BAZEL_SPAWN_INPUT_BYTES, m.input_bytes));
@@ -378,23 +315,11 @@ fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
         if m.input_files != 0 {
             attrs.push(KeyValue::new(BAZEL_SPAWN_INPUT_FILES, m.input_files as i64));
         }
-        if m.memory_estimate_bytes != 0 {
-            attrs.push(KeyValue::new(
-                BAZEL_SPAWN_MEMORY_ESTIMATE_BYTES,
-                m.memory_estimate_bytes,
-            ));
-        }
 
         if let Some(ref d) = m.execution_wall_time {
             let ms = duration_to_ms_raw(d.seconds, d.nanos);
             if ms > 0 {
                 attrs.push(KeyValue::new(BAZEL_SPAWN_EXEC_WALL_TIME_MS, ms));
-            }
-        }
-        if let Some(ref d) = m.parse_time {
-            let ms = duration_to_ms_raw(d.seconds, d.nanos);
-            if ms > 0 {
-                attrs.push(KeyValue::new(BAZEL_SPAWN_PARSE_TIME_MS, ms));
             }
         }
         if let Some(ref d) = m.network_time {

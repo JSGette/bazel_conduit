@@ -619,6 +619,20 @@ fn cache_hit_single_spawn_backfills_action_span() {
         .filter(|s| s.name.starts_with("spawn CppCompile"))
         .collect();
     assert_eq!(child_spawns.len(), 1, "exactly one child spawn span");
+    let spawn = child_spawns[0];
+    assert_eq!(attr_value(spawn, BAZEL_SPAWN_RUNNER).as_deref(), Some("remote cache hit"));
+    assert_eq!(attr_value(spawn, BAZEL_SPAWN_QUEUE_TIME_MS).as_deref(), Some("50"));
+    // Remote-cacheable is the norm, so only the exception is recorded; the
+    // label, mnemonic and outputs already live on the parent action.
+    for key in [
+        BAZEL_SPAWN_REMOTE_CACHEABLE,
+        "bazel.spawn.target_label",
+        "bazel.spawn.mnemonic",
+        "bazel.spawn.primary_output",
+        "bazel.spawn.listed_outputs",
+    ] {
+        assert_eq!(attr_value(spawn, key), None, "{key}");
+    }
 }
 
 /// Scenario 2: BEP action + TWO matching SpawnExecs (retry). The action
@@ -898,84 +912,42 @@ fn instantaneous_action_does_not_stretch_synthetic_target_to_build_end() {
     assert!(target.end_time < root.end_time);
 }
 
-/// Find a root-span event by name. Returns the event's attribute map as
-/// a flat (key, display_value) Vec.
-fn root_event<'a>(spans: &'a [SpanData], event_name: &str) -> Option<Vec<(String, String)>> {
-    let root = spans.iter().find(|s| s.parent_span_id == SpanId::INVALID)?;
-    let event = root.events.iter().find(|e| e.name == event_name)?;
-    Some(
-        event
-            .attributes
-            .iter()
-            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
-            .collect(),
-    )
+fn root_events(spans: &[SpanData]) -> Vec<String> {
+    let root = spans.iter().find(|s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    root.events.iter().map(|e| e.name.to_string()).collect()
 }
 
 /// Missing-file scenario: the tailer aborts in `open_with_backoff` once
 /// the mapper signals shutdown. We exercise that path because it's the
 /// real-world "user pointed at the wrong file / wrote to a read-only
-/// dir" failure mode. Asserts the started event carries the resolved
-/// path, and the finished event reports `status=failed` with a non-empty
-/// error string. Happy-path (`status=ok`) coverage is in the integration
+/// dir" failure mode. Asserts the worker error reaches finish and no root
+/// events are emitted. Happy-path coverage is in the integration
 /// suite where a real Bazel build writes a valid log; reproducing a
 /// valid zstd frame in a unit test would be more brittle than useful.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_log_finished_event_reports_open_failure() {
+async fn exec_log_tailer_open_failure_is_reported() {
     let ws = tempfile::tempdir().unwrap();
-    let absolute = ws.path().join("exec.log");
 
     let (mut mapper, collector) = mapper_with_collector();
     mapper.on_build_started_extended(ws.path().to_str(), None, None, None, None);
-    mapper.on_exec_log_detected(absolute.clone());
+    mapper.on_exec_log_detected(ws.path().join("exec.log"));
+    match mapper.drain_and_stop_tailer() {
+        Some(Err(error)) => assert!(!error.is_empty()),
+        other => panic!("expected a tailer error, got {other:?}"),
+    }
+    assert_eq!(mapper.compact_spawns_received, 0);
     mapper.finish();
-
-    let spans = collector.snapshot();
-    let started =
-        root_event(&spans, "bazel.exec_log.tailer_started").expect("tailer_started event on root");
-    assert!(
-        started
-            .iter()
-            .any(|(k, v)| k == "path" && v == &absolute.display().to_string()),
-        "tailer_started should carry resolved path, got {started:?}",
-    );
-
-    let finished = root_event(&spans, "bazel.exec_log.tailer_finished")
-        .expect("tailer_finished event on root");
-    assert!(
-        finished.iter().any(|(k, v)| k == "status" && v == "failed"),
-        "expected status=failed when the log file never appears, got {finished:?}",
-    );
-    assert!(
-        finished.iter().any(|(k, v)| k == "error" && !v.is_empty()),
-        "expected non-empty error string, got {finished:?}",
-    );
-    assert!(
-        finished.iter().any(|(k, v)| k == "spawns_received" && v == "0"),
-        "expected spawns_received=0, got {finished:?}",
-    );
+    assert!(root_events(&collector.snapshot()).is_empty());
 }
 
 #[test]
-fn exec_log_emits_skipped_event_when_workspace_missing() {
+fn exec_log_tailer_is_skipped_without_workspace() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.on_exec_log_detected(PathBuf::from("exec.log"));
+    assert!(!mapper.compact_streaming_active);
+    assert_eq!(mapper.drain_and_stop_tailer(), None, "no tailer was started");
     mapper.finish();
-
-    let spans = collector.snapshot();
-    let skipped =
-        root_event(&spans, "bazel.exec_log.tailer_skipped").expect("tailer_skipped event on root");
-    assert!(
-        skipped
-            .iter()
-            .any(|(k, v)| k == "reason" && v == "workspace_directory_not_set"),
-        "expected reason attribute, got {skipped:?}",
-    );
-    // No tailer was spawned, so no finished event.
-    assert!(
-        root_event(&spans, "bazel.exec_log.tailer_finished").is_none(),
-        "tailer_finished must not appear when the tailer was skipped",
-    );
+    assert!(root_events(&collector.snapshot()).is_empty());
 }
 
 // =====================================================================

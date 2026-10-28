@@ -120,13 +120,6 @@ impl OtelMapper {
                         path = %path.display(),
                         "Compact exec log path is relative but workspace_directory is unknown; skipping tailer"
                     );
-                    self.add_root_event(
-                        "bazel.exec_log.tailer_skipped",
-                        vec![
-                            KeyValue::new("path", path.display().to_string()),
-                            KeyValue::new("reason", "workspace_directory_not_set"),
-                        ],
-                    );
                     return;
                 }
             }
@@ -142,27 +135,15 @@ impl OtelMapper {
             self.exec_log_max_decompressed_bytes,
         );
         info!(path = %path.display(), "Started compact exec log tailer");
-        self.add_root_event(
-            "bazel.exec_log.tailer_started",
-            vec![KeyValue::new("path", path.display().to_string())],
-        );
         self.exec_log_state = Some(ExecLogState { path, handle });
         self.compact_streaming_active = true;
     }
 
     /// `--execution_log_binary_file` / `--execution_log_json_file` observed
     /// in BEP `OptionsParsed`. Neither format is supported by conduit's
-    /// live streaming pipeline (no dedup table, no zstd framing); record a
-    /// root-span event so users can spot the misconfiguration in their
-    /// trace UI without grepping the conduit log.
+    /// live streaming pipeline (no dedup table, no zstd framing).
     pub fn on_unsupported_exec_log_flag(&mut self, flags: &str) {
-        self.add_root_event(
-            "bazel.exec_log.unsupported_format",
-            vec![
-                KeyValue::new("flags", flags.to_string()),
-                KeyValue::new("supported", "--execution_log_compact_file".to_string()),
-            ],
-        );
+        warn!(flags, "Unsupported exec log format; only --execution_log_compact_file is tailed");
     }
 
     /// WorkspaceStatus -> add workspace attributes to root span.

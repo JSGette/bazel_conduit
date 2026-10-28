@@ -260,8 +260,8 @@ build. Each `SpawnExec` it decodes:
    Subsequent spawns for the same action (retries, dynamic-exec races) only
    bump `bazel.action.spawn.count` and emit their own child span.
 3. Always emits a `spawn {mnemonic}` child span under the action span with
-   the full `bazel.spawn.*` attribute set (command, digest, cache flags,
-   per-stage timings, I/O metrics).
+   `bazel.spawn.*` attributes (runner, cache hit, command, per-stage
+   timings, input metrics); label, mnemonic and outputs stay on the action.
 
 If a spawn arrives **before** its `ActionExecuted` BEP event (the compact
 log flushes every ~128 KiB of uncompressed input, asynchronously to BEP),
@@ -274,9 +274,8 @@ spans with no matching spawn end with `bazel.action.spawn.count = 0`.
 **Format support.** Only `--execution_log_compact_file` (and its
 `--experimental_execution_log_compact_file` alias) is consumed.
 `--execution_log_binary_file` and `--execution_log_json_file` lack the
-dedup table that makes streaming feasible — conduit logs a warning and
-records a `bazel.exec_log.unsupported_format` event on the root span when
-it sees them.
+dedup table that makes streaming feasible — conduit logs a warning when
+it sees them. Tailer start, skip and failure are logged the same way.
 
 **Streaming semantics (best-effort live tail).** Bazel writes the compact
 log through `AsynchronousMessageOutputStream → ZstdOutputStream →
@@ -385,7 +384,7 @@ All OTel span attributes follow the `bazel.<component>.<field>` naming conventio
 - **Trace-level**: `bazel.invocation_id`, `bazel.command`, `bazel.exit_code`, `bazel.patterns`, ...
 - **Target spans**: `bazel.target.label`, `bazel.target.kind`, `bazel.target.success`, `bazel.target.cached`, and for tests the summary (`bazel.test.overall_status`, run/attempt/shard/cached counts), ...
 - **Action spans**: `bazel.target.label`, `bazel.action.mnemonic`, `bazel.action.exit_code`, `bazel.action.cache_hit`, `bazel.action.runner`, ... (`cache_hit`/`runner` come from `ActionExecuted.strategy_details`, populated by Bazel 10+; older Bazel needs `--exec-log`)
-- **Spawn spans**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`, `bazel.spawn.execution_wall_time_ms`, ...
+- **Spawn spans**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`, `bazel.spawn.execution_wall_time_ms`, `bazel.spawn.remote_cacheable` (only when `false`), ...
 - **Test spans**: `bazel.test.status`, `bazel.test.attempt`, `bazel.test.cache` (`none`/`local`/`remote`), `bazel.test.strategy`, ...
 - **Build metrics**: `bazel.metrics.wall_time_ms`, `bazel.metrics.cpu_time_ms`, `bazel.metrics.action_cache_hits`, `bazel.metrics.runner.remote_cache_hit`, ...
 

@@ -30,7 +30,6 @@ pub const BAZEL_TARGET_LABEL: &str = "bazel.target.label";
 pub const BAZEL_TARGET_KIND: &str = "bazel.target.kind";
 pub const BAZEL_TARGET_SUCCESS: &str = "bazel.target.success";
 pub const BAZEL_TARGET_TAGS: &str = "bazel.target.tags";
-pub const BAZEL_TARGET_OUTPUT_COUNT: &str = "bazel.target.output_count";
 pub const BAZEL_TARGET_ABORT_REASON: &str = "bazel.target.abort_reason";
 pub const BAZEL_TARGET_ABORT_DESCRIPTION: &str = "bazel.target.abort_description";
 pub const BAZEL_TARGET_CACHED: &str = "bazel.target.cached";
@@ -42,8 +41,6 @@ pub const BAZEL_ACTION_MNEMONIC: &str = "bazel.action.mnemonic";
 pub const BAZEL_ACTION_EXIT_CODE: &str = "bazel.action.exit_code";
 pub const BAZEL_ACTION_EXIT_CODE_NAME: &str = "bazel.action.exit_code_name";
 pub const BAZEL_ACTION_CACHE_HIT: &str = "bazel.action.cache_hit";
-pub const BAZEL_ACTION_HOSTNAME: &str = "bazel.action.hostname";
-pub const BAZEL_ACTION_CACHED_REMOTELY: &str = "bazel.action.cached_remotely";
 pub const BAZEL_ACTION_RUNNER: &str = "bazel.action.runner";
 pub const BAZEL_ACTION_PRIMARY_OUTPUT: &str = "bazel.action.primary_output";
 pub const BAZEL_ACTION_SUCCESS: &str = "bazel.action.success";
@@ -75,23 +72,11 @@ pub const BAZEL_ACTION_SPAWN_PROCESS_OUTPUTS_TIME_MS: &str =
 // Spawn span (exec log enrichment)
 pub const BAZEL_SPAWN_RUNNER: &str = "bazel.spawn.runner";
 pub const BAZEL_SPAWN_CACHE_HIT: &str = "bazel.spawn.cache_hit";
-pub const BAZEL_SPAWN_REMOTABLE: &str = "bazel.spawn.remotable";
-pub const BAZEL_SPAWN_CACHEABLE: &str = "bazel.spawn.cacheable";
 pub const BAZEL_SPAWN_REMOTE_CACHEABLE: &str = "bazel.spawn.remote_cacheable";
-pub const BAZEL_SPAWN_STATUS: &str = "bazel.spawn.status";
 pub const BAZEL_SPAWN_EXIT_CODE: &str = "bazel.spawn.exit_code";
-pub const BAZEL_SPAWN_DIGEST: &str = "bazel.spawn.digest";
 pub const BAZEL_SPAWN_INPUT_BYTES: &str = "bazel.spawn.input_bytes";
 pub const BAZEL_SPAWN_INPUT_FILES: &str = "bazel.spawn.input_files";
-pub const BAZEL_SPAWN_TARGET_LABEL: &str = "bazel.spawn.target_label";
-pub const BAZEL_SPAWN_TARGET_LABEL_SHORT: &str = "bazel.spawn.target_label_short";
-pub const BAZEL_SPAWN_MNEMONIC: &str = "bazel.spawn.mnemonic";
-pub const BAZEL_SPAWN_PRIMARY_OUTPUT: &str = "bazel.spawn.primary_output";
-pub const BAZEL_SPAWN_LISTED_OUTPUTS: &str = "bazel.spawn.listed_outputs";
 pub const BAZEL_SPAWN_COMMAND: &str = "bazel.spawn.command";
-pub const BAZEL_SPAWN_INPUT_COUNT: &str = "bazel.spawn.input_count";
-pub const BAZEL_SPAWN_OUTPUT_COUNT: &str = "bazel.spawn.output_count";
-pub const BAZEL_SPAWN_TIMEOUT_MS: &str = "bazel.spawn.timeout_ms";
 pub const BAZEL_SPAWN_EXEC_WALL_TIME_MS: &str = "bazel.spawn.execution_wall_time_ms";
 pub const BAZEL_SPAWN_QUEUE_TIME_MS: &str = "bazel.spawn.queue_time_ms";
 pub const BAZEL_SPAWN_NETWORK_TIME_MS: &str = "bazel.spawn.network_time_ms";
@@ -100,9 +85,6 @@ pub const BAZEL_SPAWN_FETCH_TIME_MS: &str = "bazel.spawn.fetch_time_ms";
 pub const BAZEL_SPAWN_UPLOAD_TIME_MS: &str = "bazel.spawn.upload_time_ms";
 pub const BAZEL_SPAWN_PROCESS_OUTPUTS_TIME_MS: &str = "bazel.spawn.process_outputs_time_ms";
 pub const BAZEL_SPAWN_RETRY_TIME_MS: &str = "bazel.spawn.retry_time_ms";
-pub const BAZEL_SPAWN_MEMORY_ESTIMATE_BYTES: &str = "bazel.spawn.memory_estimate_bytes";
-pub const BAZEL_SPAWN_PARSE_TIME_MS: &str = "bazel.spawn.parse_time_ms";
-pub const BAZEL_SPAWN_DIGEST_SIZE_BYTES: &str = "bazel.spawn.digest_size_bytes";
 
 // BuildStarted extended (use BAZEL_WORKSPACE_HOST/USER for host/user to avoid duplication)
 pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
@@ -145,9 +127,7 @@ pub const BAZEL_METRICS_ACTION_CACHE_HITS: &str = "bazel.metrics.action_cache_hi
 pub const BAZEL_METRICS_ACTION_CACHE_MISSES: &str = "bazel.metrics.action_cache_misses";
 pub const BAZEL_METRICS_BYTES_SENT: &str = "bazel.metrics.bytes_sent";
 pub const BAZEL_METRICS_BYTES_RECV: &str = "bazel.metrics.bytes_recv";
-pub const BAZEL_METRICS_ACTION_DATA: &str = "bazel.metrics.action_data";
 
-pub const BAZEL_METRICS_RUNNER_COUNT: &str = "bazel.metrics.runner_count";
 
 // Test extended
 pub const BAZEL_TEST_RUN_COUNT: &str = "bazel.test.run_count";

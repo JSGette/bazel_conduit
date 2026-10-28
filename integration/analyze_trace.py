@@ -111,7 +111,7 @@ def check(path):
         req = {"root": ["bazel.invocation_id", "bazel.command"],
                "target": ["bazel.target.label"],
                "action": ["bazel.action.mnemonic"],
-               "spawn": ["bazel.spawn.mnemonic"]}.get(kind(n), [])
+               "spawn": ["bazel.spawn.runner"]}.get(kind(n), [])
         for a in req:
             if a not in s["attrs"]:
                 warns.append(f"[{n}] missing attr {a}")
