@@ -140,8 +140,7 @@ line via flags like `--client_env=NAME=VALUE`, `--action_env=`, `--test_env=`,
 status entries produced by `--workspace_status_command` (`STABLE_*` keys)
 routinely carry CI-injected tokens. Progress stdout/stderr can echo any of
 the above. Without intervention all of these end up verbatim in the
-`bazel.command_line`, `bazel.explicit_cmd_line`, `bazel.startup_options`,
-`bazel.action.command_line`, `bazel.spawn.command`, `bazel.workspace.*`,
+`bazel.explicit_cmd_line`, `bazel.action.command_line`, `bazel.spawn.command`, `bazel.workspace.*`,
 and `bazel.progress.*` span attributes — and from there into whatever
 backend the OTLP exporter is wired to.
 
@@ -150,8 +149,7 @@ that runs **before** any attribute is set on a span. Three scrubbing
 surfaces are used:
 
 - **Argv tokens** (`scrub_arg` / `scrub_args`) — applied to
-  `command_line`, `explicit_cmd_line`, `startup_options`, ActionExecuted
-  command lines, and SpawnExec command_args. The `VALUE` half of a
+  `explicit_cmd_line`, ActionExecuted command lines, and SpawnExec command_args. The `VALUE` half of a
   recognized `--flag=NAME=VALUE` is replaced with `***` when `NAME` matches.
 - **`(name, value)` pairs** (`scrub_value_by_name`) — applied to
   `workspaceStatus` entries. Replaces VALUE with `***` when the key name
@@ -192,9 +190,6 @@ the scrubber still cannot leak. Example `datadog.yaml`:
 ```yaml
 apm_config:
   replace_tags:
-    - name: "bazel.command_line"
-      pattern: "--client_env=([A-Z0-9_]*?(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*)=[^ ]+"
-      repl:    "--client_env=$1=***"
     - name: "bazel.explicit_cmd_line"
       pattern: "--client_env=([A-Z0-9_]*?(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*)=[^ ]+"
       repl:    "--client_env=$1=***"
@@ -218,7 +213,7 @@ actions, and empty targets):
 | **full** | Every action, spawn, and target gets a span. Verbose but complete. |
 
 Regardless of profile, all aggregate `BuildMetrics` (cache hit/miss counts,
-per-mnemonic action counts, timings, artifact/memory metrics) stay on the
+per-mnemonic action counts, timings, memory metrics) stay on the
 root span, and the root → target → action → spawn hierarchy is preserved for
 whatever is retained. The root span also carries
 `bazel.trace.suppressed_{actions,spawns,targets}` so you can see how much the
@@ -392,7 +387,7 @@ All OTel span attributes follow the `bazel.<component>.<field>` naming conventio
 - **Action spans**: `bazel.action.mnemonic`, `bazel.action.exit_code`, `bazel.action.cached`, `bazel.action.runner`, ... (`cached`/`runner` come from `ActionExecuted.strategy_details`, populated by Bazel 10+; older Bazel needs `--exec-log`)
 - **Spawn spans**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`, `bazel.spawn.execution_wall_time_ms`, ...
 - **Test spans**: `bazel.test.status`, `bazel.test.attempt`, `bazel.test.cached_locally`, `bazel.test.strategy`, ...
-- **Build metrics**: `bazel.metrics.wall_time_ms`, `bazel.metrics.cpu_time_ms`, `bazel.metrics.cache_hits`, ...
+- **Build metrics**: `bazel.metrics.wall_time_ms`, `bazel.metrics.cpu_time_ms`, `bazel.metrics.action_cache_hits`, `bazel.metrics.runner.remote_cache_hit`, ...
 
 ## Limitations
 

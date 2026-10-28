@@ -53,7 +53,6 @@ impl OtelMapper {
         workspace_dir: Option<&str>,
         working_dir: Option<&str>,
         build_tool_version: Option<&str>,
-        server_pid: Option<i64>,
         host: Option<&str>,
         user: Option<&str>,
     ) {
@@ -76,9 +75,6 @@ impl OtelMapper {
         if let Some(v) = build_tool_version {
             self.set_root_attr(KeyValue::new(BAZEL_BUILD_TOOL_VERSION, v.to_string()));
         }
-        if let Some(v) = server_pid {
-            self.set_root_attr(KeyValue::new(BAZEL_SERVER_PID, v));
-        }
         if let Some(v) = host {
             self.set_root_attr(KeyValue::new(BAZEL_WORKSPACE_HOST, v.to_string()));
         }
@@ -87,16 +83,8 @@ impl OtelMapper {
         }
     }
 
-    /// OptionsParsed -> add attributes to root span.
-    pub fn on_options_parsed(
-        &mut self,
-        startup_options: &[String],
-        explicit_cmd_line: &[String],
-    ) {
-        if !startup_options.is_empty() {
-            let scrubbed = self.redactor.scrub_args(startup_options);
-            self.set_root_attr(KeyValue::new(BAZEL_STARTUP_OPTIONS, scrubbed.join(" ")));
-        }
+    /// OptionsParsed -> the explicit command line on the root span.
+    pub fn on_options_parsed(&mut self, explicit_cmd_line: &[String]) {
         if !explicit_cmd_line.is_empty() {
             let scrubbed = self.redactor.scrub_args(explicit_cmd_line);
             self.set_root_attr(KeyValue::new(BAZEL_EXPLICIT_CMD_LINE, scrubbed.join(" ")));
@@ -197,14 +185,6 @@ impl OtelMapper {
         }
     }
 
-    /// UnstructuredCommandLine -> add full command line as attribute.
-    pub fn on_command_line(&mut self, args: &[String]) {
-        if !args.is_empty() {
-            let scrubbed = self.redactor.scrub_args(args);
-            self.set_root_attr(KeyValue::new(BAZEL_COMMAND_LINE, scrubbed.join(" ")));
-        }
-    }
-
     /// Pattern expanded -> add build patterns as attribute and enrich root span name.
     pub fn on_pattern(&mut self, patterns: &[String]) {
         if !patterns.is_empty() {
@@ -274,42 +254,11 @@ impl OtelMapper {
         debug!("Created aborted-label span for {label}");
     }
 
-    /// Configuration -> span event on root span. Also caches mnemonic for action enrichment.
-    pub fn on_configuration(
-        &mut self,
-        config_id: &str,
-        mnemonic: Option<&str>,
-        platform: Option<&str>,
-    ) {
-        if let Some(m) = mnemonic {
+    /// Configuration -> cache its mnemonic (e.g. `k8-fastbuild`) for actions.
+    pub fn on_configuration(&mut self, config_id: &str, mnemonic: &str) {
+        if !mnemonic.is_empty() {
             self.configurations
-                .insert(config_id.to_string(), m.to_string());
+                .insert(config_id.to_string(), mnemonic.to_string());
         }
-        let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
-        if let Some(m) = mnemonic {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_MNEMONIC, m.to_string()));
-        }
-        if let Some(p) = platform {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_PLATFORM, p.to_string()));
-        }
-        self.add_root_event("configuration", attrs);
-        debug!("Added configuration event: {config_id}");
-    }
-
-    /// Configuration with cpu/is_tool -> add to root span event.
-    pub fn on_configuration_extended(
-        &mut self,
-        config_id: &str,
-        cpu: Option<&str>,
-        is_tool: Option<bool>,
-    ) {
-        let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
-        if let Some(c) = cpu {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_CPU, c.to_string()));
-        }
-        if let Some(t) = is_tool {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_IS_TOOL, t));
-        }
-        self.add_root_event("configuration_detail", attrs);
     }
 }

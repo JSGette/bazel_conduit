@@ -100,7 +100,6 @@ struct StartedEventArgs {
     workspace_dir: Option<String>,
     working_dir: Option<String>,
     build_tool_version: Option<String>,
-    server_pid: Option<i64>,
     host: Option<String>,
     user: Option<String>,
 }
@@ -108,7 +107,6 @@ struct StartedEventArgs {
 struct OptionsParsedArgs {
     cmd_line: Vec<String>,
     explicit_cmd_line: Vec<String>,
-    startup_options: Vec<String>,
     tool_tag: Option<String>,
 }
 
@@ -295,7 +293,6 @@ impl EventRouter {
                 args.workspace_dir.as_deref(),
                 args.working_dir.as_deref(),
                 args.build_tool_version.as_deref(),
-                args.server_pid,
                 args.host.as_deref(),
                 args.user.as_deref(),
             );
@@ -320,7 +317,7 @@ impl EventRouter {
         }
 
         if let Some(mapper) = &mut self.mapper {
-            mapper.on_options_parsed(&args.startup_options, &args.explicit_cmd_line);
+            mapper.on_options_parsed(&args.explicit_cmd_line);
             if let Some(tool_tag) = args.tool_tag.filter(|s| !s.is_empty()) {
                 mapper.on_tool_tag(&tool_tag);
             }
@@ -392,20 +389,9 @@ impl EventRouter {
                             .then_some(s.working_directory.clone()),
                         build_tool_version: (!s.build_tool_version.is_empty())
                             .then_some(s.build_tool_version.clone()),
-                        server_pid: (s.server_pid != 0).then_some(s.server_pid),
                         host: (!s.host.is_empty()).then_some(s.host.clone()),
                         user: (!s.user.is_empty()).then_some(s.user.clone()),
                     });
-                }
-                Ok(())
-            }
-            BepId::UnstructuredCommandLine(_) => {
-                if let Some(BepPayload::UnstructuredCommandLine(u)) = &event.payload {
-                    if !u.args.is_empty() {
-                        if let Some(mapper) = &mut self.mapper {
-                            mapper.on_command_line(&u.args);
-                        }
-                    }
                 }
                 Ok(())
             }
@@ -414,7 +400,6 @@ impl EventRouter {
                     self.apply_options_parsed_event(OptionsParsedArgs {
                         cmd_line: o.cmd_line.clone(),
                         explicit_cmd_line: o.explicit_cmd_line.clone(),
-                        startup_options: o.startup_options.clone(),
                         tool_tag: (!o.tool_tag.is_empty()).then_some(o.tool_tag.clone()),
                     });
                 }
@@ -438,18 +423,8 @@ impl EventRouter {
             }
             BepId::Configuration(c) => {
                 if let Some(BepPayload::Configuration(cfg)) = &event.payload {
-                    let id = c.id.clone();
                     if let Some(mapper) = &mut self.mapper {
-                        mapper.on_configuration(
-                            &id,
-                            Some(cfg.mnemonic.as_str()),
-                            Some(cfg.platform_name.as_str()),
-                        );
-                        mapper.on_configuration_extended(
-                            &id,
-                            if cfg.cpu.is_empty() { None } else { Some(cfg.cpu.as_str()) },
-                            Some(cfg.is_tool),
-                        );
+                        mapper.on_configuration(&c.id, &cfg.mnemonic);
                     }
                 }
                 Ok(())
@@ -733,28 +708,13 @@ impl EventRouter {
                 }
                 Ok(())
             }
-            BepId::TargetSummary(ts) => {
-                if let Some(BepPayload::TargetSummary(ps)) = &event.payload {
-                    let label = ts.label.clone();
-                    if let Some(mapper) = &mut self.mapper {
-                        mapper.on_target_summary(
-                            &label,
-                            Some(ps.overall_build_success),
-                            Some(test_status_name(ps.overall_test_status)),
-                        );
-                    }
-                }
-                Ok(())
-            }
-            BepId::BuildToolLogs(_) => {
-                if let Some(BepPayload::BuildToolLogs(btl)) = &event.payload {
-                    if let Some(mapper) = &mut self.mapper {
-                        mapper.on_build_tool_logs(btl);
-                    }
-                }
-                Ok(())
-            }
-            BepId::StructuredCommandLine(_)
+            // TargetSummary duplicates target success; BuildToolLogs only point
+            // at local files; the unstructured command line duplicates
+            // OptionsParsed's explicit one.
+            BepId::TargetSummary(_)
+            | BepId::BuildToolLogs(_)
+            | BepId::UnstructuredCommandLine(_)
+            | BepId::StructuredCommandLine(_)
             | BepId::TestProgress(_)
             | BepId::ExecRequest(_)
             | BepId::Workspace(_)

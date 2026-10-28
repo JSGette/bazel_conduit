@@ -119,14 +119,7 @@ async fn on_exec_log_detected_resolves_relative_against_workspace() {
     let ws = tempfile::tempdir().unwrap();
     let mut mapper = test_mapper();
     mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
-    mapper.on_build_started_extended(
-        ws.path().to_str(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
+    mapper.on_build_started_extended(ws.path().to_str(), None, None, None, None);
     mapper.on_exec_log_detected(PathBuf::from("exec.log"));
 
     let state = mapper.exec_log_state.as_ref().expect("tailer should start");
@@ -142,14 +135,7 @@ async fn on_exec_log_detected_passes_absolute_path_through() {
     let absolute = ws.path().join("custom_exec.log");
     let mut mapper = test_mapper();
     mapper.on_build_started("uuid", "test", Some(1_000_000_000), None);
-    mapper.on_build_started_extended(
-        ws.path().to_str(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
+    mapper.on_build_started_extended(ws.path().to_str(), None, None, None, None);
     mapper.on_exec_log_detected(absolute.clone());
 
     let state = mapper.exec_log_state.as_ref().expect("tailer should start");
@@ -890,14 +876,7 @@ async fn exec_log_finished_event_reports_open_failure() {
     let absolute = ws.path().join("exec.log");
 
     let (mut mapper, collector) = mapper_with_collector();
-    mapper.on_build_started_extended(
-        ws.path().to_str(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
+    mapper.on_build_started_extended(ws.path().to_str(), None, None, None, None);
     mapper.on_exec_log_detected(absolute.clone());
     mapper.finish();
 
@@ -1323,29 +1302,50 @@ fn lightweight_keeps_failed_target() {
 #[test]
 fn build_metrics_set_root_attrs_and_root_contains_finish() {
     use crate::build_event_stream::build_metrics::{
-        action_summary::RunnerCount, ActionSummary, TimingMetrics,
+        action_summary::RunnerCount,
+        artifact_metrics::FilesMetric,
+        ActionSummary, ArtifactMetrics, CumulativeMetrics, MemoryMetrics, TimingMetrics,
     };
     use crate::build_event_stream::BuildMetrics;
 
     let (mut mapper, collector) = mapper_with_collector();
     mapper.on_build_finished(Some(0), Some(5_000_000_000), None);
-    mapper.on_build_metrics(&BuildMetrics {
+    let mut metrics = BuildMetrics {
         action_summary: Some(ActionSummary {
             actions_created: 7,
             runner_count: vec![RunnerCount {
-                name: "remote".into(),
+                name: "remote cache hit".into(),
                 count: 3,
                 ..Default::default()
             }],
             ..Default::default()
         }),
+        memory_metrics: Some(MemoryMetrics {
+            used_heap_size_post_build: 1,
+            peak_post_gc_heap_size: 9,
+            ..Default::default()
+        }),
+        artifact_metrics: Some(ArtifactMetrics {
+            source_artifacts_read: Some(FilesMetric::default()),
+            ..Default::default()
+        }),
+        cumulative_metrics: Some(CumulativeMetrics::default()),
         // Wall time ends at 3s, before BuildFinished at 5s.
         timing_metrics: Some(TimingMetrics {
             wall_time_in_ms: 2_000,
             ..Default::default()
         }),
         ..Default::default()
-    });
+    };
+    let acs = metrics
+        .action_summary
+        .as_mut()
+        .unwrap()
+        .action_cache_statistics
+        .get_or_insert_with(Default::default);
+    acs.hits = 4;
+    acs.misses = 2;
+    mapper.on_build_metrics(&metrics);
     mapper.finish();
 
     let spans = collector.snapshot();
@@ -1353,6 +1353,17 @@ fn build_metrics_set_root_attrs_and_root_contains_finish() {
         .expect("root span");
     assert_eq!(attr_value(&root, BAZEL_METRICS_ACTIONS_CREATED).as_deref(), Some("7"));
     assert_eq!(attr_value(&root, BAZEL_METRICS_WALL_TIME_MS).as_deref(), Some("2000"));
-    assert_eq!(attr_value(&root, "bazel.metrics.runner.remote").as_deref(), Some("3"));
+    assert_eq!(attr_value(&root, "bazel.metrics.runner.remote_cache_hit").as_deref(), Some("3"));
+    assert_eq!(attr_value(&root, BAZEL_METRICS_ACTION_CACHE_HITS).as_deref(), Some("4"));
+    assert_eq!(attr_value(&root, BAZEL_METRICS_ACTION_CACHE_MISSES).as_deref(), Some("2"));
+    assert_eq!(attr_value(&root, BAZEL_METRICS_PEAK_HEAP_POST_GC).as_deref(), Some("9"));
+    for dropped in [
+        "bazel.metrics.heap_post_build",
+        "bazel.metrics.source_artifacts_count",
+        "bazel.metrics.cumulative_num_builds",
+        "bazel.metrics.actions_execution_start_ms",
+    ] {
+        assert_eq!(attr_value(&root, dropped), None, "{dropped} should not be emitted");
+    }
     assert_eq!(root.end_time, super::nanos_to_system_time(5_000_000_000));
 }

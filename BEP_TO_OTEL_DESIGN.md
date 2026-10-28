@@ -54,9 +54,9 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 | BEP Event | Creates Span | Parent | Key Attributes | Action |
 |-----------|--------------|--------|----------------|--------|
 | `BuildStarted` | `bazel.invocation` | (root) | invocation_id, command | Start trace |
-| `OptionsParsed` | - | - | startup_options | Add to invocation |
+| `OptionsParsed` | - | - | explicit_cmd_line, tool_tag | Add to invocation |
 | `WorkspaceStatus` | - | - | user, host | Add to invocation |
-| `Configuration` | - | - | platform, mnemonic | Cache for targets |
+| `Configuration` | - | - | mnemonic | Cache for actions |
 | `PatternExpanded` | `bazel.phase.loading` | invocation | patterns | Optional phase span |
 | `TargetConfigured` | `bazel.target` | phase/invocation | label, kind | Start target span |
 | `NamedSetOfFiles` | - | - | files | Cache for outputs |

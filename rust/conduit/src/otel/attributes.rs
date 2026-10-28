@@ -8,7 +8,6 @@
 // Trace-level (from BuildStarted / invocation metadata)
 pub const BAZEL_INVOCATION_ID: &str = "bazel.invocation_id";
 pub const BAZEL_COMMAND: &str = "bazel.command";
-pub const BAZEL_COMMAND_LINE: &str = "bazel.command_line";
 pub const BAZEL_PATTERNS: &str = "bazel.patterns";
 pub const BAZEL_EXIT_CODE: &str = "bazel.exit_code";
 pub const BAZEL_EXIT_CODE_NAME: &str = "bazel.exit_code_name";
@@ -19,21 +18,12 @@ pub const BAZEL_TRACE_PROFILE: &str = "bazel.trace.profile";
 pub const BAZEL_TRACE_SUPPRESSED_ACTIONS: &str = "bazel.trace.suppressed_actions";
 pub const BAZEL_TRACE_SUPPRESSED_SPAWNS: &str = "bazel.trace.suppressed_spawns";
 pub const BAZEL_TRACE_SUPPRESSED_TARGETS: &str = "bazel.trace.suppressed_targets";
-pub const BAZEL_CRITICAL_PATH_LOG_URI: &str = "bazel.critical_path_log_uri";
-pub const BAZEL_STARTUP_OPTIONS: &str = "bazel.startup_options";
 pub const BAZEL_EXPLICIT_CMD_LINE: &str = "bazel.explicit_cmd_line";
 pub const BAZEL_TOOL_TAG: &str = "bazel.tool_tag";
 
 // Workspace status
 pub const BAZEL_WORKSPACE_USER: &str = "bazel.workspace.user";
 pub const BAZEL_WORKSPACE_HOST: &str = "bazel.workspace.host";
-
-// Configuration
-pub const BAZEL_CONFIG_MNEMONIC: &str = "bazel.config.mnemonic";
-pub const BAZEL_CONFIG_PLATFORM: &str = "bazel.config.platform";
-pub const BAZEL_CONFIG_ID: &str = "bazel.config.id";
-pub const BAZEL_CONFIG_CPU: &str = "bazel.config.cpu";
-pub const BAZEL_CONFIG_IS_TOOL: &str = "bazel.config.is_tool";
 
 // Target span
 pub const BAZEL_TARGET_LABEL: &str = "bazel.target.label";
@@ -127,7 +117,6 @@ pub const BAZEL_SPAWN_DIGEST_SIZE_BYTES: &str = "bazel.spawn.digest_size_bytes";
 pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
 pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";
 pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
-pub const BAZEL_SERVER_PID: &str = "bazel.server_pid";
 
 // VCS / repository identity. Set once on the root span from the Bazel
 // workspace name — read out of `module(name = ...)` in MODULE.bazel, or
@@ -158,27 +147,16 @@ pub const BAZEL_METRICS_CPU_TIME_MS: &str = "bazel.metrics.cpu_time_ms";
 pub const BAZEL_METRICS_ANALYSIS_PHASE_MS: &str = "bazel.metrics.analysis_phase_ms";
 pub const BAZEL_METRICS_EXECUTION_PHASE_MS: &str = "bazel.metrics.execution_phase_ms";
 pub const BAZEL_METRICS_CRITICAL_PATH_MS: &str = "bazel.metrics.critical_path_ms";
-pub const BAZEL_METRICS_HEAP_POST_BUILD: &str = "bazel.metrics.heap_post_build";
 pub const BAZEL_METRICS_PEAK_HEAP_POST_GC: &str = "bazel.metrics.peak_heap_post_gc";
 pub const BAZEL_METRICS_TARGETS_CONFIGURED: &str = "bazel.metrics.targets_configured";
 pub const BAZEL_METRICS_PACKAGES_LOADED: &str = "bazel.metrics.packages_loaded";
-pub const BAZEL_METRICS_CACHE_HITS: &str = "bazel.metrics.cache_hits";
-pub const BAZEL_METRICS_CACHE_MISSES: &str = "bazel.metrics.cache_misses";
-pub const BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT: &str = "bazel.metrics.source_artifacts_count";
-pub const BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT: &str = "bazel.metrics.output_artifacts_count";
-pub const BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT: &str =
-    "bazel.metrics.action_cache_artifacts_count";
+pub const BAZEL_METRICS_ACTION_CACHE_HITS: &str = "bazel.metrics.action_cache_hits";
+pub const BAZEL_METRICS_ACTION_CACHE_MISSES: &str = "bazel.metrics.action_cache_misses";
 pub const BAZEL_METRICS_BYTES_SENT: &str = "bazel.metrics.bytes_sent";
 pub const BAZEL_METRICS_BYTES_RECV: &str = "bazel.metrics.bytes_recv";
 pub const BAZEL_METRICS_ACTION_DATA: &str = "bazel.metrics.action_data";
 
-pub const BAZEL_METRICS_ACTIONS_EXECUTION_START_MS: &str =
-    "bazel.metrics.actions_execution_start_ms";
 pub const BAZEL_METRICS_RUNNER_COUNT: &str = "bazel.metrics.runner_count";
-pub const BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT: &str =
-    "bazel.metrics.top_level_artifacts_count";
-pub const BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES: &str = "bazel.metrics.cumulative_num_analyses";
-pub const BAZEL_METRICS_CUMULATIVE_NUM_BUILDS: &str = "bazel.metrics.cumulative_num_builds";
 
 // Test extended
 pub const BAZEL_TEST_RUN_COUNT: &str = "bazel.test.run_count";
@@ -187,10 +165,6 @@ pub const BAZEL_TEST_SHARD_COUNT: &str = "bazel.test.shard_count";
 pub const BAZEL_TEST_TOTAL_NUM_CACHED: &str = "bazel.test.total_num_cached";
 pub const BAZEL_TEST_HOSTNAME: &str = "bazel.test.hostname";
 pub const BAZEL_TEST_CACHED_REMOTELY: &str = "bazel.test.cached_remotely";
-
-// Target summary (span event)
-pub const BAZEL_TARGET_OVERALL_BUILD_SUCCESS: &str = "bazel.target.overall_build_success";
-pub const BAZEL_TARGET_OVERALL_TEST_STATUS: &str = "bazel.target.overall_test_status";
 
 // Named set file count (set on target spans)
 pub const BAZEL_NAMED_SET_FILE_COUNT: &str = "bazel.named_set.file_count";

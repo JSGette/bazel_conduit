@@ -53,7 +53,6 @@ mod actions;
 mod test_results;
 mod finalization;
 mod lifecycle;
-mod metadata_handlers;
 mod metrics;
 mod progress;
 mod test_attrs;
@@ -685,7 +684,9 @@ impl OtelMapper {
 
     /// BuildMetadata → add as attributes on root span.
     pub fn on_build_metadata(&mut self, metadata: &crate::build_event_stream::BuildMetadata) {
-        metadata_handlers::apply_build_metadata(self, metadata);
+        for (key, value) in &metadata.metadata {
+            self.set_root_attr(KeyValue::new(format!("bazel.metadata.{key}"), value.clone()));
+        }
     }
 
     // =====================================================================
@@ -722,15 +723,6 @@ impl OtelMapper {
     /// BuildMetrics → add metrics attributes to root span.
     pub fn on_build_metrics(&mut self, metrics: &crate::build_event_stream::BuildMetrics) {
         metrics::apply_build_metrics(self, metrics);
-    }
-
-    // =====================================================================
-    // Build tool logs (critical path)
-    // =====================================================================
-
-    /// BuildToolLogs → extract critical path info, set root attribute for URI, emit span event.
-    pub fn on_build_tool_logs(&mut self, logs: &crate::build_event_stream::BuildToolLogs) {
-        metadata_handlers::apply_build_tool_logs(self, logs);
     }
 
     // =====================================================================

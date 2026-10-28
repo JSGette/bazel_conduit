@@ -22,12 +22,12 @@ pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
             ));
         }
         if let Some(acs) = &s.action_cache_statistics {
-            attrs.push(KeyValue::new(BAZEL_METRICS_CACHE_HITS, i64::from(acs.hits)));
-            attrs.push(KeyValue::new(BAZEL_METRICS_CACHE_MISSES, i64::from(acs.misses)));
+            attrs.push(KeyValue::new(BAZEL_METRICS_ACTION_CACHE_HITS, i64::from(acs.hits)));
+            attrs.push(KeyValue::new(BAZEL_METRICS_ACTION_CACHE_MISSES, i64::from(acs.misses)));
         }
         for r in &s.runner_count {
             attrs.push(KeyValue::new(
-                format!("bazel.metrics.runner.{}", r.name),
+                format!("bazel.metrics.runner.{}", runner_key(&r.name)),
                 i64::from(r.count),
             ));
         }
@@ -39,10 +39,6 @@ pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
             KeyValue::new(BAZEL_METRICS_CPU_TIME_MS, t.cpu_time_in_ms),
             KeyValue::new(BAZEL_METRICS_ANALYSIS_PHASE_MS, t.analysis_phase_time_in_ms),
             KeyValue::new(BAZEL_METRICS_EXECUTION_PHASE_MS, t.execution_phase_time_in_ms),
-            KeyValue::new(
-                BAZEL_METRICS_ACTIONS_EXECUTION_START_MS,
-                t.actions_execution_start_in_ms,
-            ),
         ]);
         if let Some(d) = &t.critical_path_time {
             attrs.push(KeyValue::new(
@@ -60,7 +56,6 @@ pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
     }
 
     if let Some(mm) = &m.memory_metrics {
-        attrs.push(KeyValue::new(BAZEL_METRICS_HEAP_POST_BUILD, mm.used_heap_size_post_build));
         attrs.push(KeyValue::new(BAZEL_METRICS_PEAK_HEAP_POST_GC, mm.peak_post_gc_heap_size));
     }
     if let Some(tm) = &m.target_metrics {
@@ -68,22 +63,6 @@ pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
     }
     if let Some(pm) = &m.package_metrics {
         attrs.push(KeyValue::new(BAZEL_METRICS_PACKAGES_LOADED, pm.packages_loaded));
-    }
-
-    if let Some(am) = &m.artifact_metrics {
-        for (metric, key) in [
-            (&am.source_artifacts_read, BAZEL_METRICS_SOURCE_ARTIFACTS_COUNT),
-            (&am.output_artifacts_seen, BAZEL_METRICS_OUTPUT_ARTIFACTS_COUNT),
-            (
-                &am.output_artifacts_from_action_cache,
-                BAZEL_METRICS_ACTION_CACHE_ARTIFACTS_COUNT,
-            ),
-            (&am.top_level_artifacts, BAZEL_METRICS_TOP_LEVEL_ARTIFACTS_COUNT),
-        ] {
-            if let Some(f) = metric {
-                attrs.push(KeyValue::new(key, i64::from(f.count)));
-            }
-        }
     }
 
     if let Some(sns) = m
@@ -95,15 +74,29 @@ pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
         attrs.push(KeyValue::new(BAZEL_METRICS_BYTES_RECV, sns.bytes_recv as i64));
     }
 
-    if let Some(cm) = &m.cumulative_metrics {
-        attrs.push(KeyValue::new(
-            BAZEL_METRICS_CUMULATIVE_NUM_ANALYSES,
-            i64::from(cm.num_analyses),
-        ));
-        attrs.push(KeyValue::new(BAZEL_METRICS_CUMULATIVE_NUM_BUILDS, i64::from(cm.num_builds)));
-    }
-
     for kv in attrs {
         mapper.set_root_attr(kv);
+    }
+}
+
+/// Runner names are free text ("remote cache hit", "darwin-sandbox"); make
+/// them attribute-key friendly ("remote_cache_hit", "darwin_sandbox").
+fn runner_key(name: &str) -> String {
+    let key: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    if key.is_empty() { "unknown".to_string() } else { key }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runner_keys_are_normalised() {
+        assert_eq!(super::runner_key("remote cache hit"), "remote_cache_hit");
+        assert_eq!(super::runner_key("darwin-sandbox"), "darwin_sandbox");
+        assert_eq!(super::runner_key("Worker"), "worker");
+        assert_eq!(super::runner_key(" "), "unknown");
     }
 }

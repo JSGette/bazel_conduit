@@ -93,25 +93,4 @@ impl OtelMapper {
         self.add_root_event("test_summary", attrs);
         debug!("Added test summary event for {label}");
     }
-
-    /// TargetSummary -> span event on root with overall build/test status for the target.
-    pub fn on_target_summary(
-        &mut self,
-        label: &str,
-        overall_build_success: Option<bool>,
-        overall_test_status: Option<&str>,
-    ) {
-        let mut attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
-        ];
-        if let Some(s) = overall_build_success {
-            attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_BUILD_SUCCESS, s));
-        }
-        if let Some(s) = overall_test_status {
-            attrs.push(KeyValue::new(BAZEL_TARGET_OVERALL_TEST_STATUS, s.to_string()));
-        }
-        self.add_root_event("target_summary", attrs);
-        debug!("Added target summary event for {label}");
-    }
 }

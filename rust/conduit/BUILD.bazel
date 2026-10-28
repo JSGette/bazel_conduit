@@ -50,7 +50,6 @@ rust_library(
         "src/otel/mapper/actions.rs",
         "src/otel/mapper/finalization.rs",
         "src/otel/mapper/lifecycle.rs",
-        "src/otel/mapper/metadata_handlers.rs",
         "src/otel/mapper/metrics.rs",
         "src/otel/mapper/progress.rs",
         "src/otel/mapper/targets.rs",
