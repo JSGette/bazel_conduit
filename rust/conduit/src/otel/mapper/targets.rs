@@ -111,7 +111,7 @@ impl OtelMapper {
         if let Some(existing) = self.target_contexts.get(label) {
             return Some(existing.clone());
         }
-        let parent = self.choose_parent_for_label(label)?;
+        let parent = self.root_context.clone()?;
         if self.closed_targets.contains(label) {
             let cx = self.create_synthetic_target_span(label, &parent, start_nanos);
             self.synthetic_target_labels.insert(label.to_string());
@@ -145,33 +145,6 @@ impl OtelMapper {
             .entry(label.to_string())
             .and_modify(|current| *current = (*current).max(end_nanos))
             .or_insert(end_nanos);
-    }
-
-    /// Returns true if a label looks like an external dependency.
-    fn is_external_label(label: &str) -> bool {
-        label.starts_with('@') || label.contains("+_repo_rules+")
-    }
-
-    /// Choose the correct parent for a target: root for local targets,
-    /// `external deps` group span for external dependencies.
-    fn choose_parent_for_label(&mut self, label: &str) -> Option<Context> {
-        if Self::is_external_label(label) {
-            self.ensure_external_deps_span();
-            self.external_deps_context.clone()
-        } else {
-            self.root_context.clone()
-        }
-    }
-
-    /// Lazily create the `external deps` parent span.
-    fn ensure_external_deps_span(&mut self) {
-        Self::ensure_group_span(
-            &mut self.external_deps_context,
-            &self.root_context,
-            &self.tracer,
-            "external deps",
-            self.root_span_start_nanos,
-        );
     }
 
     /// Create a target span with only the label (no kind/tags). Used when we see
@@ -272,7 +245,7 @@ impl OtelMapper {
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
             cx
         } else if let Some(configured) = configured {
-            let parent = self.choose_parent_for_label(label);
+            let parent = self.root_context.clone();
             if let Some(parent) = parent {
                 let cx = self.create_target_span(label, &configured, &parent, None);
                 debug!("Created target span for {label} at completion time");

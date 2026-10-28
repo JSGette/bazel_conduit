@@ -12,8 +12,6 @@
 //! ├── target {label} (TargetConfigured → TargetCompleted)
 //! │   ├── action {mnemonic} {label} (lightweight: failed only / full: all)
 //! │   └── test {label} (testResult spans)
-//! ├── fetches (single parent span grouping all fetch events)
-//! │   └── fetch {url} (individual fetch spans)
 //! └── skipped targets (parent span grouping all skipped/aborted targets)
 //!     └── target {label} (aborted by Bazel)
 //!
@@ -52,7 +50,7 @@ use super::attributes::*;
 use super::redact::Redactor;
 mod action_attrs;
 mod actions;
-mod fetch_tests;
+mod test_results;
 mod finalization;
 mod lifecycle;
 mod metadata_handlers;
@@ -305,17 +303,9 @@ pub struct OtelMapper {
     /// long-lived target contexts from late action/test events.
     closed_targets: HashSet<String>,
 
-    /// Single `fetches` parent span grouping all fetch child spans.
-    /// Created lazily on first fetch event, ended in [`finish`].
-    fetches_context: Option<Context>,
-
     /// Single `skipped` parent span grouping all skipped/aborted targets.
     /// Created lazily on first skipped target, ended in [`finish`].
     skipped_context: Option<Context>,
-
-    /// Single `external deps` parent span grouping targets from external repos.
-    /// Created lazily on first external target, ended in [`finish`].
-    external_deps_context: Option<Context>,
 
     /// Cached configurations: config hash → mnemonic (e.g. `k8-fastbuild`).
     configurations: HashMap<String, String>,
@@ -430,6 +420,8 @@ pub struct OtelMapper {
     suppressed_actions: u64,
     suppressed_spawns: u64,
     suppressed_targets: u64,
+    fetch_count: u64,
+    fetch_failed: u64,
 
     /// Scrubs sensitive values out of command-line attributes before they
     /// hit the exporter. See [`crate::otel::redact`].
@@ -463,9 +455,7 @@ impl OtelMapper {
             synthetic_target_end_nanos: HashMap::new(),
             target_start_nanos: HashMap::new(),
             closed_targets: HashSet::new(),
-            fetches_context: None,
             skipped_context: None,
-            external_deps_context: None,
             configurations: HashMap::new(),
             cached_command: None,
             cached_patterns: Vec::new(),
@@ -499,6 +489,8 @@ impl OtelMapper {
             suppressed_actions: 0,
             suppressed_spawns: 0,
             suppressed_targets: 0,
+            fetch_count: 0,
+            fetch_failed: 0,
             redactor: Redactor::default_enabled(),
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
             exec_log_max_decompressed_bytes:
@@ -644,8 +636,8 @@ impl OtelMapper {
         span_cx
     }
 
-    /// Lazily create a group span (e.g. "skipped targets", "fetches", "external deps")
-    /// under the root span. Returns the existing context if already created.
+    /// Lazily create a group span (e.g. "skipped targets") under the root
+    /// span. Returns the existing context if already created.
     fn ensure_group_span(
         slot: &mut Option<Context>,
         root_context: &Option<Context>,
@@ -750,13 +742,7 @@ impl OtelMapper {
         if let Some(cx) = self.root_context.take() {
             cx.span().end();
         }
-        if let Some(cx) = self.fetches_context.take() {
-            cx.span().end();
-        }
         if let Some(cx) = self.skipped_context.take() {
-            cx.span().end();
-        }
-        if let Some(cx) = self.external_deps_context.take() {
             cx.span().end();
         }
         for (_, cx) in self.target_contexts.drain() {
@@ -796,6 +782,8 @@ impl OtelMapper {
         self.suppressed_actions = 0;
         self.suppressed_spawns = 0;
         self.suppressed_targets = 0;
+        self.fetch_count = 0;
+        self.fetch_failed = 0;
     }
 
     /// Set the trace policy and mirror the profile onto the root span.
@@ -879,17 +867,6 @@ impl OtelMapper {
         // `bazel.action.spawn.missing=true` on parent action spans.
         self.finalize_and_end_remaining_open_actions();
 
-        // End the `fetches` parent span.
-        if let Some(cx) = self.fetches_context.take() {
-            cx.span().set_status(Status::Ok);
-            if let Some(nanos) = effective_end {
-                cx.span().end_with_timestamp(nanos_to_system_time(nanos));
-            } else {
-                cx.span().end();
-            }
-            debug!("Ended fetches span");
-        }
-
         // End any remaining target spans (lazily created but never completed).
         let labels: Vec<String> = self.target_contexts.keys().cloned().collect();
         for label in labels {
@@ -931,17 +908,6 @@ impl OtelMapper {
             debug!("Ended 'skipped targets' span");
         }
 
-        // End the `external deps` parent span.
-        if let Some(cx) = self.external_deps_context.take() {
-            cx.span().set_status(Status::Ok);
-            if let Some(nanos) = effective_end {
-                cx.span().end_with_timestamp(nanos_to_system_time(nanos));
-            } else {
-                cx.span().end();
-            }
-            debug!("Ended 'external deps' span");
-        }
-
         // No-logger fallback: progress was buffered, attach a single
         // `build.log` span event before closing the root. With a logger
         // configured, [`on_progress`] streams records and these buffers stay
@@ -977,6 +943,8 @@ impl OtelMapper {
             BAZEL_TRACE_SUPPRESSED_TARGETS,
             self.suppressed_targets as i64,
         ));
+        self.set_root_attr(KeyValue::new(BAZEL_FETCH_COUNT, self.fetch_count as i64));
+        self.set_root_attr(KeyValue::new(BAZEL_FETCH_FAILED, self.fetch_failed as i64));
 
         // End root span with proper status + timestamp.
         if let Some(cx) = self.root_context.take() {

@@ -60,7 +60,7 @@ def parse_spans(text):
 def kind(name):
     if name.startswith(("bazel build", "bazel test", "bazel ")):
         return "root"
-    for k in ("target", "action", "spawn", "external deps"):
+    for k in ("target", "action", "spawn", "skipped targets"):
         if name.startswith(k):
             return k
     return "other"
@@ -121,7 +121,8 @@ def check(path):
         counts[kind(s["name"])] = counts.get(kind(s["name"]), 0) + 1
     supp = {k: root["attrs"].get(k) for k in
             ("bazel.trace.profile", "bazel.trace.suppressed_actions",
-             "bazel.trace.suppressed_spawns", "bazel.trace.suppressed_targets")
+             "bazel.trace.suppressed_spawns", "bazel.trace.suppressed_targets",
+             "bazel.fetch.count", "bazel.fetch.failed")
             } if root else {}
 
     print(f"\n=== {path} ===")

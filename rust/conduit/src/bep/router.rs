@@ -612,20 +612,10 @@ impl EventRouter {
                 }
                 Ok(())
             }
-            BepId::Fetch(f) => {
+            BepId::Fetch(_) => {
                 if let Some(BepPayload::Fetch(p)) = &event.payload {
-                    let url = f.url.clone();
-                    let downloader = match f.downloader() {
-                        crate::build_event_stream::build_event_id::fetch_id::Downloader::Http => {
-                            "HTTP"
-                        }
-                        crate::build_event_stream::build_event_id::fetch_id::Downloader::Grpc => {
-                            "GRPC"
-                        }
-                        _ => "UNKNOWN",
-                    };
                     if let Some(mapper) = &mut self.mapper {
-                        mapper.on_fetch(&url, p.success, Some(downloader));
+                        mapper.on_fetch(p.success);
                     }
                 }
                 Ok(())

@@ -1,9 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
-use crate::otel::span::{KeyValue, SpanKind, Status};
-use std::borrow::Cow;
-use std::time::{Duration, SystemTime};
+use crate::otel::span::{KeyValue, SpanKind};
 
 use tracing::{debug, info, warn};
 
@@ -12,69 +10,13 @@ use super::{build_test_attrs, build_test_span_name, test_status};
 use super::{OtelMapper, TestResultEvent};
 
 impl OtelMapper {
-    /// Fetch -> child span under root for external resource fetching.
-    pub fn on_fetch(&mut self, url: &str, success: bool, downloader: Option<&str>) {
-        self.emit_fetch_span(url, success, SystemTime::now(), downloader);
-    }
-
-    /// Ensure the `fetches` parent span exists (lazily created).
-    fn ensure_fetches_span(&mut self) {
-        Self::ensure_group_span(
-            &mut self.fetches_context,
-            &self.root_context,
-            &self.tracer,
-            "fetches",
-            self.root_span_start_nanos,
-        );
-    }
-
-    /// Internal: create + end a fetch span under the `fetches` parent.
-    ///
-    /// `arrival` is the wallclock time the fetch event was received.
-    /// BEP `Fetch` carries no timing data, so we use the arrival time as the
-    /// span start and end it 1 ms later to give Jaeger a visible duration.
-    pub(super) fn emit_fetch_span(
-        &mut self,
-        url: &str,
-        success: bool,
-        arrival: SystemTime,
-        downloader: Option<&str>,
-    ) {
-        self.ensure_fetches_span();
-
-        let parent = match &self.fetches_context {
-            Some(cx) => cx.clone(),
-            None => return,
-        };
-
-        let mut attrs = vec![
-            KeyValue::new(BAZEL_FETCH_URL, url.to_string()),
-            KeyValue::new(BAZEL_FETCH_SUCCESS, success),
-        ];
-        if let Some(dl) = downloader {
-            attrs.push(KeyValue::new(BAZEL_FETCH_DOWNLOADER, dl.to_string()));
+    /// Fetch -> root counters only: BEP `Fetch` carries no timing, so a span
+    /// per download would be fake.
+    pub fn on_fetch(&mut self, success: bool) {
+        self.fetch_count += 1;
+        if !success {
+            self.fetch_failed += 1;
         }
-
-        let builder = self
-            .tracer
-            .span_builder(format!("fetch {url}"))
-            .with_kind(SpanKind::Client)
-            .with_start_time(arrival)
-            .with_attributes(attrs);
-
-        let mut span = self.tracer.build_with_context(builder, &parent);
-
-        if success {
-            span.set_status(Status::Ok);
-        } else {
-            span.set_status(Status::Error {
-                description: Cow::Borrowed("fetch failed"),
-            });
-        }
-        // End 1 ms after arrival so the span has visible duration in Jaeger.
-        span.end_with_timestamp(arrival + Duration::from_millis(1));
-
-        debug!("Created fetch span for {url} (success={success})");
     }
 
     /// TestResult -> child span under target span for a single test attempt.

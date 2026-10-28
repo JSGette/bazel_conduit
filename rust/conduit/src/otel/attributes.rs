@@ -136,10 +136,9 @@ pub const BAZEL_SERVER_PID: &str = "bazel.server_pid";
 // `vcs.*` registry pick it up without conduit-specific filters.
 pub const VCS_REPOSITORY_NAME: &str = "vcs.repository.name";
 
-// Fetch span
-pub const BAZEL_FETCH_URL: &str = "bazel.fetch.url";
-pub const BAZEL_FETCH_SUCCESS: &str = "bazel.fetch.success";
-pub const BAZEL_FETCH_DOWNLOADER: &str = "bazel.fetch.downloader";
+// Fetch counters (root span)
+pub const BAZEL_FETCH_COUNT: &str = "bazel.fetch.count";
+pub const BAZEL_FETCH_FAILED: &str = "bazel.fetch.failed";
 
 // Test span
 pub const BAZEL_TEST_STATUS: &str = "bazel.test.status";

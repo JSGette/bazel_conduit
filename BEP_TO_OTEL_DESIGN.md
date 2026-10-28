@@ -109,7 +109,7 @@ Emission is governed by a single `TracePolicy` (`rust/conduit/src/state/trace_pr
 | `full` | Every action / spawn / target span. |
 | `lightweight` (default) | Keeps failed actions plus the `--max-action-spans` slowest successful ones (200 default), only the targets those belong to, and exec-log spawns that fail, miss the cache, or take at least `--trace-min-duration-ms` (500 ms default). Aggregate metrics stay on the root span. |
 
-Fetch/test spans are always emitted; `Progress` becomes correlated log records, never spans.
+Test spans are always emitted. `Fetch` events carry no timing, so they only feed the root counters `bazel.fetch.count` and `bazel.fetch.failed`. `Progress` becomes correlated log records, never spans.
 
 ## CLI Flags
 

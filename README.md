@@ -22,8 +22,6 @@ bazel.invocation (root)
 │       └── test attempt 1 (PASSED)
 ├── target //external:zlib (synthetic, from exec log)
 │   └── spawn CppCompile zlib/adler32.c
-├── fetches
-│   └── fetch https://...
 └── skipped targets
     └── target //pkg:skipped (ANALYSIS_FAILURE)
 ```

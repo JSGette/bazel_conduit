@@ -279,6 +279,30 @@ fn action_only_target_creates_persistent_synthetic_parent_context() {
     assert!(mapper.synthetic_target_labels.contains(label));
 }
 
+/// Fetches only count on the root, and external-repo targets hang directly
+/// off the root: neither produces a group span.
+#[test]
+fn fetches_are_root_counters_and_external_targets_parent_to_root() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_fetch(true);
+    mapper.on_fetch(false);
+    mapper.on_fetch(true);
+    mapper.on_action_completed(action_event_for(
+        "@@repo//pkg:ext",
+        "GoCompile",
+        "bazel-out/ext.a",
+    ));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_FETCH_COUNT).as_deref(), Some("3"));
+    assert_eq!(attr_value(&root, BAZEL_FETCH_FAILED).as_deref(), Some("1"));
+    let target = find_span(&spans, |s| s.name.starts_with("target ")).expect("target span");
+    assert_eq!(target.parent_span_id, root.span_context.span_id());
+    assert_eq!(spans.len(), 3, "root, target and action only: {spans:#?}");
+}
+
 #[test]
 fn action_after_target_completion_reopens_as_synthetic_parent() {
     let mut mapper = test_mapper();
