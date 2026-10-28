@@ -230,7 +230,6 @@ impl OtelMapper {
         let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
         ];
         if let Some(r) = reason {

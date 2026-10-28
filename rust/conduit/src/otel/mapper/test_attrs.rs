@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 
 use super::super::attributes::*;
-use super::{shorten_label, TestResultEvent};
+use super::TestResultEvent;
 
 pub(super) fn build_test_span_name(ev: &TestResultEvent<'_>) -> String {
     match (ev.attempt, ev.run, ev.shard) {
@@ -27,10 +27,7 @@ pub(super) fn test_status(ev: &TestResultEvent<'_>) -> Status {
 }
 
 pub(super) fn build_test_attrs(ev: &TestResultEvent<'_>) -> Vec<KeyValue> {
-    let mut attrs = vec![
-        KeyValue::new(BAZEL_TARGET_LABEL, ev.label.to_string()),
-        KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(ev.label).to_string()),
-    ];
+    let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, ev.label.to_string())];
     if let Some(v) = ev.status {
         attrs.push(KeyValue::new(BAZEL_TEST_STATUS, v.to_string()));
     }
@@ -43,17 +40,20 @@ pub(super) fn build_test_attrs(ev: &TestResultEvent<'_>) -> Vec<KeyValue> {
     if let Some(v) = ev.shard {
         attrs.push(KeyValue::new(BAZEL_TEST_SHARD, i64::from(v)));
     }
-    if let Some(v) = ev.cached {
-        attrs.push(KeyValue::new(BAZEL_TEST_CACHED, v));
+    let cache = match (ev.cached, ev.cached_remotely) {
+        (Some(true), _) => Some("local"),
+        (_, Some(true)) => Some("remote"),
+        (None, None) => None,
+        _ => Some("none"),
+    };
+    if let Some(v) = cache {
+        attrs.push(KeyValue::new(BAZEL_TEST_CACHE, v));
     }
     if let Some(v) = ev.strategy {
         attrs.push(KeyValue::new(BAZEL_TEST_STRATEGY, v.to_string()));
     }
     if let Some(v) = ev.hostname.filter(|s| !s.is_empty()) {
         attrs.push(KeyValue::new(BAZEL_TEST_HOSTNAME, v.to_string()));
-    }
-    if let Some(v) = ev.cached_remotely {
-        attrs.push(KeyValue::new(BAZEL_TEST_CACHED_REMOTELY, v));
     }
 
     attrs

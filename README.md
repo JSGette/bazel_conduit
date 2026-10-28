@@ -269,7 +269,7 @@ it's buffered briefly and flushed onto the action span the moment it
 arrives. Spawns that never match anything by the end of the build are
 grouped by `(label, mnemonic, primary_output)` and emitted under
 synthesised parent action spans (`bazel.target.synthetic = true`); action
-spans with no matching spawn pick up `bazel.action.spawn.missing = true`.
+spans with no matching spawn end with `bazel.action.spawn.count = 0`.
 
 **Format support.** Only `--execution_log_compact_file` (and its
 `--experimental_execution_log_compact_file` alias) is consumed.
@@ -350,7 +350,7 @@ BEP action IDs (`actionCompleted.label`) and the exec log's `targetLabel` both u
 
 ### Lesson 9: Not All BEP Actions Appear in the Execution Log
 
-The execution log only records **spawned processes** (actual `execve` calls). Internal Bazel actions like `FileWrite`, `TemplateExpand`, and `SymlinkTree` are not spawns and won't appear. This means some BEP actions will never have matching exec log entries — by design. Action spans for those carry `bazel.action.spawn.missing = true` at the end of the build.
+The execution log only records **spawned processes** (actual `execve` calls). Internal Bazel actions like `FileWrite`, `TemplateExpand`, and `SymlinkTree` are not spawns and won't appear. This means some BEP actions will never have matching exec log entries — by design. Action spans for those end with `bazel.action.spawn.count = 0`.
 
 ### Lesson 11: ZstdOutputStream Buffers 128 KiB Before Flushing
 
@@ -383,10 +383,10 @@ The `children` field on Progress events is for BEP DAG ordering (announcing whic
 All OTel span attributes follow the `bazel.<component>.<field>` naming convention. See `rust/conduit/src/otel/attributes.rs` for the full list (~100 constants), organized by:
 
 - **Trace-level**: `bazel.invocation_id`, `bazel.command`, `bazel.exit_code`, `bazel.patterns`, ...
-- **Target spans**: `bazel.target.label`, `bazel.target.kind`, `bazel.target.success`, `bazel.target.output_files`, ...
-- **Action spans**: `bazel.action.mnemonic`, `bazel.action.exit_code`, `bazel.action.cached`, `bazel.action.runner`, ... (`cached`/`runner` come from `ActionExecuted.strategy_details`, populated by Bazel 10+; older Bazel needs `--exec-log`)
+- **Target spans**: `bazel.target.label`, `bazel.target.kind`, `bazel.target.success`, `bazel.target.cached`, and for tests the summary (`bazel.test.overall_status`, run/attempt/shard/cached counts), ...
+- **Action spans**: `bazel.target.label`, `bazel.action.mnemonic`, `bazel.action.exit_code`, `bazel.action.cache_hit`, `bazel.action.runner`, ... (`cache_hit`/`runner` come from `ActionExecuted.strategy_details`, populated by Bazel 10+; older Bazel needs `--exec-log`)
 - **Spawn spans**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`, `bazel.spawn.execution_wall_time_ms`, ...
-- **Test spans**: `bazel.test.status`, `bazel.test.attempt`, `bazel.test.cached_locally`, `bazel.test.strategy`, ...
+- **Test spans**: `bazel.test.status`, `bazel.test.attempt`, `bazel.test.cache` (`none`/`local`/`remote`), `bazel.test.strategy`, ...
 - **Build metrics**: `bazel.metrics.wall_time_ms`, `bazel.metrics.cpu_time_ms`, `bazel.metrics.action_cache_hits`, `bazel.metrics.runner.remote_cache_hit`, ...
 
 ## Limitations

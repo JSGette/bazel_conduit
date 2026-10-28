@@ -27,12 +27,10 @@ pub const BAZEL_WORKSPACE_HOST: &str = "bazel.workspace.host";
 
 // Target span
 pub const BAZEL_TARGET_LABEL: &str = "bazel.target.label";
-pub const BAZEL_TARGET_LABEL_SHORT: &str = "bazel.target.label_short";
 pub const BAZEL_TARGET_KIND: &str = "bazel.target.kind";
 pub const BAZEL_TARGET_SUCCESS: &str = "bazel.target.success";
 pub const BAZEL_TARGET_TAGS: &str = "bazel.target.tags";
 pub const BAZEL_TARGET_OUTPUT_COUNT: &str = "bazel.target.output_count";
-pub const BAZEL_TARGET_OUTPUT_FILES: &str = "bazel.target.output_files";
 pub const BAZEL_TARGET_ABORT_REASON: &str = "bazel.target.abort_reason";
 pub const BAZEL_TARGET_ABORT_DESCRIPTION: &str = "bazel.target.abort_description";
 pub const BAZEL_TARGET_CACHED: &str = "bazel.target.cached";
@@ -43,17 +41,14 @@ pub const BAZEL_TARGET_TEST_SIZE: &str = "bazel.target.test_size";
 pub const BAZEL_ACTION_MNEMONIC: &str = "bazel.action.mnemonic";
 pub const BAZEL_ACTION_EXIT_CODE: &str = "bazel.action.exit_code";
 pub const BAZEL_ACTION_EXIT_CODE_NAME: &str = "bazel.action.exit_code_name";
-pub const BAZEL_ACTION_CACHED: &str = "bazel.action.cached";
+pub const BAZEL_ACTION_CACHE_HIT: &str = "bazel.action.cache_hit";
 pub const BAZEL_ACTION_HOSTNAME: &str = "bazel.action.hostname";
 pub const BAZEL_ACTION_CACHED_REMOTELY: &str = "bazel.action.cached_remotely";
 pub const BAZEL_ACTION_RUNNER: &str = "bazel.action.runner";
 pub const BAZEL_ACTION_PRIMARY_OUTPUT: &str = "bazel.action.primary_output";
 pub const BAZEL_ACTION_SUCCESS: &str = "bazel.action.success";
 pub const BAZEL_ACTION_COMMAND_LINE: &str = "bazel.action.command_line";
-pub const BAZEL_ACTION_STDOUT: &str = "bazel.action.stdout";
 pub const BAZEL_ACTION_STDERR: &str = "bazel.action.stderr";
-pub const BAZEL_ACTION_LABEL: &str = "bazel.action.label";
-pub const BAZEL_ACTION_LABEL_SHORT: &str = "bazel.action.label_short";
 pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
 
 // Action span: spawn-derived backfill from compact exec log.
@@ -61,13 +56,9 @@ pub const BAZEL_ACTION_CONFIGURATION: &str = "bazel.action.configuration";
 // SpawnMetrics onto the parent action span, mirroring the per-spawn
 // `bazel.spawn.*` keys. Multi-spawn actions (retries, dynamic-exec races)
 // only bump `bazel.action.spawn.count`; their attrs land on the per-spawn
-// child spans. `bazel.action.spawn.missing` is set when no SpawnExec
-// matched by the time `finish()` ends the action — useful signal for
-// action-cache-only hits, --build_event_publish_all_actions=false orphans
-// (when matched, the synthesised action carries the attrs instead), or
-// genuine plumbing bugs.
+// child spans. A count of 0 at `finish()` means no SpawnExec matched (e.g.
+// action-cache-only hits).
 pub const BAZEL_ACTION_SPAWN_COUNT: &str = "bazel.action.spawn.count";
-pub const BAZEL_ACTION_SPAWN_MISSING: &str = "bazel.action.spawn.missing";
 pub const BAZEL_ACTION_SPAWN_RUNNER: &str = "bazel.action.spawn.runner";
 pub const BAZEL_ACTION_SPAWN_CACHE_HIT: &str = "bazel.action.spawn.cache_hit";
 pub const BAZEL_ACTION_SPAWN_REMOTE_CACHEABLE: &str = "bazel.action.spawn.remote_cacheable";
@@ -134,7 +125,7 @@ pub const BAZEL_TEST_STATUS: &str = "bazel.test.status";
 pub const BAZEL_TEST_ATTEMPT: &str = "bazel.test.attempt";
 pub const BAZEL_TEST_RUN: &str = "bazel.test.run";
 pub const BAZEL_TEST_SHARD: &str = "bazel.test.shard";
-pub const BAZEL_TEST_CACHED: &str = "bazel.test.cached_locally";
+pub const BAZEL_TEST_CACHE: &str = "bazel.test.cache";
 pub const BAZEL_TEST_STRATEGY: &str = "bazel.test.strategy";
 pub const BAZEL_TEST_OVERALL_STATUS: &str = "bazel.test.overall_status";
 pub const BAZEL_TEST_TOTAL_RUN_COUNT: &str = "bazel.test.total_run_count";
@@ -164,10 +155,6 @@ pub const BAZEL_TEST_ATTEMPT_COUNT: &str = "bazel.test.attempt_count";
 pub const BAZEL_TEST_SHARD_COUNT: &str = "bazel.test.shard_count";
 pub const BAZEL_TEST_TOTAL_NUM_CACHED: &str = "bazel.test.total_num_cached";
 pub const BAZEL_TEST_HOSTNAME: &str = "bazel.test.hostname";
-pub const BAZEL_TEST_CACHED_REMOTELY: &str = "bazel.test.cached_remotely";
-
-// Named set file count (set on target spans)
-pub const BAZEL_NAMED_SET_FILE_COUNT: &str = "bazel.named_set.file_count";
 
 // Progress / build log span events
 pub const BAZEL_PROGRESS_STDERR: &str = "bazel.progress.stderr";

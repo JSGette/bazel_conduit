@@ -27,17 +27,6 @@ fn strip_ansi_empty() {
 }
 
 #[test]
-fn bytestream_uri_to_display_non_bytestream() {
-    assert_eq!(bytestream_uri_to_display("file:///tmp/out"), "file:///tmp/out");
-}
-
-#[test]
-fn bytestream_uri_to_display_strips_authority() {
-    let uri = "bytestream://remote.example.com/blobs/abc123/42";
-    assert_eq!(bytestream_uri_to_display(uri), "blobs/abc123/42");
-}
-
-#[test]
 fn tail_byte_offset_short_string() {
     assert_eq!(tail_byte_offset("hello", 10), 0);
 }
@@ -234,7 +223,8 @@ fn target_completed_clears_configured_after_lazy_target_span_creation() {
     ));
     assert!(mapper.target_contexts.contains_key("//pkg:lazy"));
 
-    mapper.on_target_completed("//pkg:lazy", true, &[], &[], Some(1_500_000_000));
+    mapper.on_target_completed("//pkg:lazy", true, &[], Some(1_500_000_000));
+    mapper.finish();
 
     assert!(
         !mapper.configured_targets.contains_key("//pkg:lazy"),
@@ -286,29 +276,99 @@ fn fetches_are_root_counters_and_external_targets_parent_to_root() {
     assert_eq!(attr_value(&root, BAZEL_FETCH_FAILED).as_deref(), Some("1"));
     let target = find_span(&spans, |s| s.name.starts_with("target ")).expect("target span");
     assert_eq!(target.parent_span_id, root.span_context.span_id());
+    assert_eq!(attr_value(&target, BAZEL_TARGET_SYNTHETIC).as_deref(), Some("true"));
     assert_eq!(spans.len(), 3, "root, target and action only: {spans:#?}");
 }
 
 #[test]
-fn action_after_target_completion_reopens_as_synthetic_parent() {
-    let mut mapper = test_mapper();
-    mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
+fn untimed_late_action_stays_inside_its_target() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_target_configured("//pkg:u", Some("genrule"), &[], Some(1_100_000_000), None);
+    mapper.on_target_completed("//pkg:u", true, &[], Some(1_200_000_000));
+    mapper.on_action_completed(ActionCompletedEvent {
+        start_time_nanos: None,
+        end_time_nanos: None,
+        ..action_event_for("//pkg:u", "Genrule", "bazel-out/u.txt")
+    });
+    mapper.finish();
 
-    mapper.on_target_configured("//pkg:late", Some("cc_library"), &[], Some(1_100_000_000), None);
-    mapper.on_target_completed("//pkg:late", true, &[], &[], Some(1_200_000_000));
-    assert!(mapper.closed_targets.contains("//pkg:late"));
+    let spans = collector.snapshot();
+    let target = find_span(&spans, |s| s.name == "target //pkg:u").expect("target span");
+    let action = find_span(&spans, |s| s.name.starts_with("action ")).expect("action span");
+    assert_eq!(action.parent_span_id, target.span_context.span_id());
+    assert!(target.end_time >= action.end_time, "{target:#?}\n{action:#?}");
+}
 
-    mapper.on_action_completed(action_event_for(
-        "//pkg:late",
-        "CppCompile",
-        "bazel-out/late.o",
-    ));
+#[test]
+fn repeated_target_completions_merge_into_one_span() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_target_configured("//pkg:m", Some("cc_library"), &[], Some(1_100_000_000), None);
+    mapper.on_target_completed("//pkg:m", false, &[], Some(1_300_000_000));
+    mapper.on_target_completed("//pkg:m", true, &[], Some(1_200_000_000));
+    mapper.finish();
 
-    assert!(
-        mapper.target_contexts.contains_key("//pkg:late"),
-        "late action should use a synthetic target parent for linkage",
-    );
-    assert!(mapper.synthetic_target_labels.contains("//pkg:late"));
+    let spans = collector.snapshot();
+    let targets: Vec<_> = spans.iter().filter(|s| s.name == "target //pkg:m").collect();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(attr_value(targets[0], BAZEL_TARGET_SUCCESS).as_deref(), Some("false"));
+    assert_eq!(targets[0].end_time, nanos_to_system_time(1_300_000_000));
+}
+
+#[test]
+fn test_summary_for_skipped_target_adds_no_span() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_target_configured("//pkg:s", Some("sh_test"), &[], Some(1_100_000_000), None);
+    mapper.on_target_skipped("//pkg:s", Some("ANALYSIS_FAILURE"), None, Some(1_200_000_000));
+    mapper.on_test_summary("//pkg:s", Some("FAILED_TO_BUILD"), Some(0), None, None, None, None);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let targets: Vec<_> = spans.iter().filter(|s| s.name.ends_with("//pkg:s")).collect();
+    assert_eq!(targets.len(), 1, "only the skipped span: {targets:#?}");
+    assert_eq!(attr_value(targets[0], BAZEL_TARGET_SYNTHETIC), None);
+}
+
+/// Events after `TargetCompleted` (late actions, tests and their summary)
+/// land on the real target span, which completes at finish.
+#[test]
+fn events_after_target_completed_land_on_the_real_target() {
+    let (mut mapper, collector) = mapper_with_collector();
+
+    mapper.on_target_configured("//pkg:t", Some("cc_test"), &[], Some(1_100_000_000), None);
+    mapper.on_target_completed("//pkg:t", true, &[], Some(1_200_000_000));
+    mapper.on_action_completed(action_event_for("//pkg:t", "CppCompile", "bazel-out/t.o"));
+    mapper.on_test_result(&TestResultEvent {
+        label: "//pkg:t",
+        status: Some("PASSED"),
+        attempt: Some(1),
+        run: None,
+        shard: None,
+        cached: Some(false),
+        strategy: None,
+        start_time_nanos: Some(1_300_000_000),
+        duration_nanos: Some(100_000_000),
+        hostname: None,
+        cached_remotely: Some(true),
+    });
+    mapper.on_test_summary("//pkg:t", Some("PASSED"), Some(1), Some(1), Some(1), Some(1), Some(1));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let targets: Vec<&SpanData> = spans.iter().filter(|s| s.name == "target //pkg:t").collect();
+    assert_eq!(targets.len(), 1, "no synthetic duplicate");
+    let target = targets[0];
+    assert_eq!(attr_value(target, BAZEL_TARGET_KIND).as_deref(), Some("cc_test"));
+    assert_eq!(attr_value(target, BAZEL_TARGET_SYNTHETIC), None);
+    assert_eq!(attr_value(target, BAZEL_TEST_OVERALL_STATUS).as_deref(), Some("PASSED"));
+    assert_eq!(attr_value(target, BAZEL_TEST_TOTAL_NUM_CACHED).as_deref(), Some("1"));
+    for child in spans.iter().filter(|s| s.name.starts_with("action ") || s.name.starts_with("test ")) {
+        assert_eq!(child.parent_span_id, target.span_context.span_id(), "{}", child.name);
+    }
+    let test = find_span(&spans, |s| s.name.starts_with("test ")).expect("test span");
+    assert_eq!(attr_value(&test, BAZEL_TEST_CACHE).as_deref(), Some("remote"));
+    assert!(target.end_time >= test.end_time, "target must contain the later test");
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert!(root.events.is_empty(), "no root events: {:?}", root.events);
 }
 
 #[test]
@@ -553,8 +613,6 @@ fn cache_hit_single_spawn_backfills_action_span() {
         attr_value(&action, BAZEL_ACTION_SPAWN_EXEC_WALL_TIME_MS).as_deref(),
         Some("300"),
     );
-    // `spawn.missing` should not be set.
-    assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
 
     let child_spawns: Vec<_> = spans
         .iter()
@@ -644,7 +702,6 @@ fn buffered_spawn_flushes_when_action_arrives() {
         attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
         Some("1"),
     );
-    assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
     let child_count = spans
         .iter()
         .filter(|s| s.name.starts_with("spawn RustCompile"))
@@ -703,10 +760,9 @@ fn orphan_spawn_synthesises_parent_action() {
 
 /// Scenario 4: BEP action arrives but **no** compact-log spawn matches
 /// it (e.g. action-cache hit invisible to the spawn log). At `finish()`
-/// the still-open action gets ended with
-/// `bazel.action.spawn.missing = true` and `bazel.action.spawn.count = 0`.
+/// the still-open action gets ended with `bazel.action.spawn.count = 0`.
 #[test]
-fn bep_only_action_marked_spawn_missing() {
+fn bep_only_action_reports_zero_spawns() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.compact_streaming_active = true;
 
@@ -726,20 +782,15 @@ fn bep_only_action_marked_spawn_missing() {
         attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
         Some("0"),
     );
-    assert_eq!(
-        attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).as_deref(),
-        Some("true"),
-    );
 
     let any_spawn = spans.iter().any(|s| s.name.starts_with("spawn "));
     assert!(!any_spawn, "no child spawn spans expected");
 }
 
 /// Spawn arrives after TargetCompleted marked the action boundary but
-/// before finish-time finalization. Parent action must not carry
-/// `spawn.missing=true`.
+/// before finish-time finalization; it still counts on the parent action.
 #[test]
-fn late_spawn_before_finish_clears_missing() {
+fn late_spawn_before_finish_is_counted() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.compact_streaming_active = true;
 
@@ -765,7 +816,6 @@ fn late_spawn_before_finish_clears_missing() {
         attr_value(&action, BAZEL_ACTION_SPAWN_COUNT).as_deref(),
         Some("1"),
     );
-    assert!(attr_value(&action, BAZEL_ACTION_SPAWN_MISSING).is_none());
 }
 
 #[test]
@@ -1007,7 +1057,7 @@ fn lightweight_budget_decides_successful_targets() {
     for (label, millis) in [("//:slow", 50), ("//:fast", 5)] {
         mapper.on_target_configured(label, Some("genrule"), &[], Some(1_000_000_000), None);
         mapper.on_action_completed(timed_action(label, true, millis));
-        mapper.on_target_completed(label, true, &[], &[], Some(2_000_000_000));
+        mapper.on_target_completed(label, true, &[], Some(2_000_000_000));
     }
     mapper.finish();
 
@@ -1033,7 +1083,7 @@ fn lightweight_budget_parents_kept_action_under_failed_target() {
 
     mapper.on_target_configured("//:t", Some("genrule"), &[], Some(1_000_000_000), None);
     mapper.on_action_completed(timed_action("//:t", true, 50));
-    mapper.on_target_completed("//:t", false, &[], &[], Some(2_000_000_000));
+    mapper.on_target_completed("//:t", false, &[], Some(2_000_000_000));
     mapper.finish();
 
     let spans = collector.snapshot();
@@ -1053,7 +1103,7 @@ fn lightweight_orphan_action_keeps_deferred_target() {
     lightweight(&mut mapper);
 
     mapper.on_target_configured("//pkg:boom", Some("cc_library"), &[], Some(1_000_000_000), None);
-    mapper.on_target_completed("//pkg:boom", true, &[], &[], Some(2_000_000_000));
+    mapper.on_target_completed("//pkg:boom", true, &[], Some(2_000_000_000));
     let mut spawn =
         spawn_exec_with_metrics("//pkg:boom", "CppCompile", "bazel-out/boom.o", "local", false);
     spawn.exit_code = 1;
@@ -1267,7 +1317,7 @@ fn lightweight_suppresses_empty_successful_target() {
     lightweight(&mut mapper);
 
     mapper.on_target_configured("//pkg:lib", Some("rust_library"), &[], Some(1_000_000_000), None);
-    mapper.on_target_completed("//pkg:lib", true, &[], &[], Some(1_500_000_000));
+    mapper.on_target_completed("//pkg:lib", true, &[], Some(1_500_000_000));
     mapper.finish();
 
     let spans = collector.snapshot();
@@ -1289,7 +1339,7 @@ fn lightweight_keeps_failed_target() {
     lightweight(&mut mapper);
 
     mapper.on_target_configured("//pkg:lib", Some("rust_library"), &[], Some(1_000_000_000), None);
-    mapper.on_target_completed("//pkg:lib", false, &[], &[], Some(1_500_000_000));
+    mapper.on_target_completed("//pkg:lib", false, &[], Some(1_500_000_000));
     mapper.finish();
 
     let spans = collector.snapshot();

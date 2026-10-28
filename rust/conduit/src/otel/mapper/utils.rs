@@ -64,23 +64,6 @@ pub(super) fn strip_ansi(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Convert a bytestream URI to a display-friendly form: show the path part (e.g. after
-/// the authority, such as `blobs/hash/size`) or leave as-is if no path or not bytestream.
-pub(super) fn bytestream_uri_to_display(uri: &str) -> Cow<'_, str> {
-    const PREFIX: &str = "bytestream://";
-    if !uri.starts_with(PREFIX) {
-        return Cow::Borrowed(uri);
-    }
-    let after_prefix = &uri[PREFIX.len()..];
-    if let Some(slash) = after_prefix.find('/') {
-        let path = &after_prefix[slash + 1..];
-        if !path.is_empty() {
-            return Cow::Owned(path.to_string());
-        }
-    }
-    Cow::Borrowed(uri)
-}
-
 /// Extract (start_nanos, end_nanos) from a `SpawnExec` via its
 /// `SpawnMetrics.start_time` + `total_time`. Returns `None` when timing
 /// data is absent.

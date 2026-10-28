@@ -29,6 +29,14 @@ impl OtelMapper {
         // Cached test results carry the original execution timestamps; clamp
         // so they don't escape the current invocation's window.
         let (start_nanos, end_nanos) = self.clamp_to_invocation(ev.start_time_nanos, raw_end);
+        // Pin untimed ends so the deferred target can still cover them.
+        let (start_nanos, end_nanos) = match end_nanos {
+            Some(_) => (start_nanos, end_nanos),
+            None => {
+                let now = super::utils::wall_clock_now_nanos();
+                (start_nanos.or(now), now)
+            }
+        };
 
         let parent = self
             .target_parent_context(ev.label, start_nanos)
@@ -37,7 +45,7 @@ impl OtelMapper {
             warn!("TestResult with no parent context for {}", ev.label);
             return;
         };
-        self.record_synthetic_target_end(ev.label, end_nanos);
+        self.record_target_child_end(ev.label, end_nanos);
 
         let span_name = build_test_span_name(ev);
         let attrs = build_test_attrs(ev);
@@ -56,7 +64,8 @@ impl OtelMapper {
         info!(label = ev.label, status = ?ev.status, "Created test result span");
     }
 
-    /// TestSummary -> span event on root (target span is already ended).
+    /// TestSummary -> attributes on the target span, still open because
+    /// targets complete at [`OtelMapper::finish`].
     #[allow(clippy::too_many_arguments)]
     pub fn on_test_summary(
         &mut self,
@@ -68,10 +77,7 @@ impl OtelMapper {
         shard_count: Option<i32>,
         total_num_cached: Option<i32>,
     ) {
-        let mut attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, shorten_label(label).to_string()),
-        ];
+        let mut attrs = Vec::new();
         if let Some(s) = overall_status {
             attrs.push(KeyValue::new(BAZEL_TEST_OVERALL_STATUS, s.to_string()));
         }
@@ -90,7 +96,17 @@ impl OtelMapper {
         if let Some(v) = total_num_cached {
             attrs.push(KeyValue::new(BAZEL_TEST_TOTAL_NUM_CACHED, v as i64));
         }
-        self.add_root_event("test_summary", attrs);
-        debug!("Added test summary event for {label}");
+        if self.closed_targets.contains(label) && !self.target_contexts.contains_key(label) {
+            debug!("Dropping TestSummary for skipped target {label}");
+            return;
+        }
+        let Some(cx) = self.target_parent_context(label, None) else {
+            warn!("TestSummary with no parent context for {label}");
+            return;
+        };
+        for kv in attrs {
+            cx.span().set_attribute(kv);
+        }
+        debug!("Added test summary to target span for {label}");
     }
 }

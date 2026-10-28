@@ -500,12 +500,6 @@ impl EventRouter {
                     return Ok(());
                 }
                 if let Some(BepPayload::Completed(c)) = &event.payload {
-                    let file_sets: Vec<String> = c
-                        .output_group
-                        .iter()
-                        .flat_map(|og| og.file_sets.iter())
-                        .map(|fs| fs.id.clone())
-                        .collect();
                     let tags = c.tag.clone();
                     self.summary.targets += 1;
                     if !c.success {
@@ -515,29 +509,9 @@ impl EventRouter {
                         mapper.on_target_completed(
                             &label,
                             c.success,
-                            &file_sets,
                             &tags,
                             event_time_nanos,
                         );
-                    }
-                }
-                Ok(())
-            }
-            BepId::NamedSet(n) => {
-                if let Some(BepPayload::NamedSetOfFiles(ns)) = &event.payload {
-                    let id = n.id.clone();
-                    let files: Vec<String> = ns
-                        .files
-                        .iter()
-                        .filter_map(|f| {
-                            crate::grpc::server::bep_file_uri(f)
-                                .or_else(|| if f.name.is_empty() { None } else { Some(f.name.clone()) })
-                        })
-                        .collect();
-                    let child_set_ids: Vec<String> =
-                        ns.file_sets.iter().map(|fs| fs.id.clone()).collect();
-                    if let Some(mapper) = &mut self.mapper {
-                        mapper.on_named_set(&id, files, &child_set_ids);
                     }
                 }
                 Ok(())
@@ -708,10 +682,11 @@ impl EventRouter {
                 }
                 Ok(())
             }
-            // TargetSummary duplicates target success; BuildToolLogs only point
-            // at local files; the unstructured command line duplicates
-            // OptionsParsed's explicit one.
+            // TargetSummary duplicates target success; NamedSet output files
+            // and BuildToolLogs are not exported; the unstructured command
+            // line duplicates OptionsParsed's explicit one.
             BepId::TargetSummary(_)
+            | BepId::NamedSet(_)
             | BepId::BuildToolLogs(_)
             | BepId::UnstructuredCommandLine(_)
             | BepId::StructuredCommandLine(_)

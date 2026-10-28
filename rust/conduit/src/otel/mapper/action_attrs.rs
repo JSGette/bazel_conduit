@@ -44,7 +44,7 @@ pub(super) fn build_action_attrs(
         attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE_NAME, v.to_string()));
     }
     if let Some(v) = ev.cached {
-        attrs.push(KeyValue::new(BAZEL_ACTION_CACHED, v));
+        attrs.push(KeyValue::new(BAZEL_ACTION_CACHE_HIT, v));
     }
     if let Some(v) = ev.runner.as_deref().filter(|s| !s.is_empty()) {
         attrs.push(KeyValue::new(BAZEL_ACTION_RUNNER, v.to_string()));
@@ -53,8 +53,7 @@ pub(super) fn build_action_attrs(
         attrs.push(KeyValue::new(BAZEL_ACTION_PRIMARY_OUTPUT, v.to_string()));
     }
     if let Some(v) = ev.label.as_deref() {
-        attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, v.to_string()));
-        attrs.push(KeyValue::new(BAZEL_ACTION_LABEL_SHORT, shorten_label(v).to_string()));
+        attrs.push(KeyValue::new(BAZEL_TARGET_LABEL, v.to_string()));
     }
     if let Some(cfg) = ev.configuration.as_deref() {
         let display_val = configurations
@@ -67,9 +66,6 @@ pub(super) fn build_action_attrs(
         let joined = scrubbed.join(" ");
         let capped = truncate_to_byte_limit(&joined, COMMAND_LINE_CAP_BYTES, "...(truncated)");
         attrs.push(KeyValue::new(BAZEL_ACTION_COMMAND_LINE, capped));
-    }
-    if let Some(v) = ev.stdout_path.as_deref() {
-        attrs.push(KeyValue::new(BAZEL_ACTION_STDOUT, v.to_string()));
     }
     if let Some(v) = ev.stderr_path.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_STDERR, v.to_string()));

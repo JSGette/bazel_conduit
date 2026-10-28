@@ -15,9 +15,8 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 1. **1 trace = 1 Bazel invocation**
 2. **Root span** created on `BuildStarted`, closed on `BuildFinished`
 3. **Primary value** comes from **Target spans**
-4. `NamedSetOfFiles` is lazily resolved for outputs
-5. Correct handling of out-of-order events using `EventID` index
-6. Secondary parents are represented using **OTel Span Links**
+4. Correct handling of out-of-order events using `EventID` index
+5. Secondary parents are represented using **OTel Span Links**
 7. `ActionExecuted` spans are sampled (failed/slow only by default)
 8. `Progress` events are ignored if `stdout`/`stderr` are empty
 
@@ -59,7 +58,7 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 | `Configuration` | - | - | mnemonic | Cache for actions |
 | `PatternExpanded` | `bazel.phase.loading` | invocation | patterns | Optional phase span |
 | `TargetConfigured` | `bazel.target` | phase/invocation | label, kind | Start target span |
-| `NamedSetOfFiles` | - | - | files | Cache for outputs |
+| `NamedSetOfFiles` | - | - | - | Ignored (output files are not exported) |
 | `TargetCompleted` | - | - | success, outputs | End target span |
 | `ActionExecuted` | `bazel.action.{type}` | target | mnemonic, exit_code | Sampled |
 | `TestResult` | `bazel.test.attempt` | target | status, attempt | Test spans |
@@ -82,13 +81,6 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 - `children` field in events declares expected child events
 - Build an index: `EventID -> Event` for out-of-order handling
 - Secondary parents become **Span Links** (not parent-child)
-
-## Outputs Handling
-
-1. `NamedSetOfFiles` events arrive with `id` (e.g., "3")
-2. Cache: `namedset_id -> [FileInfo]`
-3. `TargetCompleted` references `fileSets` with namedset IDs
-4. Resolve outputs lazily when completing target span
 
 ## Span Status Rules
 
@@ -131,6 +123,5 @@ See the [README CLI Flags table](README.md#cli-flags) for the authoritative list
 1. Parse BEP from JSON file or gRPC stream
 2. Create invocation span (BuildStarted → BuildFinished)
 3. Create target spans (TargetConfigured → TargetCompleted)
-4. Resolve outputs from NamedSetOfFiles
-5. Export to Datadog via OTLP
-6. Handle failed actions only (lightweight mode)
+4. Export to Datadog via OTLP
+5. Handle failed actions only (lightweight mode)

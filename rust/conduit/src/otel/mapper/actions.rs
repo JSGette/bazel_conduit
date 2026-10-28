@@ -102,7 +102,7 @@ impl OtelMapper {
         };
 
         if let Some(label) = label {
-            self.record_synthetic_target_end(label, clamped_end);
+            self.record_target_child_end(label, clamped_end);
         }
 
         let span_name = build_action_span_name(ev);
@@ -132,7 +132,12 @@ impl OtelMapper {
                 spawn_count: 0,
             }
         } else {
-            if let Some(nanos) = clamped_end {
+            // Pin untimed ends so the deferred target can still cover them.
+            let end = clamped_end.or_else(super::utils::wall_clock_now_nanos);
+            if let Some(label) = label {
+                self.record_target_child_end(label, end);
+            }
+            if let Some(nanos) = end {
                 span.end_with_timestamp(super::nanos_to_system_time(nanos));
             } else {
                 span.end();
@@ -294,9 +299,6 @@ impl OtelMapper {
 
     fn finalize_action_summary_attrs(span: &mut Span, spawn_count: u32) {
         span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_COUNT, i64::from(spawn_count)));
-        if spawn_count == 0 {
-            span.set_attribute(KeyValue::new(BAZEL_ACTION_SPAWN_MISSING, true));
-        }
     }
 
     /// Finalize and end the in-place action span for `key`. No-op if the span

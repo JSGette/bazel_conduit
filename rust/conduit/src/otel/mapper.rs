@@ -62,7 +62,7 @@ mod utils;
 use self::action_attrs::{action_status, build_action_attrs, build_action_span_name};
 use self::test_attrs::{build_test_attrs, build_test_span_name, test_status};
 use self::utils::{
-    append_progress_capped, bytestream_uri_to_display, detect_workspace_name, nanos_to_system_time,
+    append_progress_capped, detect_workspace_name, nanos_to_system_time,
     spawn_time_range, strip_ansi, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
     PROGRESS_CAP_BYTES,
 };
@@ -135,12 +135,11 @@ impl Ord for BudgetedAction {
     }
 }
 
-/// A `TargetCompleted` held until [`OtelMapper::finish`] under the lightweight
-/// profile, so budgeted actions emitted there still find the target open.
+/// A `TargetCompleted` held until [`OtelMapper::finish`], so late tests and
+/// budgeted actions still find the target open.
 struct DeferredTarget {
     label: String,
     success: bool,
-    file_set_ids: Vec<String>,
     tags: Vec<String>,
     event_time_nanos: Option<i64>,
 }
@@ -257,17 +256,6 @@ struct ConfiguredTarget {
     test_size: Option<String>,
 }
 
-/// A single entry in the NamedSet cache.
-///
-/// `NamedSetOfFiles` in BEP can contain both direct `files` and references
-/// to other NamedSets (`file_sets`).  We store both so we can recursively
-/// resolve the transitive closure of files.
-struct NamedSetEntry {
-    /// Direct files in this set.
-    files: Vec<String>,
-    /// IDs of child NamedSets whose files also belong to this set.
-    child_set_ids: Vec<String>,
-}
 
 /// Maps BEP events to OpenTelemetry spans.
 pub struct OtelMapper {
@@ -289,8 +277,8 @@ pub struct OtelMapper {
     /// (action/test-driven, no observed TargetConfigured lifecycle).
     synthetic_target_labels: HashSet<String>,
 
-    /// Latest observed child end for each open synthetic target.
-    synthetic_target_end_nanos: HashMap<String, i64>,
+    /// Latest observed child end for each open target.
+    target_child_end_nanos: HashMap<String, i64>,
 
     /// Start timestamp of each target span (real or synthetic), keyed by
     /// normalized label. Used to keep child action/spawn spans from starting
@@ -350,9 +338,6 @@ pub struct OtelMapper {
     /// Takes precedence over finish_time_nanos so duration matches Bazel's wall time.
     root_span_end_from_wall_nanos: Option<i64>,
 
-    /// Named set cache: set_id → entry with direct files + child set refs.
-    /// Used to resolve output files (transitively) when target spans complete.
-    named_set_cache: HashMap<String, NamedSetEntry>,
 
     /// True once a compact-log tailer has been wired in (whether via
     /// [`Self::on_exec_log_detected`] in prod or a test helper). Drives
@@ -411,8 +396,9 @@ pub struct OtelMapper {
     /// Keys of actions the budget dropped, so their exec-log spawns aren't
     /// resurrected as orphans.
     budget_dropped: HashSet<ActionSpanKey>,
-    /// Lightweight only: targets completed at [`Self::finish`].
-    deferred_targets: Vec<DeferredTarget>,
+    /// Targets completed at [`Self::finish`]. Keyed by label: completions in
+    /// several configurations share one span.
+    deferred_targets: HashMap<String, DeferredTarget>,
 
     /// Spans dropped by the lightweight profile, surfaced on the root span at
     /// [`Self::finish`] so operators can see how much volume was cut.
@@ -451,7 +437,7 @@ impl OtelMapper {
             configured_targets: HashMap::new(),
             target_contexts: HashMap::new(),
             synthetic_target_labels: HashSet::new(),
-            synthetic_target_end_nanos: HashMap::new(),
+            target_child_end_nanos: HashMap::new(),
             target_start_nanos: HashMap::new(),
             closed_targets: HashSet::new(),
             skipped_context: None,
@@ -468,7 +454,6 @@ impl OtelMapper {
             root_span_start_nanos: None,
             build_start_nanos: None,
             root_span_end_from_wall_nanos: None,
-            named_set_cache: HashMap::new(),
             compact_streaming_active: false,
             exec_log_state: None,
             action_span_cache: HashMap::new(),
@@ -484,7 +469,7 @@ impl OtelMapper {
             action_budget: BinaryHeap::new(),
             action_seq: 0,
             budget_dropped: HashSet::new(),
-            deferred_targets: Vec::new(),
+            deferred_targets: HashMap::new(),
             suppressed_actions: 0,
             suppressed_spawns: 0,
             suppressed_targets: 0,
@@ -573,7 +558,10 @@ impl OtelMapper {
 
     /// End of the (synthetic) target span a child hangs under, if known.
     pub(super) fn target_end_for(&self, label: &str) -> Option<i64> {
-        self.synthetic_target_end_nanos.get(label).copied()
+        if !self.synthetic_target_labels.contains(label) {
+            return None;
+        }
+        self.target_child_end_nanos.get(label).copied()
     }
 
     /// Set an attribute on the root span (no-op if root span not yet created).
@@ -742,7 +730,7 @@ impl OtelMapper {
         }
         self.configured_targets.clear();
         self.synthetic_target_labels.clear();
-        self.synthetic_target_end_nanos.clear();
+        self.target_child_end_nanos.clear();
         self.target_start_nanos.clear();
         self.closed_targets.clear();
         self.configurations.clear();
@@ -757,7 +745,6 @@ impl OtelMapper {
         self.root_span_start_nanos = None;
         self.build_start_nanos = None;
         self.root_span_end_from_wall_nanos = None;
-        self.named_set_cache.clear();
         if let Some(state) = self.exec_log_state.take() {
             state.handle.shutdown();
         }
@@ -822,8 +809,8 @@ impl OtelMapper {
 
     /// Finalize and end every action span still held open in
     /// [`Self::action_span_cache`]. Called from `finish()` after the tailer
-    /// drain and orphan synthesis, so `spawn.missing` decisions are based on
-    /// the complete compact-log stream.
+    /// drain and orphan synthesis, so spawn counts reflect the complete
+    /// compact-log stream.
     fn finalize_and_end_remaining_open_actions(&mut self) {
         finalization::finalize_and_end_remaining_open_actions(self);
     }
@@ -850,13 +837,14 @@ impl OtelMapper {
         // Synthesise parent action spans for them.
         self.synthesise_orphan_actions(self.trace_policy.max_action_spans().saturating_sub(kept));
 
-        for t in std::mem::take(&mut self.deferred_targets) {
-            self.complete_target(&t.label, t.success, &t.file_set_ids, &t.tags, t.event_time_nanos);
+        let mut deferred: Vec<_> = std::mem::take(&mut self.deferred_targets).into_values().collect();
+        deferred.sort_by(|a, b| (a.event_time_nanos, &a.label).cmp(&(b.event_time_nanos, &b.label)));
+        for t in deferred {
+            self.complete_target(&t.label, t.success, &t.tags, t.event_time_nanos);
         }
 
         // Finalise action-level spawn summaries only after the tailer has
-        // fully drained, so late chunk arrivals cannot create false
-        // `bazel.action.spawn.missing=true` on parent action spans.
+        // fully drained, so late chunk arrivals still count.
         self.finalize_and_end_remaining_open_actions();
 
         // End any remaining target spans (lazily created but never completed).
@@ -866,7 +854,7 @@ impl OtelMapper {
                 cx.span().set_status(Status::Unset);
                 let is_synthetic = self.synthetic_target_labels.remove(&label);
                 let target_end = if is_synthetic {
-                    self.synthetic_target_end_nanos.remove(&label).or(effective_end)
+                    self.target_child_end_nanos.remove(&label).or(effective_end)
                 } else {
                     effective_end
                 };

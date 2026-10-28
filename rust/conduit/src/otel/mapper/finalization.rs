@@ -208,7 +208,7 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
         (Some(start), Some(end)) => Some(end.max(start)),
         (_, end) => end,
     };
-    mapper.record_synthetic_target_end(&parent_label, clamped_end);
+    mapper.record_target_child_end(&parent_label, clamped_end);
 
     let span_name = if key.mnemonic.is_empty() {
         format!("action {} (synth)", shorten_label(&key.target_label))
@@ -228,11 +228,7 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
         attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, key.mnemonic.clone()));
     }
     if !key.target_label.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, key.target_label.clone()));
-        attrs.push(KeyValue::new(
-            BAZEL_ACTION_LABEL_SHORT,
-            shorten_label(&key.target_label).to_string(),
-        ));
+        attrs.push(KeyValue::new(BAZEL_TARGET_LABEL, key.target_label.clone()));
     }
     if !key.primary_output.is_empty() {
         attrs.push(KeyValue::new(
