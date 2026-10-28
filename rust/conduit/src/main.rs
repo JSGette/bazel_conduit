@@ -7,7 +7,9 @@ use conduit_lib::grpc::run_server;
 use conduit_lib::otel::{
     ExportConfig, Exporter, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
 };
-use conduit_lib::state::{TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};
+use conduit_lib::state::{
+    TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
+};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -105,22 +107,24 @@ struct Common {
     #[arg(long, value_name = "MIB", default_value_t = 2048)]
     exec_log_max_decompressed_mib: u32,
 
-    /// Trace verbosity: `auto`, `lightweight`, or `full`.
+    /// Trace verbosity: `lightweight` (default) or `full`.
     ///
-    /// `full` emits a span per action/spawn/target (verbose, complete).
-    /// `lightweight` keeps only errors, cache misses, and operations at or
-    /// above `--trace-min-duration-ms`, while aggregate metrics stay on the
-    /// root span -- a large ingestion cut with full diagnostics for slow/failed
-    /// builds. `auto` (default) follows Bazel's
-    /// `--build_event_publish_all_actions`: present -> full, absent ->
-    /// lightweight.
-    #[arg(long, default_value = "auto")]
+    /// `full` emits a span per action/spawn/target. `lightweight` keeps
+    /// failed actions plus the `--max-action-spans` slowest successful ones,
+    /// and only the targets they belong to; aggregate metrics stay on the
+    /// root span either way.
+    #[arg(long, default_value = "lightweight")]
     trace_profile: String,
 
-    /// Minimum operation duration (ms) kept by the lightweight profile on
-    /// runtime alone. Errors and cache misses are kept regardless.
+    /// Lightweight only: minimum duration (ms) for a successful, cache-hit
+    /// spawn to keep its span. Failed and cache-missed spawns are kept.
     #[arg(long, default_value_t = DEFAULT_TRACE_MIN_DURATION_MS)]
     trace_min_duration_ms: i64,
+
+    /// Lightweight only: how many successful actions (the slowest) keep
+    /// their span per invocation.
+    #[arg(long, default_value_t = DEFAULT_MAX_ACTION_SPANS)]
+    max_action_spans: usize,
 }
 
 impl Common {
@@ -195,18 +199,18 @@ async fn main() -> anyhow::Result<()> {
 
     let trace_profile = TraceProfile::parse(&args.trace_profile).ok_or_else(|| {
         anyhow::anyhow!(
-            "invalid --trace-profile '{}' (expected auto, lightweight, or full)",
+            "invalid --trace-profile '{}' (expected lightweight or full)",
             args.trace_profile
         )
     })?;
-    info!(
-        "Trace profile: {} (lightweight threshold: {} ms)",
-        trace_profile.as_str(),
-        args.trace_min_duration_ms
+    let trace_policy = TracePolicy::new(
+        trace_profile,
+        args.trace_min_duration_ms,
+        args.max_action_spans,
     );
+    info!("Trace profile: {trace_policy}");
 
     let export = exporter.as_ref().map(|e| (e.tracer(), e.logger()));
-    let trace_min_duration_ms = args.trace_min_duration_ms;
     let exec_log = args.exec_log;
     let make_router = move || {
         let router = EventRouter::new()
@@ -214,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
             .with_redactor(redactor.clone())
             .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
             .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
-            .with_trace_profile(trace_profile, trace_min_duration_ms);
+            .with_trace_policy(trace_policy);
         match &export {
             Some((tracer, logger)) => router.with_export(tracer.clone(), logger.clone()),
             None => router,

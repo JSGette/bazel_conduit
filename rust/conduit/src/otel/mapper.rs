@@ -37,7 +37,8 @@
 
 use crate::otel::span::{Context, KeyValue, Logger, Span, SpanContext, SpanKind, Status, Tracer};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::time::{Duration, UNIX_EPOCH};
@@ -73,24 +74,78 @@ use self::utils::tail_byte_offset;
 
 pub use self::utils::{clamp_time_range, truncate_to_byte_limit};
 
-/// Arguments for [`OtelMapper::on_action_completed`].
-pub struct ActionCompletedEvent<'a> {
-    pub label: Option<&'a str>,
-    pub mnemonic: Option<&'a str>,
+/// Arguments for [`OtelMapper::on_action_completed`]. Owned, because the
+/// lightweight profile holds successful actions until [`OtelMapper::finish`].
+#[derive(Clone, Debug, Default)]
+pub struct ActionCompletedEvent {
+    pub label: Option<String>,
+    pub mnemonic: Option<String>,
     pub success: bool,
     pub exit_code: Option<i32>,
-    pub exit_code_name: Option<&'a str>,
-    pub primary_output: Option<&'a str>,
-    pub configuration: Option<&'a str>,
-    pub command_line: &'a [String],
-    pub stdout_path: Option<&'a str>,
-    pub stderr_path: Option<&'a str>,
+    pub exit_code_name: Option<String>,
+    pub primary_output: Option<String>,
+    pub configuration: Option<String>,
+    pub command_line: Vec<String>,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
     pub start_time_nanos: Option<i64>,
     pub end_time_nanos: Option<i64>,
     pub cached: Option<bool>,
-    pub hostname: Option<&'a str>,
-    pub cached_remotely: Option<bool>,
-    pub runner: Option<&'a str>,
+    pub runner: Option<String>,
+}
+
+impl ActionCompletedEvent {
+    fn key(&self) -> ActionSpanKey {
+        ActionSpanKey::new(
+            self.label.as_deref(),
+            self.mnemonic.as_deref(),
+            self.primary_output.as_deref(),
+        )
+    }
+}
+
+/// A successful action competing for the lightweight span budget, ordered by
+/// duration (untimed actions rank lowest) and then arrival.
+struct BudgetedAction {
+    duration_nanos: i64,
+    seq: u64,
+    event: ActionCompletedEvent,
+}
+
+impl BudgetedAction {
+    fn rank(&self) -> (i64, u64) {
+        (self.duration_nanos, self.seq)
+    }
+}
+
+impl PartialEq for BudgetedAction {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+
+impl Eq for BudgetedAction {}
+
+impl PartialOrd for BudgetedAction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BudgetedAction {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+/// A `TargetCompleted` held until [`OtelMapper::finish`] under the lightweight
+/// profile, so budgeted actions emitted there still find the target open.
+struct DeferredTarget {
+    label: String,
+    success: bool,
+    file_set_ids: Vec<String>,
+    tags: Vec<String>,
+    event_time_nanos: Option<i64>,
 }
 
 /// Arguments for [`OtelMapper::on_test_result`].
@@ -271,8 +326,6 @@ pub struct OtelMapper {
     /// Cached build patterns (for root span name).
     cached_patterns: Vec<String>,
 
-    /// Tracks how many child action spans each target has (for cached detection).
-    target_action_counts: HashMap<String, u32>,
     /// Tracks whether any action for a target was NOT a cache hit.
     target_has_non_cached_action: HashMap<String, bool>,
 
@@ -346,6 +399,10 @@ pub struct OtelMapper {
     /// `on_action_completed` flushes only its own key; remaining entries are
     /// synthesised at [`Self::finish`].
     pending_spawns: HashMap<ActionSpanKey, Vec<SpawnExec>>,
+    /// Other candidate keys of multi-output pending spawns -> the key they are
+    /// filed under, so an action whose primary output isn't the first one
+    /// still claims them.
+    pending_spawn_aliases: HashMap<ActionSpanKey, ActionSpanKey>,
 
     /// Count of SpawnExec entries received from the tailer. Surfaced as
     /// `bazel.exec_log.spawns_received` on the `tailer_finished` root-span
@@ -353,12 +410,20 @@ pub struct OtelMapper {
     /// without grep'ing conduit's logs.
     compact_spawns_received: u64,
 
-    /// Resolved trace emission policy. Consulted at every span choke point
-    /// (BEP actions in the router, spawns in [`Self::apply_spawn_to_action`],
-    /// orphan synthesis, and target completion) so a lightweight profile
-    /// actually stays lightweight. Defaults to permissive (`Full`) until the
-    /// router resolves it from CLI + Bazel options at `OptionsParsed`.
+    /// Trace emission policy, consulted at every span choke point (actions,
+    /// spawns in [`Self::apply_spawn_to_action`], orphan synthesis, and target
+    /// completion). `Full` until the router sets the CLI policy.
     trace_policy: crate::state::TracePolicy,
+
+    /// Lightweight only: successful actions, min-heap by duration, capped at
+    /// the policy's `max_action_spans`. Emitted at [`Self::finish`].
+    action_budget: BinaryHeap<Reverse<BudgetedAction>>,
+    action_seq: u64,
+    /// Keys of actions the budget dropped, so their exec-log spawns aren't
+    /// resurrected as orphans.
+    budget_dropped: HashSet<ActionSpanKey>,
+    /// Lightweight only: targets completed at [`Self::finish`].
+    deferred_targets: Vec<DeferredTarget>,
 
     /// Spans dropped by the lightweight profile, surfaced on the root span at
     /// [`Self::finish`] so operators can see how much volume was cut.
@@ -404,7 +469,6 @@ impl OtelMapper {
             configurations: HashMap::new(),
             cached_command: None,
             cached_patterns: Vec::new(),
-            target_action_counts: HashMap::new(),
             target_has_non_cached_action: HashMap::new(),
             progress_stderr: String::new(),
             progress_stdout: String::new(),
@@ -420,9 +484,18 @@ impl OtelMapper {
             exec_log_state: None,
             action_span_cache: HashMap::new(),
             pending_spawns: HashMap::new(),
+            pending_spawn_aliases: HashMap::new(),
             compact_spawns_received: 0,
             workspace_directory: None,
-            trace_policy: crate::state::TracePolicy::default(),
+            trace_policy: crate::state::TracePolicy::new(
+                crate::state::TraceProfile::Full,
+                crate::state::DEFAULT_TRACE_MIN_DURATION_MS,
+                crate::state::DEFAULT_MAX_ACTION_SPANS,
+            ),
+            action_budget: BinaryHeap::new(),
+            action_seq: 0,
+            budget_dropped: HashSet::new(),
+            deferred_targets: Vec::new(),
             suppressed_actions: 0,
             suppressed_spawns: 0,
             suppressed_targets: 0,
@@ -697,7 +770,6 @@ impl OtelMapper {
         self.configurations.clear();
         self.cached_command = None;
         self.cached_patterns.clear();
-        self.target_action_counts.clear();
         self.target_has_non_cached_action.clear();
         self.progress_stderr.clear();
         self.progress_stdout.clear();
@@ -714,40 +786,25 @@ impl OtelMapper {
         self.compact_streaming_active = false;
         self.action_span_cache.clear();
         self.pending_spawns.clear();
+        self.pending_spawn_aliases.clear();
         self.compact_spawns_received = 0;
         self.workspace_directory = None;
-        self.trace_policy = crate::state::TracePolicy::default();
+        self.action_budget.clear();
+        self.action_seq = 0;
+        self.budget_dropped.clear();
+        self.deferred_targets.clear();
         self.suppressed_actions = 0;
         self.suppressed_spawns = 0;
         self.suppressed_targets = 0;
     }
 
-    /// Record the resolved trace policy and mirror it onto the root span. The
-    /// legacy `bazel.action_mode` attribute is kept for dashboards that still
-    /// key off it.
+    /// Set the trace policy and mirror the profile onto the root span.
     pub fn set_trace_policy(&mut self, policy: crate::state::TracePolicy) {
         self.trace_policy = policy;
         self.set_root_attr(KeyValue::new(
             BAZEL_TRACE_PROFILE,
             policy.profile().as_str(),
         ));
-        self.set_root_attr(KeyValue::new(
-            BAZEL_TRACE_MIN_DURATION_MS,
-            policy.min_duration_ms(),
-        ));
-        let legacy = if policy.is_full() {
-            "full (all actions)"
-        } else {
-            "lightweight (errors, cache misses, slow ops)"
-        };
-        self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, legacy));
-    }
-
-    /// A BEP action span was dropped by the lightweight profile (counted for
-    /// the root-span summary). Called from the router, which owns the BEP
-    /// action gate.
-    pub fn note_suppressed_action(&mut self) {
-        self.suppressed_actions = self.suppressed_actions.saturating_add(1);
     }
 
     // =====================================================================
@@ -779,8 +836,8 @@ impl OtelMapper {
     /// `(target_label, mnemonic, primary_output)` to mirror the on-disk
     /// shape; emit child spawn spans under each synthetic parent and
     /// backfill the same curated attrs onto it.
-    fn synthesise_orphan_actions(&mut self) {
-        finalization::synthesise_orphan_actions(self);
+    fn synthesise_orphan_actions(&mut self, budget: usize) {
+        finalization::synthesise_orphan_actions(self, budget);
     }
 
     /// Finalize and end every action span still held open in
@@ -803,10 +860,19 @@ impl OtelMapper {
         // the tailer's mpsc when we get here.
         self.drain_and_stop_tailer();
 
+        // Budgeted and orphan actions go out before the (deferred) targets
+        // complete, so they find their target open and only targets left
+        // empty are suppressed.
+        let kept = self.emit_budgeted_actions();
+
         // Anything still buffered after the drain never matched a BEP
         // ActionExecuted (e.g. `--build_event_publish_all_actions=false`).
         // Synthesise parent action spans for them.
-        self.synthesise_orphan_actions();
+        self.synthesise_orphan_actions(self.trace_policy.max_action_spans().saturating_sub(kept));
+
+        for t in std::mem::take(&mut self.deferred_targets) {
+            self.complete_target(&t.label, t.success, &t.file_set_ids, &t.tags, t.event_time_nanos);
+        }
 
         // Finalise action-level spawn summaries only after the tailer has
         // fully drained, so late chunk arrivals cannot create false

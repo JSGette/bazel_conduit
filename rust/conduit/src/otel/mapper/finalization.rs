@@ -5,7 +5,6 @@ use crate::otel::span::{KeyValue, SpanKind};
 use super::super::attributes::*;
 use super::{nanos_to_system_time, shorten_label, spawn_time_range, ActionSpanInfo, ActionSpanKey, OtelMapper};
 use spawn_proto::tools::protos::SpawnExec;
-use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -60,13 +59,48 @@ pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) {
     mapper.add_root_event("bazel.exec_log.tailer_finished", attrs);
 }
 
-pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper) {
+/// `budget` is how many successful actions may still get a span under the
+/// lightweight profile; ignored under full.
+pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper, budget: usize) {
     if mapper.pending_spawns.is_empty() {
         return;
     }
-    let mut groups: HashMap<ActionSpanKey, Vec<SpawnExec>> = HashMap::new();
-    for (key, spawns) in mapper.pending_spawns.drain() {
-        groups.entry(key).or_default().extend(spawns);
+    let mut groups: Vec<(ActionSpanKey, Vec<SpawnExec>)> = Vec::new();
+    for (key, spawns) in std::mem::take(&mut mapper.pending_spawns) {
+        let dropped_by_budget = !mapper.budget_dropped.is_empty()
+            && spawns.iter().any(|s| {
+                crate::exec_log::spawn_exec_candidate_keys(s)
+                    .iter()
+                    .any(|k| mapper.budget_dropped.contains(k))
+            });
+        let spawns = if dropped_by_budget {
+            mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(spawns.len() as u64);
+            Vec::new()
+        } else {
+            retained_spawns(mapper, spawns)
+        };
+        if !spawns.is_empty() {
+            groups.push((key, spawns));
+        }
+    }
+    if !mapper.trace_policy.is_full() {
+        // Groups with a failed attempt bypass the budget, like failed actions;
+        // the rest compete by duration (ties broken by key for stable output).
+        let (mut kept, mut successes): (Vec<_>, Vec<_>) = groups
+            .into_iter()
+            .partition(|(_, spawns)| spawns.iter().any(|s| s.exit_code != 0));
+        successes.sort_by(|(ka, a), (kb, b)| {
+            group_duration(b).cmp(&group_duration(a)).then_with(|| {
+                (&ka.target_label, &ka.mnemonic, &ka.primary_output)
+                    .cmp(&(&kb.target_label, &kb.mnemonic, &kb.primary_output))
+            })
+        });
+        for (_, spawns) in successes.drain(budget.min(successes.len())..) {
+            mapper.suppressed_actions = mapper.suppressed_actions.saturating_add(1);
+            mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(spawns.len() as u64);
+        }
+        kept.extend(successes);
+        groups = kept;
     }
     let group_count = groups.len();
     for (key, spawns) in groups {
@@ -76,6 +110,45 @@ pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper) {
         groups = group_count,
         "Synthesised orphan action spans from unmatched compact-log spawns",
     );
+}
+
+/// Drop spawns the trace policy filters out, counting them for the root span.
+/// Without this the compact log would resurrect a synthetic action + spawn
+/// tree for every successful cache hit whose ActionExecuted never reached BEP.
+fn retained_spawns(mapper: &mut OtelMapper, spawns: Vec<SpawnExec>) -> Vec<SpawnExec> {
+    let total = spawns.len();
+    let spawns: Vec<SpawnExec> = spawns
+        .into_iter()
+        .filter(|s| {
+            let (exit_code, cache_hit, cacheable, duration_ms) =
+                crate::exec_log::spawn_trace_signal(s);
+            mapper
+                .trace_policy
+                .should_emit_spawn(exit_code, cache_hit, cacheable, duration_ms)
+        })
+        .collect();
+    let dropped = total - spawns.len();
+    mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(dropped as u64);
+    spawns
+}
+
+fn spawns_time_range(spawns: &[SpawnExec]) -> (Option<i64>, Option<i64>) {
+    spawns
+        .iter()
+        .filter_map(spawn_time_range)
+        .fold((None, None), |(s, e), (ns, ne)| {
+            (
+                Some(s.map_or(ns, |v: i64| v.min(ns))),
+                Some(e.map_or(ne, |v: i64| v.max(ne))),
+            )
+        })
+}
+
+fn group_duration(spawns: &[SpawnExec]) -> i64 {
+    match spawns_time_range(spawns) {
+        (Some(start), Some(end)) => (end - start).max(0),
+        _ => 0,
+    }
 }
 
 pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
@@ -101,39 +174,7 @@ pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
 }
 
 fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spawns: Vec<SpawnExec>) {
-    // Apply the trace policy first: drop uninteresting spawns and, when none
-    // survive, skip the whole group. This is the fix for the lightweight
-    // bypass -- otherwise the compact log resurrects a synthetic action +
-    // spawn tree for every successful cache hit whose ActionExecuted never
-    // reached BEP. Dropped spawns are counted for the root-span summary.
-    let total = spawns.len();
-    let spawns: Vec<SpawnExec> = spawns
-        .into_iter()
-        .filter(|s| {
-            let (exit_code, cache_hit, cacheable, duration_ms) =
-                crate::exec_log::spawn_trace_signal(s);
-            mapper
-                .trace_policy
-                .should_emit_spawn(exit_code, cache_hit, cacheable, duration_ms)
-        })
-        .collect();
-    let dropped = total - spawns.len();
-    if dropped > 0 {
-        mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(dropped as u64);
-    }
-    if spawns.is_empty() {
-        return;
-    }
-
-    let (raw_start, raw_end) = spawns
-        .iter()
-        .filter_map(spawn_time_range)
-        .fold((None::<i64>, None::<i64>), |(s, e), (ns, ne)| {
-            (
-                Some(s.map_or(ns, |v| v.min(ns))),
-                Some(e.map_or(ne, |v| v.max(ne))),
-            )
-        });
+    let (raw_start, raw_end) = spawns_time_range(&spawns);
     let (clamped_start, clamped_end) = mapper.clamp_to_invocation(raw_start, raw_end);
 
     let parent_label = spawns

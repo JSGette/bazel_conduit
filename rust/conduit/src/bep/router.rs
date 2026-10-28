@@ -19,7 +19,9 @@ use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
 use crate::otel::{ActionCompletedEvent, OtelMapper, Redactor, TestResultEvent};
-use crate::state::{TracePolicy, TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};
+use crate::state::{
+    TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
+};
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
@@ -110,23 +112,6 @@ struct OptionsParsedArgs {
     tool_tag: Option<String>,
 }
 
-struct ActionCompletedArgs {
-    label: Option<String>,
-    primary_output: Option<String>,
-    configuration: Option<String>,
-    success: bool,
-    mnemonic: Option<String>,
-    exit_code: Option<i32>,
-    exit_code_name: Option<String>,
-    command_line: Vec<String>,
-    stdout_path: Option<String>,
-    stderr_path: Option<String>,
-    start_time_nanos: Option<i64>,
-    end_time_nanos: Option<i64>,
-    cached: Option<bool>,
-    runner: Option<String>,
-}
-
 /// Per-invocation counts, logged when an invocation finalizes.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -135,7 +120,6 @@ pub struct Summary {
     pub exit_code: Option<i32>,
     pub targets: usize,
     pub failed_targets: usize,
-    /// Actions kept by the trace policy.
     pub actions: usize,
     pub failed_actions: usize,
     pub exec_log: Option<PathBuf>,
@@ -169,11 +153,6 @@ pub struct EventRouter {
     redactor: Redactor,
     exec_log_max_message_bytes: usize,
     exec_log_max_decompressed_bytes: usize,
-    /// Trace profile requested on the CLI. `Auto` (default) resolves against
-    /// Bazel's `--build_event_publish_all_actions` at `OptionsParsed`.
-    requested_profile: TraceProfile,
-    /// Minimum operation duration (ms) kept by the lightweight profile.
-    trace_min_duration_ms: i64,
     /// Tail Bazel's compact exec log when the build writes one (`--exec-log`).
     exec_log: bool,
     /// Latest wall time seen in BEP payloads; stands in for the BES event
@@ -186,14 +165,16 @@ impl EventRouter {
     pub fn new() -> Self {
         Self {
             summary: Summary::default(),
-            trace_policy: TracePolicy::default(),
+            trace_policy: TracePolicy::new(
+                TraceProfile::default(),
+                DEFAULT_TRACE_MIN_DURATION_MS,
+                DEFAULT_MAX_ACTION_SPANS,
+            ),
             mapper: None,
             redactor: Redactor::default_enabled(),
             exec_log_max_message_bytes: crate::exec_log::DEFAULT_EXECLOG_MAX_MESSAGE_BYTES,
             exec_log_max_decompressed_bytes:
                 crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
-            requested_profile: TraceProfile::default(),
-            trace_min_duration_ms: DEFAULT_TRACE_MIN_DURATION_MS,
             exec_log: false,
             bep_clock_nanos: None,
         }
@@ -206,12 +187,8 @@ impl EventRouter {
         self
     }
 
-    /// Set the requested trace profile and lightweight duration threshold.
-    /// Resolution against the Bazel flag happens per-invocation at
-    /// `OptionsParsed`.
-    pub fn with_trace_profile(mut self, profile: TraceProfile, min_duration_ms: i64) -> Self {
-        self.requested_profile = profile;
-        self.trace_min_duration_ms = min_duration_ms;
+    pub fn with_trace_policy(mut self, policy: TracePolicy) -> Self {
+        self.trace_policy = policy;
         self
     }
 
@@ -301,7 +278,6 @@ impl EventRouter {
         if let Some(mapper) = &mut self.mapper {
             mapper.reset();
         }
-        self.trace_policy = TracePolicy::default();
         self.summary = Summary {
             invocation_id: Some(args.uuid.clone()),
             command: Some(args.command.clone()),
@@ -323,6 +299,7 @@ impl EventRouter {
                 args.host.as_deref(),
                 args.user.as_deref(),
             );
+            mapper.set_trace_policy(self.trace_policy);
         }
     }
 
@@ -333,17 +310,6 @@ impl EventRouter {
             .chain(&args.explicit_cmd_line)
             .map(String::as_str)
             .collect();
-        let has_all_actions = has_publish_all_actions_flag(&all_options);
-        let policy = TracePolicy::resolve(
-            self.requested_profile,
-            self.trace_min_duration_ms,
-            has_all_actions,
-        );
-        self.trace_policy = policy;
-        if let Some(mapper) = &mut self.mapper {
-            mapper.set_trace_policy(policy);
-        }
-
         if self.exec_log {
             if let Some(path) = extract_exec_log(&all_options, self.mapper.as_mut()) {
                 self.summary.exec_log = Some(path.clone());
@@ -361,45 +327,13 @@ impl EventRouter {
         }
     }
 
-    fn apply_action_completed_event(&mut self, args: ActionCompletedArgs) {
-        let duration_ms = match (args.start_time_nanos, args.end_time_nanos) {
-            (Some(start), Some(end)) if end >= start => Some((end - start) / 1_000_000),
-            _ => None,
-        };
-        let should_process = self
-            .trace_policy
-            .should_emit_action(args.success, args.cached, duration_ms);
-        if !should_process {
-            if let Some(mapper) = &mut self.mapper {
-                mapper.note_suppressed_action();
-            }
-            return;
-        }
-
+    fn apply_action_completed_event(&mut self, ev: ActionCompletedEvent) {
         self.summary.actions += 1;
-        if !args.success {
+        if !ev.success {
             self.summary.failed_actions += 1;
         }
-
         if let Some(mapper) = &mut self.mapper {
-            mapper.on_action_completed(&ActionCompletedEvent {
-                label: args.label.as_deref(),
-                mnemonic: args.mnemonic.as_deref(),
-                success: args.success,
-                exit_code: args.exit_code,
-                exit_code_name: args.exit_code_name.as_deref(),
-                primary_output: args.primary_output.as_deref(),
-                configuration: args.configuration.as_deref(),
-                command_line: &args.command_line,
-                stdout_path: args.stdout_path.as_deref(),
-                stderr_path: args.stderr_path.as_deref(),
-                start_time_nanos: args.start_time_nanos,
-                end_time_nanos: args.end_time_nanos,
-                cached: args.cached,
-                hostname: None,
-                cached_remotely: None,
-                runner: args.runner.as_deref(),
-            });
+            mapper.on_action_completed(ev);
         }
     }
 
@@ -658,7 +592,7 @@ impl EventRouter {
                             .iter()
                             .map(|a| (a.type_url.as_str(), &a.value[..])),
                     );
-                    self.apply_action_completed_event(ActionCompletedArgs {
+                    self.apply_action_completed_event(ActionCompletedEvent {
                         label: Some(a.label.clone()),
                         primary_output: Some(a.primary_output.clone()),
                         configuration,
@@ -888,27 +822,6 @@ fn payload_time_nanos(event: &BuildEvent) -> Option<i64> {
     Some(ts.seconds * 1_000_000_000 + i64::from(ts.nanos))
 }
 
-/// Check for --build_event_publish_all_actions with exact matching.
-/// Explicitly rejects --nobuild_event_publish_all_actions* and =false/=0 to avoid false positives.
-fn has_publish_all_actions_flag(options: &[&str]) -> bool {
-    let mut seen_on = false;
-    for opt in options {
-        if opt.starts_with("--nobuild_event_publish_all_actions")
-            || *opt == "--build_event_publish_all_actions=false"
-            || *opt == "--build_event_publish_all_actions=0"
-        {
-            return false;
-        }
-        if *opt == "--build_event_publish_all_actions"
-            || *opt == "--build_event_publish_all_actions=true"
-            || *opt == "--build_event_publish_all_actions=1"
-        {
-            seen_on = true;
-        }
-    }
-    seen_on
-}
-
 /// Return a short name for the BEP event type (for diagnostic logging).
 fn bep_event_type_name(id: &crate::build_event_stream::build_event_id::Id) -> &'static str {
     use crate::build_event_stream::build_event_id::Id;
@@ -992,42 +905,70 @@ mod tests {
     }
 
     #[test]
-    fn lightweight_keeps_fast_action_only_on_cache_miss() {
+    fn cli_policy_budgets_successful_actions() {
         use crate::build_event_stream::build_event::Payload;
         use crate::build_event_stream::build_event_id::{ActionCompletedId, Id};
-        use crate::build_event_stream::{ActionExecuted, BuildEvent, BuildEventId};
-        use crate::state::TraceProfile;
+        use crate::build_event_stream::{ActionExecuted, BuildEvent, BuildEventId, BuildStarted};
+        use crate::otel::span::{Sink, Tracer};
+        use crate::otel::OtelMapper;
+        use crate::state::{TracePolicy, TraceProfile};
 
-        let action = |cache_hit: bool| {
-            let mut act = ActionExecuted {
-                success: true,
-                ..Default::default()
-            };
-            act.strategy_details.push(Default::default());
-            let any = act.strategy_details.last_mut().unwrap();
-            any.type_url = SPAWN_URL.into();
-            any.value = spawn("remote", cache_hit).into();
-            BuildEvent {
-                id: Some(BuildEventId {
-                    id: Some(Id::ActionCompleted(ActionCompletedId::default())),
-                }),
-                payload: Some(Payload::Action(act)),
-                ..Default::default()
-            }
+        let ts = |seconds: i64| spawn_proto::timestamp_proto::google::protobuf::Timestamp {
+            seconds,
+            nanos: 0,
         };
-        let mut router = super::EventRouter::new().with_trace_profile(TraceProfile::Lightweight, 500);
-        let options = BuildEvent {
+        let action = |label: &str, success: bool, secs: i64| BuildEvent {
             id: Some(BuildEventId {
-                id: Some(Id::OptionsParsed(Default::default())),
+                id: Some(Id::ActionCompleted(ActionCompletedId {
+                    label: label.into(),
+                    ..Default::default()
+                })),
             }),
-            payload: Some(Payload::OptionsParsed(Default::default())),
+            payload: Some(Payload::Action(ActionExecuted {
+                success,
+                r#type: "Genrule".into(),
+                start_time: Some(ts(100)),
+                end_time: Some(ts(100 + secs)),
+                ..Default::default()
+            })),
             ..Default::default()
         };
-        router.route_build_event(&options, None).unwrap();
-        router.route_build_event(&action(true), None).unwrap();
-        assert_eq!(router.summary().actions, 0);
-        router.route_build_event(&action(false), None).unwrap();
-        assert_eq!(router.summary().actions, 1);
+        let started = BuildEvent {
+            id: Some(BuildEventId {
+                id: Some(Id::Started(Default::default())),
+            }),
+            payload: Some(Payload::Started(BuildStarted {
+                uuid: "u".into(),
+                command: "build".into(),
+                start_time: Some(ts(100)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let (sink, spans) = Sink::memory();
+        let mut router = super::EventRouter::new()
+            .with_mapper(OtelMapper::new(Tracer::new(sink), None))
+            .with_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 1));
+        router.route_build_event(&started, None).unwrap();
+        for ev in [
+            action("//:fast", true, 1),
+            action("//:slow", true, 5),
+            action("//:broken", false, 1),
+        ] {
+            router.route_build_event(&ev, None).unwrap();
+        }
+        router.finish();
+
+        assert_eq!(router.summary().actions, 3);
+        let mut names: Vec<String> = spans
+            .snapshot()
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .filter(|n| n.starts_with("action "))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["action Genrule //:broken", "action Genrule //:slow"]);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 #
 # Usage: run_full_trace_scenario.sh [target] [profile] [port]
 #   target  : bazel target to build   (default: //rust/conduit:conduit_lib)
-#   profile : auto|lightweight|full   (default: full)
+#   profile : lightweight|full   (default: full)
 #   port    : BES gRPC port           (default: 8130)
 
 set -euo pipefail

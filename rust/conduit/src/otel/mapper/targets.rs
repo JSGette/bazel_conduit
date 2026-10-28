@@ -9,7 +9,9 @@ use std::time::SystemTime;
 use tracing::{debug, warn};
 
 use super::super::attributes::*;
-use super::{bytestream_uri_to_display, ConfiguredTarget, NamedSetEntry, OtelMapper};
+use super::{
+    bytestream_uri_to_display, ConfiguredTarget, DeferredTarget, NamedSetEntry, OtelMapper,
+};
 
 impl OtelMapper {
     /// TargetConfigured -> store metadata for deferred span creation.
@@ -203,10 +205,8 @@ impl OtelMapper {
         Context::new().with_span(span)
     }
 
-    /// TargetCompleted -> create (or reuse) the target span, set attributes,
-    /// resolve output file sets from whatever's currently in the
-    /// `NamedSet` cache (`resolve_files` skips missing IDs), and end the
-    /// span synchronously.
+    /// TargetCompleted. Under the lightweight profile targets wait for
+    /// [`OtelMapper::finish`], where the action budget is settled.
     pub fn on_target_completed(
         &mut self,
         label: &str,
@@ -215,6 +215,29 @@ impl OtelMapper {
         tags: &[String],
         event_time_nanos: Option<i64>,
     ) {
+        if !self.trace_policy.is_full() {
+            self.deferred_targets.push(DeferredTarget {
+                label: label.to_string(),
+                success,
+                file_set_ids: file_set_ids.to_vec(),
+                tags: tags.to_vec(),
+                event_time_nanos,
+            });
+            return;
+        }
+        self.complete_target(label, success, file_set_ids, tags, event_time_nanos);
+    }
+
+    pub(super) fn complete_target(
+        &mut self,
+        label: &str,
+        success: bool,
+        file_set_ids: &[String],
+        tags: &[String],
+        event_time_nanos: Option<i64>,
+    ) {
+        // Create (or reuse) the target span, resolve output file sets from the
+        // `NamedSet` cache (`resolve_files` skips missing IDs), and end it.
         // Drain any spawns that flushed between the last ActionExecuted and
         // this TargetCompleted; they need to land on the action span before
         // `end_open_actions_for_target` seals it.

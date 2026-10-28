@@ -5,12 +5,11 @@ use crate::otel::span::{KeyValue, Status};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-
 use super::super::attributes::*;
 use super::{shorten_label, truncate_to_byte_limit, ActionCompletedEvent, Redactor, COMMAND_LINE_CAP_BYTES};
 
-pub(super) fn build_action_span_name(ev: &ActionCompletedEvent<'_>) -> String {
-    match (ev.label, ev.mnemonic) {
+pub(super) fn build_action_span_name(ev: &ActionCompletedEvent) -> String {
+    match (ev.label.as_deref(), ev.mnemonic.as_deref()) {
         (Some(label), Some(mnemonic)) => format!("action {mnemonic} {}", shorten_label(label)),
         (Some(label), None) => format!("action {}", shorten_label(label)),
         (None, Some(mnemonic)) => format!("action {mnemonic}"),
@@ -29,56 +28,50 @@ pub(super) fn action_status(success: bool) -> Status {
 }
 
 pub(super) fn build_action_attrs(
-    ev: &ActionCompletedEvent<'_>,
+    ev: &ActionCompletedEvent,
     configurations: &HashMap<String, String>,
     redactor: &Redactor,
 ) -> Vec<KeyValue> {
     let mut attrs = vec![KeyValue::new(BAZEL_ACTION_SUCCESS, ev.success)];
 
-    if let Some(v) = ev.mnemonic {
+    if let Some(v) = ev.mnemonic.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, v.to_string()));
     }
     if let Some(v) = ev.exit_code {
         attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE, i64::from(v)));
     }
-    if let Some(v) = ev.exit_code_name.filter(|s| !s.is_empty()) {
+    if let Some(v) = ev.exit_code_name.as_deref().filter(|s| !s.is_empty()) {
         attrs.push(KeyValue::new(BAZEL_ACTION_EXIT_CODE_NAME, v.to_string()));
     }
     if let Some(v) = ev.cached {
         attrs.push(KeyValue::new(BAZEL_ACTION_CACHED, v));
     }
-    if let Some(v) = ev.hostname.filter(|s| !s.is_empty()) {
-        attrs.push(KeyValue::new(BAZEL_ACTION_HOSTNAME, v.to_string()));
-    }
-    if let Some(v) = ev.cached_remotely {
-        attrs.push(KeyValue::new(BAZEL_ACTION_CACHED_REMOTELY, v));
-    }
-    if let Some(v) = ev.runner.filter(|s| !s.is_empty()) {
+    if let Some(v) = ev.runner.as_deref().filter(|s| !s.is_empty()) {
         attrs.push(KeyValue::new(BAZEL_ACTION_RUNNER, v.to_string()));
     }
-    if let Some(v) = ev.primary_output {
+    if let Some(v) = ev.primary_output.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_PRIMARY_OUTPUT, v.to_string()));
     }
-    if let Some(v) = ev.label {
+    if let Some(v) = ev.label.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, v.to_string()));
         attrs.push(KeyValue::new(BAZEL_ACTION_LABEL_SHORT, shorten_label(v).to_string()));
     }
-    if let Some(cfg) = ev.configuration {
+    if let Some(cfg) = ev.configuration.as_deref() {
         let display_val = configurations
             .get(cfg)
             .map_or_else(|| cfg.to_string(), Clone::clone);
         attrs.push(KeyValue::new(BAZEL_ACTION_CONFIGURATION, display_val));
     }
     if !ev.command_line.is_empty() {
-        let scrubbed = redactor.scrub_args(ev.command_line);
+        let scrubbed = redactor.scrub_args(&ev.command_line);
         let joined = scrubbed.join(" ");
         let capped = truncate_to_byte_limit(&joined, COMMAND_LINE_CAP_BYTES, "...(truncated)");
         attrs.push(KeyValue::new(BAZEL_ACTION_COMMAND_LINE, capped));
     }
-    if let Some(v) = ev.stdout_path {
+    if let Some(v) = ev.stdout_path.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_STDOUT, v.to_string()));
     }
-    if let Some(v) = ev.stderr_path {
+    if let Some(v) = ev.stderr_path.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_STDERR, v.to_string()));
     }
 

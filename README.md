@@ -130,8 +130,9 @@ and `--port`, which are `serve`-only.
 | `--exec-log` | Tail Bazel's compact execution log for per-spawn detail. Without it, conduit ignores the exec log even when the build writes one. | off |
 | `--exec-log-max-message-mib <MIB>` | Per-message cap on length-delimited entries in Bazel's `--execution_log_compact_file`. Prevents a malformed varint length prefix from OOM'ing the parser. | `64` |
 | `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
-| `--trace-profile <PROFILE>` | Trace verbosity: `auto`, `lightweight`, or `full`. See [Trace Profiles](#trace-profiles). | `auto` |
-| `--trace-min-duration-ms <MS>` | Minimum operation duration kept by the lightweight profile on runtime alone (errors and cache misses are kept regardless). | `500` |
+| `--trace-profile <PROFILE>` | Trace verbosity: `lightweight` or `full`. See [Trace Profiles](#trace-profiles). | `lightweight` |
+| `--max-action-spans <N>` | Lightweight: how many successful actions (the slowest) keep a span per invocation. | `200` |
+| `--trace-min-duration-ms <MS>` | Lightweight: minimum duration for a successful cache-hit spawn to keep a span. | `500` |
 
 ### Secret Redaction
 
@@ -213,11 +214,10 @@ diagnostic value. The trace profile controls how much of that survives, at
 every emission point (BEP actions, exec-log spawns, orphan-synthesised
 actions, and empty targets):
 
-| Profile | Selected by | Behavior |
-|---------|-------------|----------|
-| **full** | `--trace-profile=full`, or `auto` + `--build_event_publish_all_actions` | Every action, spawn, and target gets a span. Verbose but complete. |
-| **lightweight** | `--trace-profile=lightweight`, or `auto` without the Bazel flag | Keeps only spans that carry signal: errors, cacheable cache **misses**, and operations at or above `--trace-min-duration-ms` (500 ms default). Successful fast cache hits are dropped. |
-| **auto** (default) | `--trace-profile=auto` | Follows Bazel's `--build_event_publish_all_actions`: present → full, absent → lightweight. Keeps existing setups working. |
+| Profile | Behavior |
+|---------|----------|
+| **lightweight** (default) | Keeps failed actions plus the `--max-action-spans` slowest successful ones (200 default), only the targets those belong to, and exec-log spawns that fail, miss the cache, or take at least `--trace-min-duration-ms` (500 ms default). Successful actions are held until the invocation ends, so their spans export then. |
+| **full** | Every action, spawn, and target gets a span. Verbose but complete. |
 
 Regardless of profile, all aggregate `BuildMetrics` (cache hit/miss counts,
 per-mnemonic action counts, timings, artifact/memory metrics) stay on the
@@ -247,9 +247,8 @@ primary lever; layer sampling/retention on top if needed:
   invocations, cache misses), not ingestion — use them to control storage
   cost after ingestion is already trimmed.
 
-Suggested rollout: run `auto` (or `lightweight`) and compare
-`bazel.trace.suppressed_*` against total spans, make lightweight the
-operational default, switch to `full` temporarily for deep debugging, then
+Suggested rollout: run `lightweight` and compare
+`bazel.trace.suppressed_*` against total spans, switch to `full` temporarily for deep debugging, then
 apply 10–25% head sampling if volume is still high.
 
 ### Execution Log Enrichment (live tailed)

@@ -12,11 +12,9 @@ pub const BAZEL_COMMAND_LINE: &str = "bazel.command_line";
 pub const BAZEL_PATTERNS: &str = "bazel.patterns";
 pub const BAZEL_EXIT_CODE: &str = "bazel.exit_code";
 pub const BAZEL_EXIT_CODE_NAME: &str = "bazel.exit_code_name";
-pub const BAZEL_ACTION_MODE: &str = "bazel.action_mode";
 
-// Trace emission policy (set on root span from the resolved TracePolicy).
+// Trace emission policy (set on root span from the TracePolicy).
 pub const BAZEL_TRACE_PROFILE: &str = "bazel.trace.profile";
-pub const BAZEL_TRACE_MIN_DURATION_MS: &str = "bazel.trace.min_duration_ms";
 // Counts of spans dropped by the lightweight profile, for volume visibility.
 pub const BAZEL_TRACE_SUPPRESSED_ACTIONS: &str = "bazel.trace.suppressed_actions";
 pub const BAZEL_TRACE_SUPPRESSED_SPAWNS: &str = "bazel.trace.suppressed_spawns";

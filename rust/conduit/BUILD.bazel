@@ -104,14 +104,6 @@ rust_test(
 )
 
 rust_test(
-    name = "action_mode_tests",
-    srcs = ["tests/action_mode_tests.rs"],
-    deps = [
-        ":conduit_lib",
-    ],
-)
-
-rust_test(
     name = "router_tests",
     srcs = ["tests/router_tests.rs"],
     deps = [

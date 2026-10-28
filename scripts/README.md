@@ -109,7 +109,7 @@ build --build_event_publish_all_actions
 
 `bes_backend` points at the conduit gRPC server (default port `8080`). For per-spawn detail (commands, cache hits, timing breakdown), also set `execution_log_compact_file` and start conduit with `--exec-log` (`CONDUIT_EXEC_LOG=/tmp/conduit-exec.log` does both in `setup_datadog_agent.sh`).
 
-Bazel builds emit tens of thousands of spans, mostly fast cache hits. By default conduit runs in `auto` trace profile: with `--build_event_publish_all_actions` it emits everything (`full`), without it emits a `lightweight` trace (errors, cache misses, and operations >= 500 ms), which is a large ingestion cut with full diagnostics for slow/failed builds. Pin it with `--trace-profile lightweight|full` and tune `--trace-min-duration-ms`. See the [Trace Profiles](../README.md#trace-profiles) section for the ingestion-reduction rollout (including agent-side sampling and retention filters).
+Bazel builds emit tens of thousands of spans, mostly fast cache hits. By default conduit emits a `lightweight` trace: failed actions plus the 200 slowest successful ones, and only failing, cache-missed, or slow (>= 500 ms) spawns. Use `--trace-profile full` for everything, and tune `--max-action-spans` and `--trace-min-duration-ms`. See the [Trace Profiles](../README.md#trace-profiles) section for the ingestion-reduction rollout (including agent-side sampling and retention filters).
 
 ---
 

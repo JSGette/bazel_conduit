@@ -5,4 +5,6 @@
 
 mod trace_profile;
 
-pub use trace_profile::{TracePolicy, TraceProfile, DEFAULT_TRACE_MIN_DURATION_MS};
+pub use trace_profile::{
+    TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
+};

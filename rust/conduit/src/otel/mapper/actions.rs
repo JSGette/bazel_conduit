@@ -7,23 +7,68 @@ use tracing::{debug, warn};
 
 use super::super::attributes::*;
 use super::{action_status, build_action_attrs, build_action_span_name};
-use super::{clamp_time_range, ActionCompletedEvent, ActionSpanInfo, ActionSpanKey, OpenAction, OtelMapper};
+use super::{
+    clamp_time_range, ActionCompletedEvent, ActionSpanInfo, ActionSpanKey, BudgetedAction,
+    OpenAction, OtelMapper,
+};
+use std::cmp::Reverse;
 
 impl OtelMapper {
-    /// ActionCompleted -> create `action {mnemonic} {label}` span. With the
-    /// compact exec log enabled the span is kept open so arriving spawns can
-    /// backfill attrs onto it; without it the span ends here as today.
-    ///
-    /// In **lightweight** mode only failed actions reach this method.
-    /// In **full** mode every action (success or failure) is mapped.
-    ///
-    /// When `start_time_nanos` / `end_time_nanos` are available (from the
-    /// `ActionExecuted.start_time` / `end_time` proto fields) they are used
-    /// for accurate span timing.
-    pub fn on_action_completed(&mut self, ev: &ActionCompletedEvent<'_>) {
+    /// ActionCompleted. Failed actions (and every action under the full
+    /// profile) become spans now; successful ones under lightweight compete
+    /// for the span budget and the slowest are emitted at [`Self::finish`].
+    pub fn on_action_completed(&mut self, ev: ActionCompletedEvent) {
+        if let Some(l) = &ev.label {
+            if ev.cached == Some(false) {
+                self.target_has_non_cached_action.insert(l.clone(), true);
+            }
+        }
+        if !ev.success || self.trace_policy.is_full() {
+            self.emit_action(&ev);
+            return;
+        }
+        let duration_nanos = match (ev.start_time_nanos, ev.end_time_nanos) {
+            (Some(start), Some(end)) => (end - start).max(0),
+            _ => 0,
+        };
+        self.action_seq += 1;
+        self.action_budget.push(Reverse(BudgetedAction {
+            duration_nanos,
+            seq: self.action_seq,
+            event: ev,
+        }));
+        if self.action_budget.len() > self.trace_policy.max_action_spans() {
+            if let Some(Reverse(dropped)) = self.action_budget.pop() {
+                self.suppressed_actions = self.suppressed_actions.saturating_add(1);
+                if self.compact_streaming_active {
+                    self.budget_dropped.insert(dropped.event.key());
+                }
+            }
+        }
+    }
+
+    /// Emit the actions that survived the budget, earliest first so each
+    /// target span opens at its first kept action.
+    pub(super) fn emit_budgeted_actions(&mut self) -> usize {
+        let mut kept: Vec<ActionCompletedEvent> = std::mem::take(&mut self.action_budget)
+            .into_iter()
+            .map(|Reverse(b)| b.event)
+            .collect();
+        kept.sort_by_key(|ev| ev.start_time_nanos.or(ev.end_time_nanos));
+        for ev in &kept {
+            self.emit_action(ev);
+        }
+        kept.len()
+    }
+
+    /// Create the `action {mnemonic} {label}` span. With the compact exec log
+    /// enabled the span is kept open so arriving spawns can backfill attrs
+    /// onto it; without it the span ends here.
+    fn emit_action(&mut self, ev: &ActionCompletedEvent) {
         // Drain whatever the tailer has produced so far. Cheap; runs the
         // backfill against actions that already landed in the cache.
         self.pump_compact_spawns();
+        let label = ev.label.as_deref();
 
         // Clamp action timing before creating a synthetic target so its
         // lifecycle can use the same child bounds.
@@ -33,7 +78,7 @@ impl OtelMapper {
             self.root_span_start_nanos,
             self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
         );
-        let parent = match ev.label {
+        let parent = match label {
             Some(label) => self
                 .target_parent_context(label, clamped_start)
                 .or_else(|| self.root_context.clone()),
@@ -50,30 +95,22 @@ impl OtelMapper {
         // clamp up to the parent target's start: a cache-hit target span may be
         // created at TargetComplete (later) than an action that really began
         // near the build start, which would push the child before its parent.
-        let target_start = ev.label.and_then(|l| self.target_start_for(l));
+        let target_start = label.and_then(|l| self.target_start_for(l));
         let clamped_start = match (clamped_start.or(clamped_end), target_start) {
             (Some(start), Some(parent_start)) => Some(start.max(parent_start)),
             (start, parent_start) => start.or(parent_start),
         };
 
-        if let Some(label) = ev.label {
+        if let Some(label) = label {
             self.record_synthetic_target_end(label, clamped_end);
-        }
-
-        // Track action for cached-target detection.
-        if let Some(l) = ev.label {
-            *self.target_action_counts.entry(l.to_string()).or_insert(0) += 1;
-            if ev.cached == Some(false) {
-                self.target_has_non_cached_action.insert(l.to_string(), true);
-            }
         }
 
         let span_name = build_action_span_name(ev);
         let attrs = build_action_attrs(ev, &self.configurations, &self.redactor);
         let status = action_status(ev.success);
 
-        let key = ActionSpanKey::new(ev.label, ev.mnemonic, ev.primary_output);
-        let target_label = ev.label.map(str::to_string).unwrap_or_default();
+        let key = ev.key();
+        let target_label = label.unwrap_or_default().to_string();
         let defer_end = self.compact_streaming_active;
 
         let mut span =
@@ -119,7 +156,7 @@ impl OtelMapper {
 
         debug!(
             success = ev.success,
-            label = ?ev.label,
+            label = ?label,
             defer_end,
             "Recorded action span",
         );
@@ -205,24 +242,23 @@ impl OtelMapper {
     }
 
     fn push_pending_spawn(&mut self, spawn: SpawnExec) {
-        let key = crate::exec_log::spawn_exec_candidate_keys(&spawn)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                ActionSpanKey::new(
-                    Some(spawn.target_label.as_str()),
-                    Some(spawn.mnemonic.as_str()),
-                    Some(""),
-                )
-            });
+        let mut keys = crate::exec_log::spawn_exec_candidate_keys(&spawn).into_iter();
+        let key = keys.next().expect("candidate keys are never empty");
+        for alias in keys {
+            self.pending_spawn_aliases.insert(alias, key.clone());
+        }
         self.pending_spawns.entry(key).or_default().push(spawn);
     }
 
     /// Move buffered spawns for `key` from [`Self::pending_spawns`] into the
     /// action cache once ActionExecuted has arrived.
     fn flush_pending_spawns_for_action(&mut self, key: &ActionSpanKey) {
-        let Some(matched) = self.pending_spawns.remove(key) else {
-            return;
+        let matched = match self.pending_spawns.remove(key) {
+            Some(matched) => matched,
+            None => match self.pending_spawn_aliases.remove(key) {
+                Some(filed) => self.pending_spawns.remove(&filed).unwrap_or_default(),
+                None => return,
+            },
         };
         for spawn in matched {
             self.apply_spawn_to_action(key, spawn);

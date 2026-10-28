@@ -107,8 +107,7 @@ Emission is governed by a single `TracePolicy` (`rust/conduit/src/state/trace_pr
 | Profile | Behavior |
 |---------|----------|
 | `full` | Every action / spawn / target span. |
-| `lightweight` | Only signal-bearing spans: errors, cacheable cache misses, and operations at or above `--trace-min-duration-ms`. Aggregate metrics stay on the root span. |
-| `auto` (default) | Follows Bazel `--build_event_publish_all_actions`: present → full, absent → lightweight. |
+| `lightweight` (default) | Keeps failed actions plus the `--max-action-spans` slowest successful ones (200 default), only the targets those belong to, and exec-log spawns that fail, miss the cache, or take at least `--trace-min-duration-ms` (500 ms default). Aggregate metrics stay on the root span. |
 
 Fetch/test spans are always emitted; `Progress` becomes correlated log records, never spans.
 
@@ -122,8 +121,9 @@ See the [README CLI Flags table](README.md#cli-flags) for the authoritative list
 | `replay <FILE>` | Read a binary BEP file (`--build_event_binary_file`) | - |
 | `--export <MODE>` | `none`, `stdout`, `otlp` | `none` |
 | `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
-| `--trace-profile <PROFILE>` | `auto`, `lightweight`, `full` | `auto` |
-| `--trace-min-duration-ms <MS>` | Lightweight duration threshold | `500` |
+| `--trace-profile <PROFILE>` | `lightweight`, `full` | `lightweight` |
+| `--max-action-spans <N>` | Lightweight successful-action budget | `200` |
+| `--trace-min-duration-ms <MS>` | Lightweight spawn duration threshold | `500` |
 | `--log-level <LEVEL>` | Log verbosity | `info` |
 
 ## Minimal MVP

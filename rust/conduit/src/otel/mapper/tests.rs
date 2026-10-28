@@ -241,7 +241,7 @@ fn target_completed_clears_configured_after_lazy_target_span_creation() {
     assert!(mapper.configured_targets.contains_key("//pkg:lazy"));
 
     // Action arrival lazily creates target context before TargetCompleted.
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:lazy",
         "CppCompile",
         "bazel-out/lazy.o",
@@ -266,7 +266,7 @@ fn action_only_target_creates_persistent_synthetic_parent_context() {
     mapper.on_build_started("uuid-1", "build", Some(1_000_000_000), None);
 
     let label = "@@repo//pkg:external";
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         label,
         "GoCompile",
         "bazel-out/external.a",
@@ -288,7 +288,7 @@ fn action_after_target_completion_reopens_as_synthetic_parent() {
     mapper.on_target_completed("//pkg:late", true, &[], &[], Some(1_200_000_000));
     assert!(mapper.closed_targets.contains("//pkg:late"));
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:late",
         "CppCompile",
         "bazel-out/late.o",
@@ -472,28 +472,17 @@ fn spawn_exec_with_metrics(
     }
 }
 
-fn action_event_for<'a>(
-    label: &'a str,
-    mnemonic: &'a str,
-    output: &'a str,
-) -> ActionCompletedEvent<'a> {
+fn action_event_for(label: &str, mnemonic: &str, output: &str) -> ActionCompletedEvent {
     ActionCompletedEvent {
-        label: Some(label),
-        mnemonic: Some(mnemonic),
+        label: Some(label.into()),
+        mnemonic: Some(mnemonic.into()),
         success: true,
         exit_code: Some(0),
-        exit_code_name: None,
-        primary_output: Some(output),
-        configuration: None,
-        command_line: &[],
-        stdout_path: None,
-        stderr_path: None,
+        primary_output: Some(output.into()),
         start_time_nanos: Some(1_000_000_000),
         end_time_nanos: Some(1_500_000_000),
         cached: Some(false),
-        hostname: None,
-        cached_remotely: None,
-        runner: None,
+        ..Default::default()
     }
 }
 
@@ -518,7 +507,7 @@ fn cache_hit_single_spawn_backfills_action_span() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.compact_streaming_active = true;
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:foo",
         "CppCompile",
         "bazel-out/foo.o",
@@ -572,7 +561,7 @@ fn two_attempt_retry_backfills_first_only() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.compact_streaming_active = true;
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:bar",
         "GoCompile",
         "bazel-out/bar.a",
@@ -631,7 +620,7 @@ fn buffered_spawn_flushes_when_action_arrives() {
         "remote",
         false,
     ));
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:pre",
         "RustCompile",
         "bazel-out/pre.rlib",
@@ -711,7 +700,7 @@ fn bep_only_action_marked_spawn_missing() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.compact_streaming_active = true;
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:bep_only",
         "GenRule",
         "bazel-out/bep_only.txt",
@@ -744,7 +733,7 @@ fn late_spawn_before_finish_clears_missing() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.compact_streaming_active = true;
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:late",
         "CppCompile",
         "bazel-out/late.o",
@@ -780,7 +769,7 @@ fn cached_spawn_chain_is_nested_inside_root_window() {
     mapper.root_span_end_from_wall_nanos = Some(invocation_start + 2_000_000_000);
     mapper.compact_streaming_active = true;
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:cached",
         "GoCompilePkg",
         "bazel-out/cached.a",
@@ -833,7 +822,7 @@ fn instantaneous_action_does_not_stretch_synthetic_target_to_build_end() {
         "bazel-out/cached.a",
     );
     action.end_time_nanos = action.start_time_nanos;
-    mapper.on_action_completed(&action);
+    mapper.on_action_completed(action);
     mapper.finish();
 
     let spans = collector.snapshot();
@@ -946,7 +935,224 @@ fn exec_log_emits_skipped_event_when_workspace_missing() {
 // =====================================================================
 
 fn lightweight(mapper: &mut OtelMapper) {
-    mapper.set_trace_policy(TracePolicy::resolve(TraceProfile::Lightweight, 500, false));
+    mapper.set_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 200));
+}
+
+/// A spawn the lightweight filter keeps on its own: a cacheable cache miss.
+fn missed_spawn(target: &str, output: &str) -> SpawnExec {
+    SpawnExec {
+        cacheable: true,
+        ..spawn_exec_with_metrics(target, "CppCompile", output, "local", false)
+    }
+}
+
+fn timed_action(label: &str, success: bool, millis: i64) -> ActionCompletedEvent {
+    ActionCompletedEvent {
+        success,
+        end_time_nanos: Some(1_000_000_000 + millis * 1_000_000),
+        ..action_event_for(label, "Genrule", &format!("bazel-out/{}", &label[2..]))
+    }
+}
+
+fn action_names(spans: &[SpanData]) -> Vec<String> {
+    let mut names: Vec<String> = spans
+        .iter()
+        .filter(|s| s.name.starts_with("action "))
+        .map(|s| s.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Successful actions compete for the budget (the slowest win, untimed rank
+/// lowest); failures bypass it. Dropped actions are counted on the root.
+#[test]
+fn lightweight_budget_keeps_slowest_successes_and_all_failures() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.set_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 2));
+
+    mapper.on_action_completed(timed_action("//:a", true, 30));
+    mapper.on_action_completed(timed_action("//:b", true, 10));
+    mapper.on_action_completed(timed_action("//:c", false, 1));
+    mapper.on_action_completed(timed_action("//:d", true, 20));
+    mapper.on_action_completed(ActionCompletedEvent {
+        end_time_nanos: None,
+        ..timed_action("//:e", true, 0)
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert_eq!(
+        action_names(&spans),
+        ["action Genrule //:a", "action Genrule //:c", "action Genrule //:d"],
+    );
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_ACTIONS).as_deref(),
+        Some("2"),
+    );
+}
+
+/// A successful target completes after the budget settles: it survives
+/// (with its configured kind) when one of its actions was kept, and is
+/// suppressed as empty when all of them were dropped.
+#[test]
+fn lightweight_budget_decides_successful_targets() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.set_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 1));
+
+    for (label, millis) in [("//:slow", 50), ("//:fast", 5)] {
+        mapper.on_target_configured(label, Some("genrule"), &[], Some(1_000_000_000), None);
+        mapper.on_action_completed(timed_action(label, true, millis));
+        mapper.on_target_completed(label, true, &[], &[], Some(2_000_000_000));
+    }
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let target = find_span(&spans, |s| s.name == "target //:slow").expect("kept target");
+    assert_eq!(attr_value(&target, BAZEL_TARGET_KIND).as_deref(), Some("genrule"));
+    let action = find_span(&spans, |s| s.name == "action Genrule //:slow").expect("kept action");
+    assert_eq!(action.parent_span_id, target.span_context.span_id());
+    assert!(find_span(&spans, |s| s.name == "target //:fast").is_none());
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(),
+        Some("1"),
+    );
+}
+
+/// A failed target is also held, so a kept successful action of it lands
+/// under the real target span rather than a synthetic duplicate.
+#[test]
+fn lightweight_budget_parents_kept_action_under_failed_target() {
+    let (mut mapper, collector) = mapper_with_collector();
+    lightweight(&mut mapper);
+
+    mapper.on_target_configured("//:t", Some("genrule"), &[], Some(1_000_000_000), None);
+    mapper.on_action_completed(timed_action("//:t", true, 50));
+    mapper.on_target_completed("//:t", false, &[], &[], Some(2_000_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let targets: Vec<&SpanData> = spans.iter().filter(|s| s.name == "target //:t").collect();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(attr_value(targets[0], BAZEL_TARGET_KIND).as_deref(), Some("genrule"));
+    let action = find_span(&spans, |s| s.name == "action Genrule //:t").expect("kept action");
+    assert_eq!(action.parent_span_id, targets[0].span_context.span_id());
+}
+
+/// A kept orphan spawn (no BEP action) also lands under its real, deferred
+/// target, which is then not counted as an empty suppressed target.
+#[test]
+fn lightweight_orphan_action_keeps_deferred_target() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    lightweight(&mut mapper);
+
+    mapper.on_target_configured("//pkg:boom", Some("cc_library"), &[], Some(1_000_000_000), None);
+    mapper.on_target_completed("//pkg:boom", true, &[], &[], Some(2_000_000_000));
+    let mut spawn =
+        spawn_exec_with_metrics("//pkg:boom", "CppCompile", "bazel-out/boom.o", "local", false);
+    spawn.exit_code = 1;
+    mapper.on_compact_spawn(spawn);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let target = find_span(&spans, |s| s.name == "target //pkg:boom").expect("real target");
+    assert_eq!(attr_value(&target, BAZEL_TARGET_KIND).as_deref(), Some("cc_library"));
+    let action = find_span(&spans, |s| s.name.contains("CppCompile") && s.name.contains("(synth)"))
+        .expect("synthetic orphan action");
+    assert_eq!(action.parent_span_id, target.span_context.span_id());
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(),
+        Some("0"),
+    );
+}
+
+/// A deferred action claims its pending spawn even when its primary output
+/// is not the spawn's first listed output.
+#[test]
+fn lightweight_deferred_action_claims_multi_output_spawn() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    lightweight(&mut mapper);
+
+    let mut spawn =
+        spawn_exec_with_metrics("//pkg:gen", "Genrule", "bazel-out/a.h", "local", false);
+    spawn.listed_outputs.push("bazel-out/b.cc".into());
+    mapper.on_compact_spawn(spawn);
+    mapper.on_action_completed(action_event_for("//pkg:gen", "Genrule", "bazel-out/b.cc"));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert!(find_span(&spans, |s| s.name.contains("(synth)")).is_none());
+    let action = find_span(&spans, |s| s.name.starts_with("action Genrule")).expect("action");
+    assert_eq!(
+        attr_value(&action, BAZEL_ACTION_SPAWN_CACHE_HIT).as_deref(),
+        Some("false"),
+    );
+}
+
+/// Successful orphan actions share what is left of the budget after BEP
+/// actions; orphans with a failed attempt bypass it.
+#[test]
+fn lightweight_budget_caps_successful_orphan_actions() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    mapper.set_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 2));
+
+    mapper.on_action_completed(timed_action("//:bep", true, 50));
+    mapper.on_compact_spawn(missed_spawn("//pkg:x", "bazel-out/x.o"));
+    mapper.on_compact_spawn(missed_spawn("//pkg:y", "bazel-out/y.o"));
+    let mut failed = missed_spawn("//pkg:z", "bazel-out/z.o");
+    failed.exit_code = 1;
+    mapper.on_compact_spawn(failed);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let synth: Vec<String> = action_names(&spans)
+        .into_iter()
+        .filter(|n| n.ends_with("(synth)"))
+        .collect();
+    assert_eq!(synth.len(), 2, "one successful orphan plus the failed one: {synth:?}");
+    assert!(synth.iter().any(|n| n.contains(":z")));
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_ACTIONS).as_deref(),
+        Some("1"),
+    );
+}
+
+/// Exec-log spawns of a budget-dropped action are not resurrected as a
+/// synthetic orphan action, even when they would pass the spawn filter.
+#[test]
+fn lightweight_budget_dropped_action_spawns_are_not_synthesised() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    mapper.set_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 1));
+
+    mapper.on_action_completed(timed_action("//:slow", true, 50));
+    mapper.on_action_completed(timed_action("//:fast", true, 5));
+    mapper.on_compact_spawn(SpawnExec {
+        mnemonic: "Genrule".into(),
+        ..missed_spawn("//:fast", "bazel-out/:fast")
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    assert_eq!(action_names(&spans), ["action Genrule //:slow"]);
+    assert!(!spans.iter().any(|s| s.name.starts_with("spawn ")));
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_SPAWNS).as_deref(),
+        Some("1"),
+    );
+    assert_eq!(
+        attr_value(&root, BAZEL_TRACE_SUPPRESSED_ACTIONS).as_deref(),
+        Some("1"),
+        "the dropped action is not counted again as a capped orphan",
+    );
 }
 
 /// A successful, fast, cache-hit orphan spawn is dropped: no synthetic
@@ -1020,7 +1226,7 @@ fn lightweight_drops_matched_cache_hit_child_spawn() {
     mapper.compact_streaming_active = true;
     lightweight(&mut mapper);
 
-    mapper.on_action_completed(&action_event_for(
+    mapper.on_action_completed(action_event_for(
         "//pkg:foo",
         "CppCompile",
         "bazel-out/foo.o",
