@@ -18,7 +18,7 @@ use crate::otel::span::{Logger, Tracer};
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
-use crate::otel::{ActionCompletedEvent, OtelMapper, Redactor, TestResultEvent};
+use crate::otel::{ActionCompletedEvent, LogMode, OtelMapper, Redactor, TestResultEvent};
 use crate::state::{
     TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
 };
@@ -153,6 +153,7 @@ pub struct EventRouter {
     exec_log_max_decompressed_bytes: usize,
     /// Tail Bazel's compact exec log when the build writes one (`--exec-log`).
     exec_log: bool,
+    log_mode: LogMode,
     /// Latest wall time seen in BEP payloads; stands in for the BES event
     /// time when replaying a file, which carries none.
     bep_clock_nanos: Option<i64>,
@@ -174,6 +175,7 @@ impl EventRouter {
             exec_log_max_decompressed_bytes:
                 crate::exec_log::DEFAULT_EXECLOG_MAX_DECOMPRESSED_BYTES,
             exec_log: false,
+            log_mode: LogMode::default(),
             bep_clock_nanos: None,
         }
     }
@@ -190,6 +192,14 @@ impl EventRouter {
         self
     }
 
+    pub fn with_log_mode(mut self, mode: LogMode) -> Self {
+        self.log_mode = mode;
+        if let Some(mapper) = self.mapper.take() {
+            self.mapper = Some(mapper.with_log_mode(mode));
+        }
+        self
+    }
+
     /// Attach OTel export. Per-invocation attributes go on the root span,
     /// not on the resource, which is shared by every invocation.
     pub fn with_export(
@@ -200,6 +210,7 @@ impl EventRouter {
         self.mapper = Some(
             OtelMapper::new(tracer, Some(logger))
                 .with_redactor(self.redactor.clone())
+                .with_log_mode(self.log_mode)
                 .with_exec_log_max_message_bytes(self.exec_log_max_message_bytes)
                 .with_exec_log_max_decompressed_bytes(self.exec_log_max_decompressed_bytes),
         );
@@ -240,7 +251,7 @@ impl EventRouter {
     /// Attach an OTel mapper directly (used by tests; production wires the
     /// mapper through [`Self::with_export`]).
     pub fn with_mapper(mut self, mapper: OtelMapper) -> Self {
-        self.mapper = Some(mapper.with_redactor(self.redactor.clone()));
+        self.mapper = Some(mapper.with_redactor(self.redactor.clone()).with_log_mode(self.log_mode));
         self
     }
 

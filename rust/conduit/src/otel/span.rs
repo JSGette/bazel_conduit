@@ -202,10 +202,18 @@ pub struct SpanData {
     pub status: Status,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
 #[derive(Clone, Debug)]
 pub struct LogData {
     pub timestamp: SystemTime,
     pub span_context: SpanContext,
+    pub severity: Severity,
     pub body: String,
     pub attributes: Vec<KeyValue>,
 }

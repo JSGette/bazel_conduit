@@ -130,6 +130,7 @@ and `--port`, which are `serve`-only.
 | `--exec-log-max-decompressed-mib <MIB>` | Cap on total decompressed bytes pulled from a compact execution log's zstd frame. Prevents a small malicious frame from inflating into GiB of in-memory state (zstd zip-bomb). | `2048` |
 | `--trace-profile <PROFILE>` | Trace verbosity: `lightweight` or `full`. See [Trace Profiles](#trace-profiles). | `lightweight` |
 | `--max-action-spans <N>` | Lightweight: how many successful actions (the slowest) keep a span per invocation. | `200` |
+| `--logs <MODE>` | Which Bazel console output becomes OTLP log records: `errors` (`ERROR:`/`FAIL:` blocks with the failed action's output and `--test_output` blocks at error severity, `WARNING:` blocks at warn), `all` (one record per progress event and stream), or `none`. Records are capped at 64 KiB and 256 per invocation; the overflow is counted in `bazel.trace.suppressed_logs` on the root span. | `errors` |
 | `--trace-min-duration-ms <MS>` | Lightweight: minimum duration for a successful cache-hit spawn to keep a span. | `500` |
 
 ### Secret Redaction
@@ -141,7 +142,7 @@ status entries produced by `--workspace_status_command` (`STABLE_*` keys)
 routinely carry CI-injected tokens. Progress stdout/stderr can echo any of
 the above. Without intervention all of these end up verbatim in the
 `bazel.explicit_cmd_line`, `bazel.action.command_line`, `bazel.spawn.command`, `bazel.workspace.*`,
-and `bazel.progress.*` span attributes — and from there into whatever
+and progress log records — and from there into whatever
 backend the OTLP exporter is wired to.
 
 Conduit ships with an in-process scrubber (`rust/conduit/src/otel/redact.rs`)
@@ -393,7 +394,7 @@ All OTel span attributes follow the `bazel.<component>.<field>` naming conventio
 1. **No distributed / remote build support**: Conduit is a local sidecar. It does not support remote BES endpoints or multi-machine builds.
 2. **No phase spans**: Loading, analysis, and execution phases are not modeled as separate spans (metrics for these are captured as attributes on the root span via `BuildMetrics`).
 3. **No span links / DAG representation**: BEP's DAG structure (secondary parents) is not represented as OTel span links. All relationships are parent-child.
-4. **No conduit-side probabilistic sampling**: The `lightweight` profile drops uninteresting spans deterministically (errors, cache misses, and slow work are always kept), but there is no top-N-slowest or percentage sampling inside conduit — layer head-based sampling / retention filters at the SDK, agent, or backend. See [Trace Profiles](#trace-profiles).
+4. **No conduit-side probabilistic sampling**: The `lightweight` profile drops uninteresting spans deterministically (failures are always kept, plus the slowest successful actions up to `--max-action-spans`), but there is no percentage sampling inside conduit — layer head-based sampling / retention filters at the SDK, agent, or backend. See [Trace Profiles](#trace-profiles).
 5. **Single invocation at a time**: The gRPC server processes one build stream at a time (sequential invocations via `Arc<Mutex<EventRouter>>`).
 6. **Exec log streaming is best-effort, not "live per spawn"**: Bazel flushes the compact log every ~128 KiB of uncompressed input (200–600 spawns on big builds), and the final &lt;128 KiB is only visible after `close()` at `BuildCompleteEvent`. Spawn enrichment lands on action spans in those chunk-sized bursts, with a final post-`close()` drain at `finish()`.
 7. **`TestProgress` and `ExecRequest` are no-ops**: These event types are received but not mapped to any OTel construct.

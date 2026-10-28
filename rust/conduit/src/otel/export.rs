@@ -8,7 +8,7 @@
 //! dropped and counted, never buffered without bound.
 
 use super::span::{
-    Item, KeyValue, LogData, Logger, Sink, SpanData, SpanKind, Status, Tracer, Value,
+    Item, KeyValue, LogData, Logger, Severity, Sink, SpanData, SpanKind, Status, Tracer, Value,
 };
 use otlp_proto::opentelemetry::proto as otlp;
 use std::fmt::Write as _;
@@ -452,8 +452,8 @@ fn log_proto(l: LogData) -> otlp::logs::v1::LogRecord {
     otlp::logs::v1::LogRecord {
         time_unix_nano: t,
         observed_time_unix_nano: t,
-        severity_number: otlp::logs::v1::SeverityNumber::Info as i32,
-        severity_text: "INFO".into(),
+        severity_number: severity_number(l.severity),
+        severity_text: severity_text(l.severity).into(),
         body: Some(otlp::common::v1::AnyValue {
             value: Some(otlp::common::v1::any_value::Value::StringValue(l.body)),
         }),
@@ -592,6 +592,23 @@ fn spans_json(spans: &[SpanData]) -> String {
     out
 }
 
+fn severity_number(s: Severity) -> i32 {
+    use otlp::logs::v1::SeverityNumber;
+    match s {
+        Severity::Info => SeverityNumber::Info as i32,
+        Severity::Warn => SeverityNumber::Warn as i32,
+        Severity::Error => SeverityNumber::Error as i32,
+    }
+}
+
+fn severity_text(s: Severity) -> &'static str {
+    match s {
+        Severity::Info => "INFO",
+        Severity::Warn => "WARN",
+        Severity::Error => "ERROR",
+    }
+}
+
 fn logs_json(logs: &[LogData]) -> String {
     let mut out = String::new();
     json_envelope(&mut out, "resourceLogs", "scopeLogs", "logRecords");
@@ -602,9 +619,11 @@ fn logs_json(logs: &[LogData]) -> String {
         let t = unix_nanos(l.timestamp);
         let _ = write!(
             out,
-            "{{\"timeUnixNano\":\"{t}\",\"observedTimeUnixNano\":\"{t}\",\"severityNumber\":9,\
-             \"severityText\":\"INFO\",\"flags\":{SAMPLED},\"traceId\":\"{}\",\"spanId\":\"{}\",\
+            "{{\"timeUnixNano\":\"{t}\",\"observedTimeUnixNano\":\"{t}\",\"severityNumber\":{},\
+             \"severityText\":\"{}\",\"flags\":{SAMPLED},\"traceId\":\"{}\",\"spanId\":\"{}\",\
              \"body\":{{\"stringValue\":",
+            severity_number(l.severity),
+            severity_text(l.severity),
             l.span_context.trace_id(),
             l.span_context.span_id()
         );

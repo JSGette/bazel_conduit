@@ -27,28 +27,6 @@ fn strip_ansi_empty() {
 }
 
 #[test]
-fn tail_byte_offset_short_string() {
-    assert_eq!(tail_byte_offset("hello", 10), 0);
-}
-
-#[test]
-fn tail_byte_offset_exact() {
-    assert_eq!(tail_byte_offset("hello", 5), 0);
-}
-
-#[test]
-fn tail_byte_offset_truncates() {
-    assert_eq!(tail_byte_offset("hello world", 5), 6);
-}
-
-#[test]
-fn append_progress_capped_within_limit() {
-    let mut buf = String::from("hello ");
-    append_progress_capped(&mut buf, "world");
-    assert_eq!(buf, "hello world");
-}
-
-#[test]
 fn detect_workspace_name_reads_module_bazel() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -1388,4 +1366,152 @@ fn build_metrics_set_root_attrs_and_root_contains_finish() {
         assert_eq!(attr_value(&root, dropped), None, "{dropped} should not be emitted");
     }
     assert_eq!(root.end_time, super::nanos_to_system_time(5_000_000_000));
+}
+
+// =====================================================================
+// Progress logs (`--logs`). Fixtures are Bazel 9 console chunks.
+// =====================================================================
+
+use super::progress::{error_record_summaries, LOG_RECORD_CAP_BYTES, MAX_LOG_RECORDS};
+use crate::otel::span::{Logger, Severity};
+
+#[test]
+fn error_logs_keep_warnings_and_drop_progress_noise() {
+    let stderr = "Computing main repo mapping: \nLoading: 0 packages loaded\n\
+        WARNING: /tmp/ws/BUILD.bazel:2:8: target '//:old' is deprecated: use //:new instead\n\
+        Analyzing: 4 targets (5 packages loaded, 6 targets configured)\n\
+        [4 / 4] no actions running\nINFO: Analyzed 4 targets (81 packages loaded).\n";
+    assert_eq!(
+        error_record_summaries(&[(stderr, "")]),
+        vec![(
+            Severity::Warn,
+            "WARNING: /tmp/ws/BUILD.bazel:2:8: target '//:old' is deprecated: use //:new instead".to_string(),
+        )],
+    );
+}
+
+#[test]
+fn error_logs_keep_failed_action_stderr_with_its_error() {
+    let stderr = "ERROR: /tmp/ws/BUILD.bazel:14:8: Executing genrule //:broken failed: (Exit 1)\n\n\
+        Use --sandbox_debug to see verbose messages from the sandbox\n\
+        compiler: error: something bad\n    at detail line\nplain trailing line\n\
+        INFO: Elapsed time: 11.999s, Critical Path: 0.47s\n\
+        ERROR: Build did NOT complete successfully\nFAILED: \n";
+    let records = error_record_summaries(&[(stderr, "")]);
+    assert_eq!(records.len(), 2, "{records:#?}");
+    assert_eq!(records[0].0, Severity::Error);
+    assert!(records[0].1.starts_with("ERROR: /tmp/ws/BUILD.bazel:14:8"));
+    assert!(records[0].1.ends_with("compiler: error: something bad\n    at detail line\nplain trailing line"));
+    assert_eq!(records[1], (Severity::Error, "ERROR: Build did NOT complete successfully".to_string()));
+}
+
+#[test]
+fn error_logs_keep_failed_test_line_and_test_output() {
+    let stderr = "FAIL: //:failing_test (Exit 1) (see /tmp/ws/testlogs/failing_test/test.log)\n\
+        INFO: From Testing //:failing_test:\n";
+    let stdout = "==================== Test output for //:failing_test:\ntest says hello\n\
+        assertion failed: 1 != 2\n\
+        ================================================================================\n\
+        //:failing_test                                                 FAILED in 0.4s\n";
+    let records = error_record_summaries(&[(stderr, stdout)]);
+    assert_eq!(records.len(), 2, "{records:#?}");
+    assert_eq!(
+        records[0],
+        (Severity::Error, "FAIL: //:failing_test (Exit 1) (see /tmp/ws/testlogs/failing_test/test.log)".to_string()),
+    );
+    assert_eq!(records[1].0, Severity::Error);
+    assert!(records[1].1.contains("assertion failed: 1 != 2"));
+    assert!(!records[1].1.contains("FAILED in"), "summary table is not test output");
+}
+
+/// Progress events carry console deltas: a block and even a line can be split
+/// across events, and the last block only ends at finish.
+#[test]
+fn error_logs_survive_progress_chunk_boundaries() {
+    let records = error_record_summaries(&[
+        ("ERROR: //:broken failed: (Exit 1)\n", ""),
+        ("compiler: error: something bad\nWARN", "==================== Test output for //:t:\nline 1\n"),
+        ("ING: deprecated\nINFO: done\nERROR: tail", "line 2\n====================\n"),
+        (" block\nstill tail", ""),
+    ]);
+    assert_eq!(
+        records,
+        vec![
+            (Severity::Error, "ERROR: //:broken failed: (Exit 1)\ncompiler: error: something bad".to_string()),
+            (Severity::Warn, "WARNING: deprecated".to_string()),
+            (Severity::Error, "==================== Test output for //:t:\nline 1\nline 2\n====================".to_string()),
+            (Severity::Error, "ERROR: tail block\nstill tail".to_string()),
+        ],
+    );
+}
+
+#[test]
+fn error_logs_keep_test_output_written_to_stderr() {
+    let stderr = "FAIL: //:t (Exit 1)\n==================== Test output for //:t:\n\
+        ERROR: from the test itself\n\
+        ================================================================================\n\
+        INFO: Build completed\n";
+    assert_eq!(
+        error_record_summaries(&[(stderr, "")]),
+        vec![
+            (Severity::Error, "FAIL: //:t (Exit 1)".to_string()),
+            (
+                Severity::Error,
+                "==================== Test output for //:t:\nERROR: from the test itself\n\
+                 ================================================================================"
+                    .to_string(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn open_error_block_is_emitted_at_finish() {
+    let (mut mapper, _) = mapper_with_logger(LogMode::Errors);
+    mapper.on_progress(Some("ERROR: boom\naction output\n"), None);
+    assert_eq!(mapper.log_records, 0, "block may continue in the next event");
+    mapper.finish();
+    assert_eq!(mapper.log_records, 1);
+}
+
+fn mapper_with_logger(mode: LogMode) -> (OtelMapper, MemorySpans) {
+    let (sink, collector) = Sink::memory();
+    let mut mapper =
+        OtelMapper::new(Tracer::new(sink), Some(Logger::default())).with_log_mode(mode);
+    mapper.on_build_started("test-uuid", "build", Some(1_000_000_000), None);
+    (mapper, collector)
+}
+
+#[test]
+fn log_records_are_capped_per_invocation() {
+    let (mut mapper, collector) = mapper_with_logger(LogMode::Errors);
+    for _ in 0..MAX_LOG_RECORDS + 3 {
+        mapper.on_progress(Some("ERROR: boom\n"), None);
+    }
+    mapper.finish();
+    assert_eq!(mapper.log_records, MAX_LOG_RECORDS);
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_TRACE_SUPPRESSED_LOGS).as_deref(), Some("3"));
+}
+
+#[test]
+fn log_modes_all_and_none() {
+    let (mut all, _) = mapper_with_logger(LogMode::All);
+    all.on_progress(Some("INFO: noise\n"), Some("stdout"));
+    all.on_progress(None, Some("stdout only"));
+    assert_eq!(all.log_records, 3, "one record per non-empty stream");
+
+    let (mut none, _) = mapper_with_logger(LogMode::None);
+    none.on_progress(Some("ERROR: boom\n"), None);
+    assert_eq!((none.log_records, none.suppressed_logs), (0, 0));
+}
+
+#[test]
+fn log_record_body_is_capped() {
+    let long = format!("ERROR: {}", "x".repeat(2 * LOG_RECORD_CAP_BYTES));
+    let capped = super::progress::cap(&long);
+    assert!(capped.len() <= LOG_RECORD_CAP_BYTES);
+    assert!(capped.ends_with("...(truncated)"));
 }

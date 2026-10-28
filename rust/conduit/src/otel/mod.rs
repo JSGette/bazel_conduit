@@ -14,5 +14,5 @@ pub mod redact {
 }
 
 pub use export::{ExportConfig, Exporter, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE};
-pub use mapper::{ActionCompletedEvent, OtelMapper, TestResultEvent};
+pub use mapper::{ActionCompletedEvent, LogMode, OtelMapper, TestResultEvent};
 pub use redact::{Redactor, DEFAULT_REDACT_PATTERNS};

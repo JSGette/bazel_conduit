@@ -16,12 +16,9 @@
 //!     └── target {label} (aborted by Bazel)
 //!
 //! Correlated OTel log records:
-//!   - bazel.progress (one record per BEP `Progress` event, streamed as the
-//!     build runs and correlated with the root span via trace_id/span_id;
-//!     each record's stderr/stdout body is ANSI-stripped and capped at 1 MB).
-//!     Without a `LoggerProvider`, all progress text accumulates in memory
-//!     and is attached to the root span as a single `build.log` event in
-//!     `finish`.
+//!   - BEP `Progress` console output filtered by [`LogMode`], streamed as the
+//!     build runs and correlated with the root span; bodies are ANSI-stripped,
+//!     redacted and capped at 64 KiB, at most 256 records per invocation.
 //!
 //! Trace profiles (see [`crate::state::TracePolicy`]):
 //!   - full: every action / spawn / target gets a span.
@@ -62,13 +59,11 @@ mod utils;
 use self::action_attrs::{action_status, build_action_attrs, build_action_span_name};
 use self::test_attrs::{build_test_attrs, build_test_span_name, test_status};
 use self::utils::{
-    append_progress_capped, detect_workspace_name, nanos_to_system_time,
-    spawn_time_range, strip_ansi, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
-    PROGRESS_CAP_BYTES,
+    detect_workspace_name, nanos_to_system_time, spawn_time_range, strip_ansi,
+    wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
 };
-#[cfg(test)]
-use self::utils::tail_byte_offset;
 
+pub use self::progress::LogMode;
 pub use self::utils::{clamp_time_range, truncate_to_byte_limit};
 
 /// Arguments for [`OtelMapper::on_action_completed`]. Owned, because the
@@ -306,17 +301,13 @@ pub struct OtelMapper {
     /// Tracks whether any action for a target was NOT a cache hit.
     target_has_non_cached_action: HashMap<String, bool>,
 
-    /// Fallback buffers for the no-logger path: when no `LoggerProvider` is
-    /// configured, progress text accumulates here and is attached to the root
-    /// span as a single `build.log` event in [`finish`]. Each stream is capped
-    /// at 1 MB (see [`PROGRESS_CAP_BYTES`]). Unused on the streaming path.
-    progress_stderr: String,
-    progress_stdout: String,
-
-    /// Optional OTel logger. When present, every BEP `Progress` event is
-    /// emitted as its own correlated log record (streaming) rather than
-    /// buffered until the build ends.
+    /// Receives BEP `Progress` output as log records; `None` drops it.
     logger: Option<Logger>,
+    log_mode: LogMode,
+    error_logs: progress::ErrorLogParser,
+    /// Records emitted this invocation, capped at [`progress::MAX_LOG_RECORDS`].
+    log_records: u64,
+    suppressed_logs: u64,
 
     /// Cached exit code from BuildFinished (root span ends in [`finish`]).
     exit_code: Option<i32>,
@@ -445,9 +436,11 @@ impl OtelMapper {
             cached_command: None,
             cached_patterns: Vec::new(),
             target_has_non_cached_action: HashMap::new(),
-            progress_stderr: String::new(),
-            progress_stdout: String::new(),
             logger,
+            log_mode: LogMode::default(),
+            error_logs: progress::ErrorLogParser::default(),
+            log_records: 0,
+            suppressed_logs: 0,
             exit_code: None,
             shut_down: false,
             finish_time_nanos: None,
@@ -486,6 +479,11 @@ impl OtelMapper {
     /// supply a custom name pattern list from the CLI).
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    pub fn with_log_mode(mut self, mode: LogMode) -> Self {
+        self.log_mode = mode;
         self
     }
 
@@ -657,11 +655,8 @@ impl OtelMapper {
     // Progress events
     // =====================================================================
 
-    /// Progress with stderr/stdout. With a logger configured, each event is
-    /// emitted immediately as a correlated `bazel.progress` log record
-    /// (streaming, capped at [`PROGRESS_CAP_BYTES`] per record). Without a
-    /// logger, content accumulates in [`progress_stderr`]/[`progress_stdout`]
-    /// and is attached as a single span event in [`finish`].
+    /// Progress with stderr/stdout -> log records filtered by [`LogMode`],
+    /// correlated with the root span.
     pub fn on_progress(&mut self, stderr: Option<&str>, stdout: Option<&str>) {
         progress::handle_progress(self, stderr, stdout);
     }
@@ -737,8 +732,9 @@ impl OtelMapper {
         self.cached_command = None;
         self.cached_patterns.clear();
         self.target_has_non_cached_action.clear();
-        self.progress_stderr.clear();
-        self.progress_stdout.clear();
+        self.error_logs = progress::ErrorLogParser::default();
+        self.log_records = 0;
+        self.suppressed_logs = 0;
         self.exit_code = None;
         self.shut_down = false;
         self.finish_time_nanos = None;
@@ -888,26 +884,7 @@ impl OtelMapper {
             debug!("Ended 'skipped targets' span");
         }
 
-        // No-logger fallback: progress was buffered, attach a single
-        // `build.log` span event before closing the root. With a logger
-        // configured, [`on_progress`] streams records and these buffers stay
-        // empty.
-        if self.logger.is_none() {
-            let stderr = std::mem::take(&mut self.progress_stderr);
-            let stdout = std::mem::take(&mut self.progress_stdout);
-            if (!stderr.is_empty() || !stdout.is_empty()) && self.root_context.is_some() {
-                let mut attrs = Vec::new();
-                if !stderr.is_empty() {
-                    attrs.push(KeyValue::new(BAZEL_PROGRESS_STDERR, stderr));
-                }
-                if !stdout.is_empty() {
-                    attrs.push(KeyValue::new(BAZEL_PROGRESS_STDOUT, stdout));
-                }
-                if let Some(cx) = &self.root_context {
-                    cx.span().add_event("build.log", attrs);
-                }
-            }
-        }
+        progress::flush_progress(self);
 
         // Surface how much the lightweight profile trimmed (always set, even
         // when zero, so dashboards can rely on the attribute existing).
@@ -922,6 +899,10 @@ impl OtelMapper {
         self.set_root_attr(KeyValue::new(
             BAZEL_TRACE_SUPPRESSED_TARGETS,
             self.suppressed_targets as i64,
+        ));
+        self.set_root_attr(KeyValue::new(
+            BAZEL_TRACE_SUPPRESSED_LOGS,
+            self.suppressed_logs as i64,
         ));
         self.set_root_attr(KeyValue::new(BAZEL_FETCH_COUNT, self.fetch_count as i64));
         self.set_root_attr(KeyValue::new(BAZEL_FETCH_FAILED, self.fetch_failed as i64));
@@ -944,7 +925,12 @@ impl OtelMapper {
                 cx.span().end();
             }
 
-            info!("Root span ended (exit_code={:?})", self.exit_code);
+            info!(
+                log_records = self.log_records,
+                suppressed_logs = self.suppressed_logs,
+                "Root span ended (exit_code={:?})",
+                self.exit_code
+            );
         }
     }
 }

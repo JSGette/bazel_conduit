@@ -5,7 +5,8 @@ use clap::{Args, Parser, Subcommand};
 use conduit_lib::bep::{replay, EventRouter};
 use conduit_lib::grpc::run_server;
 use conduit_lib::otel::{
-    ExportConfig, Exporter, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
+    ExportConfig, Exporter, LogMode, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE,
+    DEFAULT_REDACT_PATTERNS,
 };
 use conduit_lib::state::{
     TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
@@ -125,6 +126,12 @@ struct Common {
     /// their span per invocation.
     #[arg(long, default_value_t = DEFAULT_MAX_ACTION_SPANS)]
     max_action_spans: usize,
+
+    /// Which Bazel console output becomes OTLP log records: `errors`
+    /// (ERROR/FAIL/WARNING blocks and failed test output), `all`, or `none`.
+    /// Records are capped at 64 KiB and 256 per invocation.
+    #[arg(long, default_value = "errors")]
+    logs: String,
 }
 
 impl Common {
@@ -209,6 +216,10 @@ async fn main() -> anyhow::Result<()> {
         args.max_action_spans,
     );
     info!("Trace profile: {trace_policy}");
+    let log_mode = LogMode::parse(&args.logs).ok_or_else(|| {
+        anyhow::anyhow!("invalid --logs '{}' (expected errors, all or none)", args.logs)
+    })?;
+    info!("Logs: {log_mode}");
 
     let export = exporter.as_ref().map(|e| (e.tracer(), e.logger()));
     let exec_log = args.exec_log;
@@ -218,7 +229,8 @@ async fn main() -> anyhow::Result<()> {
             .with_redactor(redactor.clone())
             .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
             .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
-            .with_trace_policy(trace_policy);
+            .with_trace_policy(trace_policy)
+            .with_log_mode(log_mode);
         match &export {
             Some((tracer, logger)) => router.with_export(tracer.clone(), logger.clone()),
             None => router,

@@ -17,6 +17,8 @@ pub const BAZEL_TRACE_PROFILE: &str = "bazel.trace.profile";
 // Counts of spans dropped by the lightweight profile, for volume visibility.
 pub const BAZEL_TRACE_SUPPRESSED_ACTIONS: &str = "bazel.trace.suppressed_actions";
 pub const BAZEL_TRACE_SUPPRESSED_SPAWNS: &str = "bazel.trace.suppressed_spawns";
+/// Log records over the per-invocation cap.
+pub const BAZEL_TRACE_SUPPRESSED_LOGS: &str = "bazel.trace.suppressed_logs";
 pub const BAZEL_TRACE_SUPPRESSED_TARGETS: &str = "bazel.trace.suppressed_targets";
 pub const BAZEL_EXPLICIT_CMD_LINE: &str = "bazel.explicit_cmd_line";
 pub const BAZEL_TOOL_TAG: &str = "bazel.tool_tag";
@@ -135,10 +137,6 @@ pub const BAZEL_TEST_ATTEMPT_COUNT: &str = "bazel.test.attempt_count";
 pub const BAZEL_TEST_SHARD_COUNT: &str = "bazel.test.shard_count";
 pub const BAZEL_TEST_TOTAL_NUM_CACHED: &str = "bazel.test.total_num_cached";
 pub const BAZEL_TEST_HOSTNAME: &str = "bazel.test.hostname";
-
-// Progress / build log span events
-pub const BAZEL_PROGRESS_STDERR: &str = "bazel.progress.stderr";
-pub const BAZEL_PROGRESS_STDOUT: &str = "bazel.progress.stdout";
 
 // -----------------------------------------------------------------------------
 // Label helpers (for readable span names and attributes)

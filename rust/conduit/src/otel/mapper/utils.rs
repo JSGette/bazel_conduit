@@ -112,29 +112,8 @@ pub fn clamp_time_range(
     }
 }
 
-/// Maximum size in bytes for each of progress_stderr and progress_stdout.
-/// Each stream is capped at 1 MB; when appending would exceed the cap, the
-/// existing buffer is truncated to keep the tail (recent output) and new
-/// content is appended. Enforced in [`crate::otel::mapper::OtelMapper::on_progress`].
-pub(super) const PROGRESS_CAP_BYTES: usize = 1024 * 1024; // 1 MB
 pub(super) const COMMAND_LINE_CAP_BYTES: usize = 4096; // 4 KB
 
-/// Byte length of the suffix added when we truncate from the front.
-pub(super) const PROGRESS_TRUNCATION_SUFFIX: &str = "\n...(truncated)\n";
-
-/// Return the byte offset into `s` such that `s[offset..]` is the last at most
-/// `max_tail_bytes` bytes of `s` at a valid UTF-8 character boundary.
-pub(super) fn tail_byte_offset(s: &str, max_tail_bytes: usize) -> usize {
-    if s.len() <= max_tail_bytes {
-        return 0;
-    }
-    let start = s.len() - max_tail_bytes;
-    let mut i = start;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i.min(s.len())
-}
 
 /// Truncate `s` to at most `max_bytes` bytes, stepping back to the nearest
 /// UTF-8 boundary and appending `suffix`. Returns the original string when
@@ -148,53 +127,6 @@ pub fn truncate_to_byte_limit(s: &str, max_bytes: usize, suffix: &str) -> String
         cut -= 1;
     }
     format!("{}{}", &s[..cut], suffix)
-}
-
-/// Append `new_content` to `buf` while keeping total size <= PROGRESS_CAP_BYTES.
-/// When appending would exceed the cap, truncates the existing buffer to keep
-/// the tail (recent output), adds a truncation marker, then appends the new content.
-pub(super) fn append_progress_capped(buf: &mut String, new_content: &str) {
-    let suffix_len = PROGRESS_TRUNCATION_SUFFIX.len();
-    let max_total = PROGRESS_CAP_BYTES;
-
-    if buf.len() + new_content.len() <= max_total {
-        buf.push_str(new_content);
-        return;
-    }
-
-    // Need to drop from the front: keep last (max_total - new_content.len() - suffix_len) bytes of buf.
-    let max_old_tail = max_total.saturating_sub(new_content.len()).saturating_sub(suffix_len);
-    if max_old_tail > 0 {
-        let offset = tail_byte_offset(buf, max_old_tail);
-        let tail = buf[offset..].to_string();
-        buf.clear();
-        buf.push_str(&tail);
-        buf.push_str(PROGRESS_TRUNCATION_SUFFIX);
-    } else {
-        buf.clear();
-        // New content alone exceeds cap: keep only the tail of new_content.
-        let keep_new = max_total.saturating_sub(suffix_len);
-        if keep_new > 0 {
-            let offset = tail_byte_offset(new_content, keep_new.min(new_content.len()));
-            buf.push_str(PROGRESS_TRUNCATION_SUFFIX);
-            buf.push_str(&new_content[offset..]);
-        }
-        return;
-    }
-
-    // Append new_content; if we're still over cap, trim from the end of new_content.
-    let remaining = max_total.saturating_sub(buf.len());
-    if new_content.len() <= remaining {
-        buf.push_str(new_content);
-    } else {
-        let end = new_content.len() - remaining;
-        let mut trim_start = end;
-        while trim_start < new_content.len() && !new_content.is_char_boundary(trim_start) {
-            trim_start += 1;
-        }
-        buf.push_str(&new_content[trim_start..]);
-        buf.push_str("\n...(truncated)");
-    }
 }
 
 /// Resolve a human-readable name for the Bazel workspace producing this

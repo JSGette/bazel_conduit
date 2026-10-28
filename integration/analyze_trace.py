@@ -122,6 +122,7 @@ def check(path):
     supp = {k: root["attrs"].get(k) for k in
             ("bazel.trace.profile", "bazel.trace.suppressed_actions",
              "bazel.trace.suppressed_spawns", "bazel.trace.suppressed_targets",
+             "bazel.trace.suppressed_logs",
              "bazel.fetch.count", "bazel.fetch.failed")
             } if root else {}
 
