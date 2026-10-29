@@ -20,7 +20,7 @@ use tracing_subscriber::FmtSubscriber;
 
 /// BEP to OpenTelemetry trace converter
 #[derive(Parser, Debug)]
-#[command(name = "conduit")]
+#[command(name = "conduit", version)]
 #[command(about = "Convert Bazel Build Event Protocol events to OpenTelemetry traces")]
 struct Cli {
     #[command(subcommand)]
