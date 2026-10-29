@@ -93,7 +93,7 @@ pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
 pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";
 pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
 
-// VCS / repository identity on the root span. The name comes from
+// VCS / repository identity on every span. The name comes from
 // `module(name = ...)` in MODULE.bazel, else the basename of
 // `workspace_directory`; a `--build_metadata=REPO_URL=...` overrides it.
 // URL, commit and branch come from `--build_metadata=REPO_URL|COMMIT_SHA|BRANCH`

@@ -268,11 +268,14 @@ impl MemorySpans {
     }
 }
 
+type SharedAttributes = Arc<Mutex<Vec<KeyValue>>>;
+
 /// A live span. Ends (at "now") when dropped without an explicit end.
 pub struct Span {
     span_context: SpanContext,
     data: Option<SpanData>,
     sink: Sink,
+    shared: SharedAttributes,
 }
 
 impl Span {
@@ -318,6 +321,11 @@ impl Span {
     pub fn end_with_timestamp(&mut self, end: SystemTime) {
         if let Some(mut data) = self.data.take() {
             data.end_time = end.max(data.start_time);
+            for kv in self.shared.lock().unwrap().iter() {
+                if !data.attributes.iter().any(|a| a.key == kv.key) {
+                    data.attributes.push(kv.clone());
+                }
+            }
             self.sink.send(Item::Span(data));
         }
     }
@@ -441,11 +449,30 @@ impl SpanBuilder {
 #[derive(Clone, Default)]
 pub struct Tracer {
     sink: Sink,
+    shared: SharedAttributes,
 }
 
 impl Tracer {
     pub fn new(sink: Sink) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            shared: SharedAttributes::default(),
+        }
+    }
+
+    /// Same sink, own shared attributes.
+    pub fn scoped(&self) -> Self {
+        Self::new(self.sink.clone())
+    }
+
+    /// Adds (or replaces) an attribute on every span of this tracer that has
+    /// not ended yet, including ones already started.
+    pub fn set_shared_attribute(&self, kv: KeyValue) {
+        let mut shared = self.shared.lock().unwrap();
+        match shared.iter_mut().find(|a| a.key == kv.key) {
+            Some(existing) => existing.value = kv.value,
+            None => shared.push(kv),
+        }
     }
 
     pub fn span_builder(&self, name: impl Into<Cow<'static, str>>) -> SpanBuilder {
@@ -480,6 +507,7 @@ impl Tracer {
                 status: Status::Unset,
             }),
             sink: self.sink.clone(),
+            shared: self.shared.clone(),
         }
     }
 }
@@ -545,5 +573,26 @@ mod tests {
         span.end();
         drop(span);
         assert_eq!(spans.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn shared_attributes_reach_open_spans_of_the_scoped_tracer_only() {
+        let (sink, spans) = Sink::memory();
+        let base = Tracer::new(sink);
+        let (a, b) = (base.scoped(), base.scoped());
+        let mut early = a.build_with_context(a.span_builder("early"), &Context::new());
+        early.set_attribute(KeyValue::new("own", "span"));
+        a.set_shared_attribute(KeyValue::new("repo", "old"));
+        a.set_shared_attribute(KeyValue::new("repo", "new"));
+        a.set_shared_attribute(KeyValue::new("own", "shared"));
+        early.end();
+        drop(b.build_with_context(b.span_builder("other"), &Context::new()));
+
+        let spans = spans.snapshot();
+        assert_eq!(
+            spans[0].attributes,
+            vec![KeyValue::new("own", "span"), KeyValue::new("repo", "new")],
+        );
+        assert!(spans[1].attributes.is_empty());
     }
 }

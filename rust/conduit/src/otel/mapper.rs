@@ -423,7 +423,7 @@ impl OtelMapper {
         logger: Option<Logger>,
     ) -> Self {
         Self {
-            tracer,
+            tracer: tracer.scoped(),
             root_context: None,
             configured_targets: HashMap::new(),
             target_contexts: HashMap::new(),
@@ -665,15 +665,17 @@ impl OtelMapper {
     // Build metadata
     // =====================================================================
 
-    /// BuildMetadata → root span attributes: `REPO_URL`, `COMMIT_SHA` and
-    /// `BRANCH` become `vcs.*` / `git.*`, other keys `bazel.metadata.<KEY>`.
+    /// BuildMetadata: `REPO_URL`, `COMMIT_SHA` and `BRANCH` become `vcs.*` /
+    /// `git.*` on every span, other keys `bazel.metadata.<KEY>` on the root.
+    /// Spans that already ended are not updated; Bazel posts this event in
+    /// `beforeCommand`, ahead of any target, action or test.
     pub fn on_build_metadata(&mut self, metadata: &crate::build_event_stream::BuildMetadata) {
         for (key, value) in &metadata.metadata {
             match key.as_str() {
                 "REPO_URL" => {
                     let url = strip_url_credentials(value);
                     if let Some(name) = repository_name_from_url(&url) {
-                        self.set_root_attr(KeyValue::new(VCS_REPOSITORY_NAME, name));
+                        self.tracer.set_shared_attribute(KeyValue::new(VCS_REPOSITORY_NAME, name));
                     }
                     self.set_vcs_attrs([VCS_REPOSITORY_URL, GIT_REPOSITORY_URL], url);
                 }
@@ -692,7 +694,7 @@ impl OtelMapper {
             return;
         }
         for key in keys {
-            self.set_root_attr(KeyValue::new(key, value.clone()));
+            self.tracer.set_shared_attribute(KeyValue::new(key, value.clone()));
         }
     }
 
@@ -747,6 +749,7 @@ impl OtelMapper {
         for (_, cx) in self.target_contexts.drain() {
             cx.span().end();
         }
+        self.tracer = self.tracer.scoped();
         self.configured_targets.clear();
         self.synthetic_target_labels.clear();
         self.target_child_end_nanos.clear();

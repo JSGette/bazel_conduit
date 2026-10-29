@@ -64,7 +64,7 @@ impl OtelMapper {
             if !v.is_empty() {
                 let path = PathBuf::from(v);
                 if let Some(name) = super::detect_workspace_name(&path) {
-                    self.set_root_attr(KeyValue::new(VCS_REPOSITORY_NAME, name));
+                    self.tracer.set_shared_attribute(KeyValue::new(VCS_REPOSITORY_NAME, name));
                 }
                 self.workspace_directory = Some(path);
             }
