@@ -59,8 +59,8 @@ mod utils;
 use self::action_attrs::{action_status, build_action_attrs, build_action_span_name};
 use self::test_attrs::{build_test_attrs, build_test_span_name, test_status};
 use self::utils::{
-    detect_workspace_name, nanos_to_system_time, spawn_time_range, strip_ansi,
-    wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
+    detect_workspace_name, nanos_to_system_time, repository_name_from_url, spawn_time_range,
+    strip_ansi, strip_url_credentials, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
 };
 
 pub use self::progress::LogMode;
@@ -665,10 +665,34 @@ impl OtelMapper {
     // Build metadata
     // =====================================================================
 
-    /// BuildMetadata → add as attributes on root span.
+    /// BuildMetadata → root span attributes: `REPO_URL`, `COMMIT_SHA` and
+    /// `BRANCH` become `vcs.*` / `git.*`, other keys `bazel.metadata.<KEY>`.
     pub fn on_build_metadata(&mut self, metadata: &crate::build_event_stream::BuildMetadata) {
         for (key, value) in &metadata.metadata {
-            self.set_root_attr(KeyValue::new(format!("bazel.metadata.{key}"), value.clone()));
+            match key.as_str() {
+                "REPO_URL" => {
+                    let url = strip_url_credentials(value);
+                    if let Some(name) = repository_name_from_url(&url) {
+                        self.set_root_attr(KeyValue::new(VCS_REPOSITORY_NAME, name));
+                    }
+                    self.set_vcs_attrs([VCS_REPOSITORY_URL, GIT_REPOSITORY_URL], url);
+                }
+                "COMMIT_SHA" => {
+                    self.set_vcs_attrs([VCS_REF_HEAD_REVISION, GIT_COMMIT_SHA], value.clone())
+                }
+                "BRANCH" => self.set_vcs_attrs([VCS_REF_HEAD_NAME, GIT_BRANCH], value.clone()),
+                _ => self
+                    .set_root_attr(KeyValue::new(format!("bazel.metadata.{key}"), value.clone())),
+            }
+        }
+    }
+
+    fn set_vcs_attrs(&self, keys: [&'static str; 2], value: String) {
+        if value.is_empty() {
+            return;
+        }
+        for key in keys {
+            self.set_root_attr(KeyValue::new(key, value.clone()));
         }
     }
 

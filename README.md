@@ -26,9 +26,9 @@ bazel build //pkg:app                      root: command, patterns, exit code, b
     └── target //pkg:broken                abort reason
 ```
 
-- **Root span:** command and patterns, exit code, `BuildMetrics` (wall/CPU time, action-cache
-  hits and misses, per-runner action counts, memory), fetch counters, and how much the trace
-  profile trimmed (`bazel.trace.suppressed_*`).
+- **Root span:** command and patterns, [repository identity](#repository-identity), exit code,
+  `BuildMetrics` (wall/CPU time, action-cache hits and misses, per-runner action counts,
+  memory), fetch counters, and how much the trace profile trimmed (`bazel.trace.suppressed_*`).
 - **Spans** are trimmed by the [trace profile](#trace-profiles): by default, failed actions
   plus the 200 slowest successful ones.
 - **Log records** carry the build's `ERROR:`, `FAIL:` and `WARNING:` output, including a
@@ -231,6 +231,7 @@ log record (`rust/conduit/src/otel/redact.rs`):
 - **Argv tokens**: the explicit command line, action command lines, and spawn command lines.
   The `VALUE` in `--flag=NAME=VALUE` becomes `***` when `NAME` matches.
 - **Name/value pairs**: workspace status entries, by key name.
+- **URLs**: userinfo in the `REPO_URL` build metadata.
 - **Free text**: console output in log records, token by token.
 
 The pass-through form `--client_env=NAME` (no value on the wire) is left alone.
@@ -272,6 +273,26 @@ list. They are a de-facto schema and may change between releases.
   (`none`/`local`/`remote`), `bazel.test.strategy`.
 - **Spawn**: `bazel.spawn.runner`, `bazel.spawn.cache_hit`, `bazel.spawn.command`,
   `bazel.spawn.execution_wall_time_ms`, `bazel.spawn.remote_cacheable` (only when `false`), ...
+
+### Repository identity
+
+The root span says which repository a trace belongs to. `vcs.repository.name` is the
+`module(name = ...)` from `MODULE.bazel`, else the workspace directory's basename. The
+`--build_metadata` keys Bazel documents for this override and extend it:
+
+| `--build_metadata` key | Root span attributes |
+| --- | --- |
+| `REPO_URL` | `vcs.repository.url.full`, `git.repository_url`, and `vcs.repository.name` from the URL's last path segment |
+| `COMMIT_SHA` | `vcs.ref.head.revision`, `git.commit.sha` |
+| `BRANCH` | `vcs.ref.head.name`, `git.branch` |
+
+Credentials in a `REPO_URL` (`https://user:token@host/...`) are dropped. Other keys land as
+`bazel.metadata.<KEY>`. Set the URL once in the repository's `.bazelrc`, and the commit and
+branch from CI:
+
+```
+common --build_metadata=REPO_URL=https://github.com/DataDog/datadog-agent
+```
 
 ## Design notes
 

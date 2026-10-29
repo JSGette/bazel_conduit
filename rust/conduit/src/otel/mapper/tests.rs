@@ -69,6 +69,67 @@ fn detect_workspace_name_ignores_bazel_dep_blocks() {
 }
 
 #[test]
+fn repository_name_from_url_forms() {
+    for url in [
+        "https://github.com/DataDog/datadog-agent",
+        "https://github.com/DataDog/datadog-agent.git",
+        "https://github.com/DataDog/datadog-agent/",
+        "git@github.com:DataDog/datadog-agent.git",
+        "datadog-agent",
+    ] {
+        assert_eq!(repository_name_from_url(url).as_deref(), Some("datadog-agent"), "{url}");
+    }
+    assert_eq!(repository_name_from_url(""), None);
+}
+
+#[test]
+fn strip_url_credentials_drops_userinfo() {
+    assert_eq!(
+        strip_url_credentials("https://gitlab-ci-token:s3cr3t@gitlab.example.com/g/p.git"),
+        "https://gitlab.example.com/g/p.git",
+    );
+    assert_eq!(
+        strip_url_credentials("https://github.com/o/r@v1"),
+        "https://github.com/o/r@v1",
+    );
+    assert_eq!(
+        strip_url_credentials("git@github.com:o/r.git"),
+        "git@github.com:o/r.git",
+    );
+}
+
+#[test]
+fn build_metadata_maps_repository_identity() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_build_started_extended(Some("/repos/datadog-agent-nogo"), None, None, None, None);
+    mapper.on_build_metadata(&crate::build_event_stream::BuildMetadata {
+        metadata: HashMap::from([
+            ("REPO_URL".into(), "https://user:tok@github.com/DataDog/datadog-agent.git".into()),
+            ("COMMIT_SHA".into(), "abc123".into()),
+            ("BRANCH".into(), String::new()),
+            ("OWNER".into(), "me".into()),
+        ]),
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    let url = "https://github.com/DataDog/datadog-agent.git";
+    assert_eq!(attr_value(&root, VCS_REPOSITORY_NAME).as_deref(), Some("datadog-agent"));
+    assert_eq!(attr_value(&root, VCS_REPOSITORY_URL).as_deref(), Some(url));
+    assert_eq!(attr_value(&root, GIT_REPOSITORY_URL).as_deref(), Some(url));
+    assert_eq!(attr_value(&root, VCS_REF_HEAD_REVISION).as_deref(), Some("abc123"));
+    assert_eq!(attr_value(&root, GIT_COMMIT_SHA).as_deref(), Some("abc123"));
+    assert_eq!(attr_value(&root, GIT_BRANCH), None);
+    assert_eq!(attr_value(&root, "bazel.metadata.OWNER").as_deref(), Some("me"));
+    assert!(
+        !root.attributes.iter().any(|kv| kv.key.starts_with("bazel.metadata.REPO")),
+        "mapped keys are not duplicated: {:?}",
+        root.attributes,
+    );
+}
+
+#[test]
 fn nanos_to_system_time_positive() {
     let t = nanos_to_system_time(1_000_000_000);
     assert_eq!(t, UNIX_EPOCH + Duration::from_secs(1));
