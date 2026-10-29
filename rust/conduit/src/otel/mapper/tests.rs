@@ -102,6 +102,8 @@ fn strip_url_credentials_drops_userinfo() {
 fn build_metadata_maps_repository_identity() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.on_build_started_extended(Some("/repos/datadog-agent-nogo"), None, None, None, None);
+    let root_cx = mapper.root_context.clone().unwrap();
+    let mut child = mapper.build_child_span(&root_cx, "child".into(), SpanKind::Internal, vec![], None);
     mapper.on_build_metadata(&crate::build_event_stream::BuildMetadata {
         metadata: HashMap::from([
             ("REPO_URL".into(), "https://user:tok@github.com/DataDog/datadog-agent.git".into()),
@@ -110,6 +112,7 @@ fn build_metadata_maps_repository_identity() {
             ("OWNER".into(), "me".into()),
         ]),
     });
+    child.end();
     mapper.finish();
 
     let spans = collector.snapshot();
@@ -127,6 +130,11 @@ fn build_metadata_maps_repository_identity() {
         "mapped keys are not duplicated: {:?}",
         root.attributes,
     );
+    let child = find_span(&spans, |s| s.name == "child").expect("child span");
+    assert_eq!(attr_value(&child, VCS_REPOSITORY_NAME).as_deref(), Some("datadog-agent"));
+    assert_eq!(attr_value(&child, GIT_REPOSITORY_URL).as_deref(), Some(url));
+    assert_eq!(attr_value(&child, GIT_COMMIT_SHA).as_deref(), Some("abc123"));
+    assert_eq!(attr_value(&child, "bazel.metadata.OWNER"), None);
 }
 
 #[test]
@@ -237,6 +245,23 @@ fn reset_clears_state() {
     assert!(mapper.root_context.is_none());
     assert!(mapper.exit_code.is_none());
     assert!(mapper.cached_command.is_none());
+}
+
+#[test]
+fn reset_drops_repository_identity() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_build_metadata(&crate::build_event_stream::BuildMetadata {
+        metadata: HashMap::from([("COMMIT_SHA".into(), "abc123".into())]),
+    });
+    mapper.reset();
+    mapper.on_build_started("uuid-2", "build", Some(1_000_000_000), None);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let roots: Vec<_> = spans.iter().filter(|s| s.parent_span_id == SpanId::INVALID).collect();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(attr_value(roots[0], GIT_COMMIT_SHA).as_deref(), Some("abc123"));
+    assert_eq!(attr_value(roots[1], GIT_COMMIT_SHA), None);
 }
 
 #[test]

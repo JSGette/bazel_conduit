@@ -276,18 +276,19 @@ list. They are a de-facto schema and may change between releases.
 
 ### Repository identity
 
-The root span says which repository a trace belongs to. `vcs.repository.name` is the
-`module(name = ...)` from `MODULE.bazel`, else the workspace directory's basename. The
-`--build_metadata` keys Bazel documents for this override and extend it:
+Every span says which repository it belongs to, so Datadog does not infer a repository from
+another service named `bazel`. `vcs.repository.name` is the `module(name = ...)` from
+`MODULE.bazel`, else the workspace directory's basename. The `--build_metadata` keys Bazel
+documents for this override and extend it:
 
-| `--build_metadata` key | Root span attributes |
+| `--build_metadata` key | Span attributes |
 | --- | --- |
 | `REPO_URL` | `vcs.repository.url.full`, `git.repository_url`, and `vcs.repository.name` from the URL's last path segment |
 | `COMMIT_SHA` | `vcs.ref.head.revision`, `git.commit.sha` |
 | `BRANCH` | `vcs.ref.head.name`, `git.branch` |
 
-Credentials in a `REPO_URL` (`https://user:token@host/...`) are dropped. Other keys land as
-`bazel.metadata.<KEY>`. Set the URL once in the repository's `.bazelrc`, and the commit and
+Credentials in a `REPO_URL` (`https://user:token@host/...`) are dropped. Other keys land on
+the root span as `bazel.metadata.<KEY>`. Set the URL once in the repository's `.bazelrc`, and the commit and
 branch from CI:
 
 ```
