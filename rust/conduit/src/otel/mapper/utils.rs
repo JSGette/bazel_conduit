@@ -149,6 +149,27 @@ pub(super) fn detect_workspace_name(workspace_dir: &Path) -> Option<String> {
     }
 }
 
+/// Drop `user:token@` from a `scheme://` URL; CI clone URLs (e.g. GitLab's
+/// `CI_REPOSITORY_URL`) embed a job token there.
+pub(super) fn strip_url_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// `https://github.com/DataDog/datadog-agent.git` and
+/// `git@github.com:DataDog/datadog-agent` -> `datadog-agent`.
+pub(super) fn repository_name_from_url(url: &str) -> Option<String> {
+    let last = url.trim_end_matches('/').rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Pull `name = "<value>"` out of the first `<func>(...)` block in a
 /// MODULE.bazel file. Substring-based and deliberately
 /// dumb - Starlark string escaping, commented-out blocks, or unusual

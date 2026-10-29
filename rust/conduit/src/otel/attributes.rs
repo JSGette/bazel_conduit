@@ -93,12 +93,18 @@ pub const BAZEL_WORKSPACE_DIR: &str = "bazel.workspace_directory";
 pub const BAZEL_WORKING_DIR: &str = "bazel.working_directory";
 pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
 
-// VCS / repository identity. Set once on the root span from the Bazel
-// workspace name — read out of `module(name = ...)` in MODULE.bazel, or
-// the basename of `workspace_directory` as a fallback. Uses the OTel VCS semantic
-// convention name so trace UIs (Datadog, Jaeger) that already know the
-// `vcs.*` registry pick it up without conduit-specific filters.
+// VCS / repository identity on the root span. The name comes from
+// `module(name = ...)` in MODULE.bazel, else the basename of
+// `workspace_directory`; a `--build_metadata=REPO_URL=...` overrides it.
+// URL, commit and branch come from `--build_metadata=REPO_URL|COMMIT_SHA|BRANCH`
+// and are emitted under both the OTel `vcs.*` and the Datadog `git.*` names.
 pub const VCS_REPOSITORY_NAME: &str = "vcs.repository.name";
+pub const VCS_REPOSITORY_URL: &str = "vcs.repository.url.full";
+pub const VCS_REF_HEAD_REVISION: &str = "vcs.ref.head.revision";
+pub const VCS_REF_HEAD_NAME: &str = "vcs.ref.head.name";
+pub const GIT_REPOSITORY_URL: &str = "git.repository_url";
+pub const GIT_COMMIT_SHA: &str = "git.commit.sha";
+pub const GIT_BRANCH: &str = "git.branch";
 
 // Fetch counters (root span)
 pub const BAZEL_FETCH_COUNT: &str = "bazel.fetch.count";
