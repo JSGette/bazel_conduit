@@ -14,6 +14,7 @@ autocfg,https://github.com/cuviper/autocfg,Apache-2.0 OR MIT,Josh Stone <cuviper
 axum,https://github.com/tokio-rs/axum,MIT,Copyright axum contributors
 axum-core,https://github.com/tokio-rs/axum,MIT,Copyright axum-core contributors
 base64,https://github.com/marshallpierce/rust-base64,MIT OR Apache-2.0,Marshall Pierce <marshall@mpierce.org>
+bazel,https://github.com/bazelbuild/bazel,Apache-2.0,Copyright The Bazel Authors
 bitflags,https://github.com/bitflags/bitflags,MIT OR Apache-2.0,The Rust Project Developers
 bumpalo,https://github.com/fitzgen/bumpalo,MIT OR Apache-2.0,Nick Fitzgerald <fitzgen@gmail.com>
 bytes,https://github.com/tokio-rs/bytes,MIT,Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
@@ -40,6 +41,7 @@ futures-util,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
+googleapis,https://github.com/googleapis/googleapis,Apache-2.0,Copyright Google LLC
 h2,https://github.com/hyperium/h2,MIT,Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
