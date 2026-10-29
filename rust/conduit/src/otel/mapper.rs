@@ -811,6 +811,11 @@ impl OtelMapper {
         finalization::finalize_and_end_remaining_open_actions(self);
     }
 
+    /// Root end used when no `BuildFinished` arrived.
+    pub fn default_finish_time(&mut self, nanos: Option<i64>) {
+        self.finish_time_nanos = self.finish_time_nanos.or(nanos);
+    }
+
     /// End all remaining spans (call after last BEP event).
     pub fn finish(&mut self) {
         let effective_end = self.root_span_end_from_wall_nanos.or(self.finish_time_nanos);

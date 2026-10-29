@@ -184,8 +184,6 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Export mode: {:?}", export_config);
 
-    let exporter = Exporter::start(&export_config)?;
-
     let redactor = args.build_redactor();
     if redactor.is_enabled() {
         info!("Command-line redaction: enabled");
@@ -221,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
     })?;
     info!("Logs: {log_mode}");
 
+    let exporter = Exporter::start(&export_config)?;
     let export = exporter.as_ref().map(|e| (e.tracer(), e.logger()));
     let exec_log = args.exec_log;
     let make_router = move || {
@@ -237,22 +236,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    match cli.command {
+    // Spans already queued must still flush when the command fails.
+    let result = match cli.command {
         Command::Replay { file, .. } => {
             let mut router = make_router();
-            let count = replay(File::open(&file)?, &mut router)?;
+            let replayed = File::open(&file)
+                .map_err(anyhow::Error::from)
+                .and_then(|f| Ok(replay(f, &mut router)?));
             router.finish();
-            info!("Replayed {count} events from {}: {}", file.display(), router.summary());
+            replayed.map(|count| info!("Replayed {count} events from {}: {}", file.display(), router.summary()))
         }
-        Command::Serve { port, listen_addr, .. } => {
-            serve(SocketAddr::new(listen_addr, port), make_router).await?;
-        }
-    }
+        Command::Serve { port, listen_addr, .. } => serve(SocketAddr::new(listen_addr, port), make_router).await,
+    };
 
     if let Some(exporter) = exporter {
         exporter.shutdown().await;
     }
-    Ok(())
+    result
 }
 
 async fn serve(

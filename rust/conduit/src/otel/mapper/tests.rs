@@ -1066,6 +1066,8 @@ fn lightweight_orphan_action_keeps_deferred_target() {
     let action = find_span(&spans, |s| s.name.contains("CppCompile") && s.name.contains("(synth)"))
         .expect("synthetic orphan action");
     assert_eq!(action.parent_span_id, target.span_context.span_id());
+    assert_eq!(attr_value(&action, BAZEL_ACTION_SUCCESS).as_deref(), Some("false"));
+    assert!(matches!(action.status, Status::Error { .. }));
     let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
     assert_eq!(
         attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(),
@@ -1373,7 +1375,7 @@ fn build_metrics_set_root_attrs_and_root_contains_finish() {
 // =====================================================================
 
 use super::progress::{error_record_summaries, LOG_RECORD_CAP_BYTES, MAX_LOG_RECORDS};
-use crate::otel::span::{Logger, Severity};
+use crate::otel::span::{Logger, Severity, Status};
 
 #[test]
 fn error_logs_keep_warnings_and_drop_progress_noise() {

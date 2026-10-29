@@ -157,6 +157,7 @@ pub struct EventRouter {
     /// Latest wall time seen in BEP payloads; stands in for the BES event
     /// time when replaying a file, which carries none.
     bep_clock_nanos: Option<i64>,
+    saw_bes_event_time: bool,
 }
 
 impl EventRouter {
@@ -177,6 +178,7 @@ impl EventRouter {
             exec_log: false,
             log_mode: LogMode::default(),
             bep_clock_nanos: None,
+            saw_bes_event_time: false,
         }
     }
 
@@ -269,6 +271,11 @@ impl EventRouter {
     /// Finalize: end all open spans on the current invocation.
     pub fn finish(&mut self) {
         if let Some(mapper) = &mut self.mapper {
+            // A replayed file cut short has no BuildFinished: end the root on
+            // the build's clock rather than at replay time, hours later.
+            if !self.saw_bes_event_time {
+                mapper.default_finish_time(self.bep_clock_nanos);
+            }
             mapper.finish();
         }
     }
@@ -362,6 +369,7 @@ impl EventRouter {
                 (_, Some(c)) => Some(c.max(t)),
             };
         }
+        self.saw_bes_event_time |= event_time_nanos.is_some();
         let event_time_nanos = event_time_nanos.or(self.bep_clock_nanos);
 
         let event_type = bep_event_type_name(id);
@@ -653,6 +661,10 @@ impl EventRouter {
                         .map(|ts| ts.seconds * 1_000_000_000 + i64::from(ts.nanos));
                     let duration_nanos = pr.test_attempt_duration.as_ref()
                         .map(|d| d.seconds * 1_000_000_000 + i64::from(d.nanos));
+                    let (start_time_nanos, duration_nanos) = match (start_time_nanos, duration_nanos) {
+                        (Some(start), Some(duration)) => (Some(start), Some(duration)),
+                        _ => (event_time_nanos, event_time_nanos.map(|_| 0)),
+                    };
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_test_result(&TestResultEvent {
                             label: &label,
@@ -753,6 +765,11 @@ fn payload_time_nanos(event: &BuildEvent) -> Option<i64> {
         BepPayload::Started(s) => s.start_time.as_ref(),
         BepPayload::Action(a) => a.end_time.as_ref(),
         BepPayload::Finished(f) => f.finish_time.as_ref(),
+        BepPayload::TestResult(t) => {
+            let (start, duration) = (t.test_attempt_start.as_ref()?, t.test_attempt_duration.as_ref()?);
+            let start = start.seconds * 1_000_000_000 + i64::from(start.nanos);
+            return Some(start + duration.seconds * 1_000_000_000 + i64::from(duration.nanos));
+        }
         _ => None,
     }?;
     Some(ts.seconds * 1_000_000_000 + i64::from(ts.nanos))
@@ -905,6 +922,57 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["action Genrule //:broken", "action Genrule //:slow"]);
+    }
+
+    #[test]
+    fn replay_without_timing_uses_the_bep_clock() {
+        use crate::build_event_stream::build_event::Payload;
+        use crate::build_event_stream::build_event_id::{Id, TestResultId};
+        use crate::build_event_stream::{BuildEvent, BuildEventId, BuildStarted, TestResult};
+        use crate::otel::span::{Sink, Tracer};
+        use crate::otel::OtelMapper;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let started = BuildEvent {
+            id: Some(BuildEventId { id: Some(Id::Started(Default::default())) }),
+            payload: Some(Payload::Started(BuildStarted {
+                uuid: "u".into(),
+                command: "test".into(),
+                start_time: Some(spawn_proto::timestamp_proto::google::protobuf::Timestamp { seconds: 100, nanos: 0 }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let result = BuildEvent {
+            id: Some(BuildEventId {
+                id: Some(Id::TestResult(TestResultId { label: "//:t".into(), attempt: 1, ..Default::default() })),
+            }),
+            payload: Some(Payload::TestResult(TestResult { status: 1, ..Default::default() })),
+            ..Default::default()
+        };
+
+        let mut timed = result.clone();
+        if let Some(Payload::TestResult(t)) = &mut timed.payload {
+            t.test_attempt_start = Some(spawn_proto::timestamp_proto::google::protobuf::Timestamp { seconds: 101, nanos: 0 });
+            t.test_attempt_duration = Some(spawn_proto::duration_proto::google::protobuf::Duration { seconds: 4, nanos: 0 });
+        }
+        if let Some(BuildEventId { id: Some(Id::TestResult(id)) }) = &mut timed.id {
+            id.attempt = 2;
+        }
+
+        let (sink, spans) = Sink::memory();
+        let mut router = super::EventRouter::new().with_mapper(OtelMapper::new(Tracer::new(sink), None));
+        router.route_build_event(&started, None).unwrap();
+        router.route_build_event(&result, None).unwrap();
+        router.route_build_event(&timed, None).unwrap();
+        router.finish();
+
+        let spans = spans.snapshot();
+        let test = spans.iter().find(|s| s.name.contains("attempt=1 ")).expect("untimed test span");
+        let build_clock = UNIX_EPOCH + Duration::from_secs(100);
+        assert_eq!((test.start_time, test.end_time), (build_clock, build_clock));
+        let root = spans.iter().find(|s| s.name.starts_with("bazel ")).expect("root span");
+        assert_eq!(root.end_time, UNIX_EPOCH + Duration::from_secs(105), "no BuildFinished: root ends on the build clock");
     }
 
     #[test]

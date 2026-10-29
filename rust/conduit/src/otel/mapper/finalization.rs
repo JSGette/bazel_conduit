@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
-use crate::otel::span::{KeyValue, SpanKind};
+use crate::otel::span::{KeyValue, SpanKind, Status};
 use super::super::attributes::*;
 use super::{nanos_to_system_time, shorten_label, spawn_time_range, ActionSpanInfo, ActionSpanKey, OtelMapper};
 use spawn_proto::tools::protos::SpawnExec;
@@ -221,8 +221,9 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
         )
     };
 
+    let success = spawns.iter().all(|s| s.exit_code == 0);
     let mut attrs = vec![
-        KeyValue::new(BAZEL_ACTION_SUCCESS, true),
+        KeyValue::new(BAZEL_ACTION_SUCCESS, success),
         KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
     ];
     if !key.mnemonic.is_empty() {
@@ -255,6 +256,9 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
     };
     for spawn in &spawns {
         crate::exec_log::emit_spawn_span(&mapper.tracer, &info, spawn, &mapper.redactor);
+    }
+    if !success {
+        span.set_status(Status::Error { description: "a spawn failed".into() });
     }
 
     if let Some(nanos) = clamped_end {
