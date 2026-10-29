@@ -13,11 +13,10 @@
 //! span, and synthesizes orphan parent actions for unmatched spawns at
 //! `finish()`.
 
+use crate::otel::span::{Context, KeyValue, Span, SpanKind, Status, Tracer};
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use opentelemetry::trace::{Span, SpanKind, TraceContextExt, Tracer};
-use opentelemetry::{Context, KeyValue};
 
 use crate::otel::attributes::*;
 use crate::otel::mapper::{ActionSpanInfo, ActionSpanKey, clamp_time_range, truncate_to_byte_limit};
@@ -62,7 +61,7 @@ pub fn read_message_len<R: Read>(r: &mut R, max_bytes: usize) -> std::io::Result
     if len > max_bytes as u64 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("execlog message length {len} exceeds {max_bytes} byte cap"),
+            format!("message length {len} exceeds {max_bytes} byte cap"),
         ));
     }
     Ok(Some(len as usize))
@@ -103,16 +102,10 @@ fn nanos_to_system_time(nanos: i64) -> SystemTime {
     }
 }
 
-/// Normalize label for matching: strip leading `@` so BEP `@@repo//:t` and
-/// exec log `@repo//:t` match.
-fn normalize_label(s: &str) -> &str {
-    s.trim_start_matches('@')
-}
-
 /// Candidate keys for cache lookup: (target_label, mnemonic, output) for each
 /// output in listed_outputs and actual_outputs.
 pub(crate) fn spawn_exec_candidate_keys(s: &SpawnExec) -> Vec<ActionSpanKey> {
-    let label = normalize_label(s.target_label.as_str());
+    let label = s.target_label.as_str();
     let mnemonic = s.mnemonic.as_str();
     let mut keys = Vec::new();
     for out in &s.listed_outputs {
@@ -204,7 +197,7 @@ fn duration_to_ms_raw(seconds: i64, nanos: i32) -> i64 {
 /// for first when triaging a slow action (which runner ran it, was it a
 /// cache hit, where did the time go).
 pub(crate) fn apply_spawn_attrs_to_action(
-    span: &mut opentelemetry_sdk::trace::Span,
+    span: &mut Span,
     s: &SpawnExec,
 ) {
     if !s.runner.is_empty() {
@@ -248,7 +241,7 @@ pub(crate) fn apply_spawn_attrs_to_action(
 /// so child spans don't start before or end after their parent (required by
 /// Datadog's flame graph, which uses temporal containment for nesting).
 pub(crate) fn emit_spawn_span(
-    tracer: &opentelemetry_sdk::trace::Tracer,
+    tracer: &Tracer,
     parent_info: &ActionSpanInfo,
     s: &SpawnExec,
     redactor: &Redactor,
@@ -276,7 +269,7 @@ pub(crate) fn emit_spawn_span(
     let mut span = tracer.build_with_context(builder, &parent_ctx);
 
     if s.exit_code != 0 {
-        span.set_status(opentelemetry::trace::Status::Error {
+        span.set_status(Status::Error {
             description: std::borrow::Cow::Owned(format!(
                 "exit_code={} status={}",
                 s.exit_code, s.status
@@ -296,65 +289,15 @@ pub(crate) fn emit_spawn_span(
 /// attribute -- defence in depth for rules that smuggle a Bazel-style
 /// `--client_env=NAME=VALUE` flag into the spawned process argv.
 fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
-    let mut attrs = Vec::with_capacity(32);
-
-    if !s.target_label.is_empty() {
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_TARGET_LABEL,
-            s.target_label.clone(),
-        ));
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_TARGET_LABEL_SHORT,
-            shorten_label(&s.target_label).to_string(),
-        ));
-    }
-    if !s.mnemonic.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_MNEMONIC, s.mnemonic.clone()));
-    }
-
-    let primary_output = s
-        .listed_outputs
-        .first()
-        .cloned()
-        .or_else(|| s.actual_outputs.first().map(|f| f.path.clone()))
-        .unwrap_or_default();
-    if !primary_output.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_PRIMARY_OUTPUT, primary_output));
-    }
-
-    if !s.listed_outputs.is_empty() {
-        let joined = s.listed_outputs.join(", ");
-        let total = s.listed_outputs.len();
-        let suffix = format!("... ({total} outputs total)");
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_LISTED_OUTPUTS,
-            truncate_to_byte_limit(&joined, SPAWN_ATTR_CAP_BYTES, &suffix),
-        ));
-    }
+    let mut attrs = Vec::with_capacity(16);
 
     attrs.push(KeyValue::new(BAZEL_SPAWN_RUNNER, s.runner.clone()));
     attrs.push(KeyValue::new(BAZEL_SPAWN_CACHE_HIT, s.cache_hit));
-    attrs.push(KeyValue::new(BAZEL_SPAWN_REMOTABLE, s.remotable));
-    attrs.push(KeyValue::new(BAZEL_SPAWN_CACHEABLE, s.cacheable));
-    attrs.push(KeyValue::new(BAZEL_SPAWN_REMOTE_CACHEABLE, s.remote_cacheable));
-
-    if !s.status.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_STATUS, s.status.clone()));
+    if !s.remote_cacheable {
+        attrs.push(KeyValue::new(BAZEL_SPAWN_REMOTE_CACHEABLE, false));
     }
     if s.exit_code != 0 {
         attrs.push(KeyValue::new(BAZEL_SPAWN_EXIT_CODE, s.exit_code as i64));
-    }
-    if s.timeout_millis != 0 {
-        attrs.push(KeyValue::new(BAZEL_SPAWN_TIMEOUT_MS, s.timeout_millis));
-    }
-
-    if let Some(ref d) = s.digest {
-        if !d.hash.is_empty() {
-            attrs.push(KeyValue::new(BAZEL_SPAWN_DIGEST, d.hash.clone()));
-        }
-        if d.size_bytes != 0 {
-            attrs.push(KeyValue::new(BAZEL_SPAWN_DIGEST_SIZE_BYTES, d.size_bytes));
-        }
     }
 
     if !s.command_args.is_empty() {
@@ -365,19 +308,6 @@ fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
         ));
     }
 
-    if !s.inputs.is_empty() {
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_INPUT_COUNT,
-            s.inputs.len() as i64,
-        ));
-    }
-    if !s.actual_outputs.is_empty() {
-        attrs.push(KeyValue::new(
-            BAZEL_SPAWN_OUTPUT_COUNT,
-            s.actual_outputs.len() as i64,
-        ));
-    }
-
     if let Some(ref m) = s.metrics {
         if m.input_bytes != 0 {
             attrs.push(KeyValue::new(BAZEL_SPAWN_INPUT_BYTES, m.input_bytes));
@@ -385,23 +315,11 @@ fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
         if m.input_files != 0 {
             attrs.push(KeyValue::new(BAZEL_SPAWN_INPUT_FILES, m.input_files as i64));
         }
-        if m.memory_estimate_bytes != 0 {
-            attrs.push(KeyValue::new(
-                BAZEL_SPAWN_MEMORY_ESTIMATE_BYTES,
-                m.memory_estimate_bytes,
-            ));
-        }
 
         if let Some(ref d) = m.execution_wall_time {
             let ms = duration_to_ms_raw(d.seconds, d.nanos);
             if ms > 0 {
                 attrs.push(KeyValue::new(BAZEL_SPAWN_EXEC_WALL_TIME_MS, ms));
-            }
-        }
-        if let Some(ref d) = m.parse_time {
-            let ms = duration_to_ms_raw(d.seconds, d.nanos);
-            if ms > 0 {
-                attrs.push(KeyValue::new(BAZEL_SPAWN_PARSE_TIME_MS, ms));
             }
         }
         if let Some(ref d) = m.network_time {
@@ -449,6 +367,18 @@ fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
     }
 
     attrs
+}
+
+/// Signals a [`TracePolicy`](crate::state::TracePolicy) needs to decide whether
+/// this spawn is worth a span: `(exit_code, cache_hit, cacheable, duration_ms)`.
+/// Duration comes from `SpawnMetrics.total_time` (wall + overhead).
+pub(crate) fn spawn_trace_signal(s: &SpawnExec) -> (i32, bool, bool, Option<i64>) {
+    let duration_ms = s
+        .metrics
+        .as_ref()
+        .and_then(|m| m.total_time.as_ref())
+        .map(|d| duration_to_ms_raw(d.seconds, d.nanos));
+    (s.exit_code, s.cache_hit, s.cacheable, duration_ms)
 }
 
 /// Extract (start_nanos, end_nanos) from SpawnMetrics.

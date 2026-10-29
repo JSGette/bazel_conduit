@@ -1,19 +1,36 @@
 # Integration tests for conduit: BEP -> trace, no performance regression.
-# Uses minimal BEP sample (no live Bazel build) for hermetic, fast test.
+# Uses a generated binary BEP sample (no live Bazel build) for a hermetic, fast test.
 
+load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+rust_binary(
+    name = "gen_bep_sample",
+    srcs = ["gen_bep_sample.rs"],
+    deps = [
+        "//proto/build_event_stream:build_event_stream_rust_proto",
+        "@crates//:prost",
+    ],
+)
+
+genrule(
+    name = "bep_sample",
+    outs = ["bep_sample.bin"],
+    cmd = "$(execpath :gen_bep_sample) $@",
+    tools = [":gen_bep_sample"],
+)
 
 sh_test(
     name = "trace_test",
     srcs = ["trace_test.sh"],
     data = [
+        ":bep_sample",
         "//rust/conduit:conduit",
         "analyze_trace.py",
-        "bep_sample.ndjson",
     ],
     args = [
         "$(location //rust/conduit:conduit)",
-        "$(location bep_sample.ndjson)",
+        "$(location :bep_sample)",
         "$(location analyze_trace.py)",
     ],
     tags = ["integration"],

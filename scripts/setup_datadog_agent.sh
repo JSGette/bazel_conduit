@@ -29,7 +29,7 @@ NO_CONDUIT=0
 DRY_RUN=0
 REFRESH_TOKEN=0
 CONDUIT_BES_PORT="${CONDUIT_BES_PORT:-8080}"
-CONDUIT_EXEC_LOG="${CONDUIT_EXEC_LOG:-/tmp/conduit-exec.log}"
+CONDUIT_EXEC_LOG="${CONDUIT_EXEC_LOG:-}"
 CONDUIT_TARGET="${CONDUIT_TARGET:-//rust/conduit:conduit}"
 PORT_CANDIDATES=(4317 14317 24317 34317 44317 54317)
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,7 +54,8 @@ Usage: setup_datadog_agent.sh [--domain DOMAIN] [--no-restart] [--no-conduit] [-
 
 Env overrides:
   CONDUIT_BES_PORT       Port conduit listens on for BES        (default: 8080)
-  CONDUIT_EXEC_LOG       Path for --execution_log_compact_file= (default: /tmp/conduit-exec.log)
+  CONDUIT_EXEC_LOG       Opt into per-spawn detail: path for --execution_log_compact_file=
+                         and run conduit with --exec-log (default: unset, off)
   CONDUIT_TARGET         Bazel target for the conduit binary    (default: //rust/conduit:conduit)
 EOF
 }
@@ -229,14 +230,17 @@ else
 fi
 
 # ---------- step 5: print bazel snippet --------------------------------------
+EXEC_LOG_RC=""
+if [[ -n "${CONDUIT_EXEC_LOG}" ]]; then
+  EXEC_LOG_RC="common --execution_log_compact_file=${CONDUIT_EXEC_LOG}"$'\n'
+fi
 cat <<EOF
 
 ==================================================================
 Add the following to your user.bazelrc (or .bazelrc):
 ------------------------------------------------------------------
-common --bes_backend=grpc://localhost:${CONDUIT_BES_PORT}
-common --execution_log_compact_file=${CONDUIT_EXEC_LOG}
-# Optional: emit BEP for every action, not just the failing/test ones.
+common --bes_backend=grpc://127.0.0.1:${CONDUIT_BES_PORT}
+${EXEC_LOG_RC}# Optional: emit BEP for every action, not just the failing/test ones.
 build  --build_event_publish_all_actions
 
 Then run any bazel build/test as usual; traces and logs will land in
@@ -245,8 +249,11 @@ your Datadog org via the local agent (site: ${DD_SITE}).
 EOF
 
 # ---------- step 6: launch conduit -------------------------------------------
-CONDUIT_ARGS=(--serve --port "${CONDUIT_BES_PORT}"
+CONDUIT_ARGS=(serve --port "${CONDUIT_BES_PORT}"
               --export otlp --otlp-endpoint "http://localhost:${OTLP_GRPC_PORT}")
+if [[ -n "${CONDUIT_EXEC_LOG}" ]]; then
+  CONDUIT_ARGS+=(--exec-log)
+fi
 
 if (( NO_CONDUIT )) || (( DRY_RUN )); then
   cat <<EOF

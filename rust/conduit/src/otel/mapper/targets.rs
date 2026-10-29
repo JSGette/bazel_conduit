@@ -1,16 +1,14 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::{Context, KeyValue, SpanKind, Status};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::time::SystemTime;
 
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::KeyValue;
 use tracing::{debug, warn};
 
 use super::super::attributes::*;
-use super::{bytestream_uri_to_display, normalize_label, ConfiguredTarget, NamedSetEntry, OtelMapper};
+use super::{ConfiguredTarget, DeferredTarget, OtelMapper};
 
 impl OtelMapper {
     /// TargetConfigured -> store metadata for deferred span creation.
@@ -50,17 +48,14 @@ impl OtelMapper {
     /// When `start_nanos_override` is set (e.g. earliest action start), use it
     /// instead of configured event time so target duration reflects action timing.
     fn create_target_span(
-        &self,
+        &mut self,
         label: &str,
         configured: &ConfiguredTarget,
-        parent: &opentelemetry::Context,
+        parent: &Context,
         start_nanos_override: Option<i64>,
-    ) -> opentelemetry::Context {
+    ) -> Context {
         let short = shorten_label(label);
-        let mut attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
-        ];
+        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
         if let Some(k) = &configured.kind {
             attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
         }
@@ -75,7 +70,14 @@ impl OtelMapper {
         }
 
         let raw_start = start_nanos_override.or(configured.event_time_nanos);
-        let (start_nanos, _) = self.clamp_to_invocation(raw_start, None);
+        // Always anchor at a real timestamp (fall back to invocation start) so
+        // untimed child actions can be kept inside the target window instead of
+        // racing a wall-clock creation time.
+        let start_nanos = self
+            .clamp_to_invocation(raw_start, None)
+            .0
+            .or(self.root_span_start_nanos);
+        self.record_target_start(label, start_nanos);
         let mut builder = self
             .tracer
             .span_builder(format!("target {short}"))
@@ -87,7 +89,7 @@ impl OtelMapper {
         }
 
         let span = self.tracer.build_with_context(builder, parent);
-        opentelemetry::Context::new().with_span(span)
+        Context::new().with_span(span)
     }
 
     /// Resolve the parent context to use for action/test child spans.
@@ -99,27 +101,19 @@ impl OtelMapper {
         &mut self,
         label: &str,
         start_nanos: Option<i64>,
-    ) -> Option<opentelemetry::Context> {
+    ) -> Option<Context> {
         if let Some(existing) = self.target_contexts.get(label) {
             return Some(existing.clone());
         }
-        if let Some(existing) = self
-            .target_contexts
-            .iter()
-            .find(|(existing, _)| normalize_label(existing) == normalize_label(label))
-            .map(|(_, context)| context.clone())
-        {
-            return Some(existing);
-        }
-        let parent = self.choose_parent_for_label(label)?;
+        let parent = self.root_context.clone()?;
         if self.closed_targets.contains(label) {
             let cx = self.create_synthetic_target_span(label, &parent, start_nanos);
             self.synthetic_target_labels.insert(label.to_string());
             self.target_contexts.insert(label.to_string(), cx.clone());
             return Some(cx);
         }
-        if let Some(configured) = self.configured_targets.get(label) {
-            let cx = self.create_target_span(label, configured, &parent, start_nanos);
+        if let Some(configured) = self.configured_targets.get(label).cloned() {
+            let cx = self.create_target_span(label, &configured, &parent, start_nanos);
             debug!("Lazily created target span for {label} (action needed parent)");
             self.target_contexts.insert(label.to_string(), cx.clone());
             return Some(cx);
@@ -130,67 +124,31 @@ impl OtelMapper {
         Some(cx)
     }
 
-    pub(super) fn record_synthetic_target_end(&mut self, label: &str, end_nanos: Option<i64>) {
+    pub(super) fn record_target_child_end(&mut self, label: &str, end_nanos: Option<i64>) {
+        // Clamp to the invocation window: cache hits can carry spawn/action
+        // ends beyond it, which would push the synthetic target span past root
+        // and its own children.
+        let (_, end_nanos) = self.clamp_to_invocation(None, end_nanos);
         let Some(end_nanos) = end_nanos else {
             return;
         };
-        let tracked_label = if self.synthetic_target_labels.contains(label) {
-            label.to_string()
-        } else {
-            let normalized = normalize_label(label);
-            let Some(existing) = self
-                .synthetic_target_labels
-                .iter()
-                .find(|existing| normalize_label(existing) == normalized)
-            else {
-                return;
-            };
-            existing.clone()
-        };
-        self.synthetic_target_end_nanos
-            .entry(tracked_label)
+        self.target_child_end_nanos
+            .entry(label.to_string())
             .and_modify(|current| *current = (*current).max(end_nanos))
             .or_insert(end_nanos);
-    }
-
-    /// Returns true if a label looks like an external dependency.
-    fn is_external_label(label: &str) -> bool {
-        label.starts_with('@') || label.contains("+_repo_rules+")
-    }
-
-    /// Choose the correct parent for a target: root for local targets,
-    /// `external deps` group span for external dependencies.
-    fn choose_parent_for_label(&mut self, label: &str) -> Option<opentelemetry::Context> {
-        if Self::is_external_label(label) {
-            self.ensure_external_deps_span();
-            self.external_deps_context.clone()
-        } else {
-            self.root_context.clone()
-        }
-    }
-
-    /// Lazily create the `external deps` parent span.
-    fn ensure_external_deps_span(&mut self) {
-        Self::ensure_group_span(
-            &mut self.external_deps_context,
-            &self.root_context,
-            &self.tracer,
-            "external deps",
-        );
     }
 
     /// Create a target span with only the label (no kind/tags). Used when we see
     /// an action with a label but no prior TargetConfigured event.
     fn create_synthetic_target_span(
-        &self,
+        &mut self,
         label: &str,
-        parent: &opentelemetry::Context,
+        parent: &Context,
         start_nanos: Option<i64>,
-    ) -> opentelemetry::Context {
+    ) -> Context {
         let short = shorten_label(label);
         let attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
         ];
         let mut builder = self
@@ -198,23 +156,46 @@ impl OtelMapper {
             .span_builder(format!("target {short}"))
             .with_kind(SpanKind::Internal)
             .with_attributes(attrs);
-        let (clamped_start, _) = self.clamp_to_invocation(start_nanos, None);
+        let clamped_start = self
+            .clamp_to_invocation(start_nanos, None)
+            .0
+            .or(self.root_span_start_nanos);
+        self.record_target_start(label, clamped_start);
         if let Some(nanos) = clamped_start {
             builder = builder.with_start_time(super::nanos_to_system_time(nanos));
         }
         let span = self.tracer.build_with_context(builder, parent);
-        opentelemetry::Context::new().with_span(span)
+        Context::new().with_span(span)
     }
 
-    /// TargetCompleted -> create (or reuse) the target span, set attributes,
-    /// resolve output file sets from whatever's currently in the
-    /// `NamedSet` cache (`resolve_files` skips missing IDs), and end the
-    /// span synchronously.
+    /// TargetCompleted. Targets complete at [`OtelMapper::finish`]: tests
+    /// (and their summary) arrive after `TargetCompleted`, and the lightweight
+    /// action budget is only settled there.
     pub fn on_target_completed(
         &mut self,
         label: &str,
         success: bool,
-        file_set_ids: &[String],
+        tags: &[String],
+        event_time_nanos: Option<i64>,
+    ) {
+        self.deferred_targets
+            .entry(label.to_string())
+            .and_modify(|t| {
+                t.success &= success;
+                t.event_time_nanos = t.event_time_nanos.max(event_time_nanos);
+            })
+            .or_insert_with(|| DeferredTarget {
+                label: label.to_string(),
+                success,
+                tags: tags.to_vec(),
+                event_time_nanos,
+            });
+    }
+
+    pub(super) fn complete_target(
+        &mut self,
+        label: &str,
+        success: bool,
         tags: &[String],
         event_time_nanos: Option<i64>,
     ) {
@@ -227,15 +208,39 @@ impl OtelMapper {
         // their original action timestamps, so without this a span ending at
         // event_time will run from the cached `start` (weeks ago) to today.
         let (_, effective_end) = self.clamp_to_invocation(None, event_time_nanos);
+        // Completion is deferred to finish, so tests and actions reported after
+        // TargetCompleted can end later than it.
+        let effective_end = match (effective_end, self.target_child_end_nanos.get(label).copied()) {
+            (Some(end), Some(child_end)) => Some(end.max(child_end)),
+            (end, child_end) => end.or(child_end),
+        };
+        let (_, effective_end) = self.clamp_to_invocation(None, effective_end);
         // Consume configured metadata up front regardless of whether the span
         // was already created lazily from an action/test event.
         let configured = self.configured_targets.remove(label);
+
+        // Lightweight profile: a successful target whose span was never opened
+        // by a retained child (failed/slow/miss action or a test) carries no
+        // diagnostic signal, so drop it. `target_contexts` only holds a target
+        // once a retained child lazily created it, so its presence is our
+        // "has an interesting child" test. Failed targets always survive.
+        if success
+            && !self.trace_policy.is_full()
+            && !self.target_contexts.contains_key(label)
+        {
+            self.synthetic_target_labels.remove(label);
+            self.target_child_end_nanos.remove(label);
+            self.closed_targets.insert(label.to_string());
+            self.suppressed_targets = self.suppressed_targets.saturating_add(1);
+            debug!("Suppressed empty successful target span for {label} (lightweight)");
+            return;
+        }
 
         // Get or create the span under the appropriate parent.
         let cx = if let Some(cx) = self.target_contexts.remove(label) {
             cx
         } else if let Some(configured) = configured {
-            let parent = self.choose_parent_for_label(label);
+            let parent = self.root_context.clone();
             if let Some(parent) = parent {
                 let cx = self.create_target_span(label, &configured, &parent, None);
                 debug!("Created target span for {label} at completion time");
@@ -276,18 +281,15 @@ impl OtelMapper {
 
         // End any action spans we held open for this target. Deterministic
         // boundary - Bazel guarantees no further ActionExecuted events for
-        // this target. Anything still open without a matching SpawnExec at
-        // this point picks up `bazel.action.spawn.missing=true`.
+        // this target.
         self.end_open_actions_for_target(label, effective_end);
 
-        Self::set_output_attributes_and_end_target_span(
-            &self.named_set_cache,
-            &cx,
-            file_set_ids,
-            effective_end,
-        );
+        match effective_end {
+            Some(nanos) => cx.span().end_with_timestamp(super::nanos_to_system_time(nanos)),
+            None => cx.span().end(),
+        }
         self.synthetic_target_labels.remove(label);
-        self.synthetic_target_end_nanos.remove(label);
+        self.target_child_end_nanos.remove(label);
         self.closed_targets.insert(label.to_string());
         debug!("Ended target span for {label} (success={success})");
     }
@@ -315,6 +317,7 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "skipped targets",
+            self.root_span_start_nanos,
         );
 
         let parent = match &self.skipped_context {
@@ -325,7 +328,6 @@ impl OtelMapper {
         let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
         ];
         if let Some(configured) = &configured {
@@ -353,86 +355,14 @@ impl OtelMapper {
             .with_start_time(instant);
 
         let span = self.tracer.build_with_context(builder, parent);
-        let cx = opentelemetry::Context::new().with_span(span);
+        let cx = Context::new().with_span(span);
 
         cx.span().set_status(Status::Unset);
         cx.span().end_with_timestamp(instant);
         self.synthetic_target_labels.remove(label);
-        self.synthetic_target_end_nanos.remove(label);
+        self.target_child_end_nanos.remove(label);
         self.closed_targets.insert(label.to_string());
 
         debug!("Created and ended skipped target span for {label}");
-    }
-
-    /// Set output file attributes on the target span and end it.
-    fn set_output_attributes_and_end_target_span(
-        cache: &HashMap<String, NamedSetEntry>,
-        cx: &opentelemetry::Context,
-        file_set_ids: &[String],
-        event_time_nanos: Option<i64>,
-    ) {
-        let all_files = Self::resolve_files(cache, file_set_ids);
-
-        if !all_files.is_empty() {
-            let display_files: Vec<String> = all_files
-                .iter()
-                .map(|s| bytestream_uri_to_display(s).into_owned())
-                .collect();
-            let file_list = if display_files.len() <= 20 {
-                display_files.join(", ")
-            } else {
-                format!(
-                    "{} ... and {} more",
-                    display_files[..20].join(", "),
-                    display_files.len() - 20
-                )
-            };
-            cx.span()
-                .set_attribute(KeyValue::new(BAZEL_NAMED_SET_FILE_COUNT, all_files.len() as i64));
-            cx.span()
-                .set_attribute(KeyValue::new(BAZEL_TARGET_OUTPUT_FILES, file_list));
-        }
-
-        if let Some(nanos) = event_time_nanos {
-            cx.span()
-                .end_with_timestamp(super::nanos_to_system_time(nanos));
-        } else {
-            cx.span().end();
-        }
-    }
-
-    /// Recursively collect all files reachable from the given NamedSet IDs.
-    /// IDs missing from the cache are silently skipped.
-    fn resolve_files(cache: &HashMap<String, NamedSetEntry>, set_ids: &[String]) -> Vec<String> {
-        let mut files = Vec::new();
-        let mut stack: Vec<&str> = set_ids.iter().map(String::as_str).collect();
-        let mut visited = std::collections::HashSet::new();
-        while let Some(id) = stack.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            if let Some(entry) = cache.get(id) {
-                files.extend(entry.files.iter().cloned());
-                for child in &entry.child_set_ids {
-                    stack.push(child.as_str());
-                }
-            }
-        }
-        files
-    }
-
-    /// Cache a NamedSet so its files can be resolved when targets complete.
-    ///
-    /// A NamedSet can contain direct `files` AND references to other
-    /// NamedSets (`child_set_ids`); both are stored so [`resolve_files`]
-    /// can collect the transitive closure.
-    pub fn on_named_set(&mut self, set_id: &str, files: Vec<String>, child_set_ids: &[String]) {
-        self.named_set_cache.insert(
-            set_id.to_string(),
-            NamedSetEntry {
-                files,
-                child_set_ids: child_set_ids.to_vec(),
-            },
-        );
     }
 }

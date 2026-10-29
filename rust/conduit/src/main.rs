@@ -1,48 +1,62 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
-use clap::Parser;
-use conduit_lib::bep::{BepDecoder, EventRouter};
+use clap::{Args, Parser, Subcommand};
+use conduit_lib::bep::{replay, EventRouter};
 use conduit_lib::grpc::run_server;
 use conduit_lib::otel::{
-    init_logger_provider, init_tracer_provider, ExportConfig, Redactor,
-    DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE, DEFAULT_REDACT_PATTERNS,
+    ExportConfig, Exporter, LogMode, Redactor, DEFAULT_OTLP_MAX_EXPORT_BATCH_SIZE,
+    DEFAULT_REDACT_PATTERNS,
 };
-use opentelemetry::logs::LoggerProvider as _;
-use opentelemetry::trace::TracerProvider as _;
+use conduit_lib::state::{
+    TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
+};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use tracing::{error, info, warn, Level};
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// BEP to OpenTelemetry trace converter
 #[derive(Parser, Debug)]
 #[command(name = "conduit")]
 #[command(about = "Convert Bazel Build Event Protocol events to OpenTelemetry traces")]
-struct Args {
-    /// Input BEP JSON file (mutually exclusive with gRPC server mode)
-    #[arg(short, long)]
-    input: Option<PathBuf>,
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Start gRPC server for BES (Build Event Service)
-    #[arg(short, long)]
-    serve: bool,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the BES gRPC server; point Bazel at it with
+    /// `--bes_backend=grpc://127.0.0.1:<port>`.
+    Serve {
+        /// gRPC server port
+        #[arg(short = 'p', long, default_value = "8080")]
+        port: u16,
 
-    /// gRPC server port
-    #[arg(short = 'p', long, default_value = "8080")]
-    port: u16,
+        /// Bind address. Defaults to loopback because conduit has no auth
+        /// or TLS; any other address must be paired with external access
+        /// control (firewall, sidecar mTLS, network policy).
+        #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        listen_addr: IpAddr,
 
-    /// Bind address for the BES gRPC server. Defaults to loopback
-    /// (`127.0.0.1`) because conduit has no auth or TLS — exposing
-    /// it to other hosts is an explicit, deliberate choice that
-    /// must be paired with external access control (firewall,
-    /// sidecar mTLS, etc.). Use `0.0.0.0` to listen on all
-    /// interfaces, or a specific host IP to restrict to one NIC.
-    #[arg(long, value_name = "IP", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    listen_addr: IpAddr,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Replay a binary BEP file written with `--build_event_binary_file`.
+    Replay {
+        file: PathBuf,
 
-    /// Export mode: none, stdout, otlp
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Args, Debug)]
+struct Common {
+    /// Export mode: none, stdout (OTLP-JSON lines), otlp (gRPC)
     #[arg(long, default_value = "none")]
     export: String,
 
@@ -72,6 +86,12 @@ struct Args {
     #[arg(long = "redact-name-pattern", value_name = "SUBSTR")]
     redact_name_patterns: Vec<String>,
 
+    /// Enrich actions with per-spawn detail from Bazel's compact execution
+    /// log (`--execution_log_compact_file`). Off by default: conduit ignores
+    /// the exec log even when the build writes one.
+    #[arg(long, default_value_t = false)]
+    exec_log: bool,
+
     /// Per-message cap (in MiB) on length-delimited entries in Bazel's
     /// `--execution_log_{binary,compact}_file`. A malformed varint length
     /// prefix would otherwise be fed straight to `Vec::resize`. The default
@@ -87,9 +107,34 @@ struct Args {
     /// (2 GiB) is ~4x the largest realistic decompressed compact log.
     #[arg(long, value_name = "MIB", default_value_t = 2048)]
     exec_log_max_decompressed_mib: u32,
+
+    /// Trace verbosity: `lightweight` (default) or `full`.
+    ///
+    /// `full` emits a span per action/spawn/target. `lightweight` keeps
+    /// failed actions plus the `--max-action-spans` slowest successful ones,
+    /// and only the targets they belong to; aggregate metrics stay on the
+    /// root span either way.
+    #[arg(long, default_value = "lightweight")]
+    trace_profile: String,
+
+    /// Lightweight only: minimum duration (ms) for a successful, cache-hit
+    /// spawn to keep its span. Failed and cache-missed spawns are kept.
+    #[arg(long, default_value_t = DEFAULT_TRACE_MIN_DURATION_MS)]
+    trace_min_duration_ms: i64,
+
+    /// Lightweight only: how many successful actions (the slowest) keep
+    /// their span per invocation.
+    #[arg(long, default_value_t = DEFAULT_MAX_ACTION_SPANS)]
+    max_action_spans: usize,
+
+    /// Which Bazel console output becomes OTLP log records: `errors`
+    /// (ERROR/FAIL/WARNING blocks and failed test output), `all`, or `none`.
+    /// Records are capped at 64 KiB and 256 per invocation.
+    #[arg(long, default_value = "errors")]
+    logs: String,
 }
 
-impl Args {
+impl Common {
     fn build_redactor(&self) -> Redactor {
         if self.no_redact {
             return Redactor::disabled();
@@ -103,7 +148,10 @@ impl Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let args = match &cli.command {
+        Command::Serve { common, .. } | Command::Replay { common, .. } => common,
+    };
 
     // Set up logging
     let level = match args.log_level.to_lowercase().as_str() {
@@ -118,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(level)
         .with_target(true)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -135,13 +184,6 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Export mode: {:?}", export_config);
 
-    // Build OTel providers exactly once, here. Resource carries only
-    // service.name + telemetry.sdk.* so spans can outlive a single
-    // invocation; per-invocation attrs (bazel.invocation_id, command,
-    // workspace.directory) are set on the root span instead.
-    let tracer_provider = init_tracer_provider(&export_config)?;
-    let logger_provider = init_logger_provider(&export_config)?;
-
     let redactor = args.build_redactor();
     if redactor.is_enabled() {
         info!("Command-line redaction: enabled");
@@ -153,77 +195,83 @@ async fn main() -> anyhow::Result<()> {
         (args.exec_log_max_message_mib as usize).saturating_mul(1024 * 1024);
     let exec_log_max_decompressed_bytes =
         (args.exec_log_max_decompressed_mib as usize).saturating_mul(1024 * 1024);
-    info!(
-        "Execution log caps: {} MiB per message, {} MiB decompressed total",
-        args.exec_log_max_message_mib, args.exec_log_max_decompressed_mib
+    if args.exec_log {
+        info!(
+            "Execution log enrichment: enabled ({} MiB per message, {} MiB decompressed total)",
+            args.exec_log_max_message_mib, args.exec_log_max_decompressed_mib
+        );
+    }
+
+    let trace_profile = TraceProfile::parse(&args.trace_profile).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --trace-profile '{}' (expected lightweight or full)",
+            args.trace_profile
+        )
+    })?;
+    let trace_policy = TracePolicy::new(
+        trace_profile,
+        args.trace_min_duration_ms,
+        args.max_action_spans,
     );
+    info!("Trace profile: {trace_policy}");
+    let log_mode = LogMode::parse(&args.logs).ok_or_else(|| {
+        anyhow::anyhow!("invalid --logs '{}' (expected errors, all or none)", args.logs)
+    })?;
+    info!("Logs: {log_mode}");
 
-    let mut router = EventRouter::new()
-        .with_redactor(redactor)
-        .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
-        .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes);
-    if let (Some(tp), Some(lp)) = (&tracer_provider, &logger_provider) {
-        router = router.with_export(tp.tracer("conduit"), lp.logger("conduit"));
-    }
-
-    if let Some(input_path) = args.input {
-        process_json_file(&input_path, &mut router)?;
-        router.finish();
-    } else if args.serve {
-        let addr = SocketAddr::new(args.listen_addr, args.port);
-        if !args.listen_addr.is_loopback() {
-            warn!(
-                %addr,
-                "Binding gRPC server to a non-loopback address. Conduit has no auth or TLS; \
-                 ensure access is restricted via firewall / sidecar / network policy."
-            );
+    let exporter = Exporter::start(&export_config)?;
+    let export = exporter.as_ref().map(|e| (e.tracer(), e.logger()));
+    let exec_log = args.exec_log;
+    let make_router = move || {
+        let router = EventRouter::new()
+            .with_exec_log(exec_log)
+            .with_redactor(redactor.clone())
+            .with_exec_log_max_message_bytes(exec_log_max_message_bytes)
+            .with_exec_log_max_decompressed_bytes(exec_log_max_decompressed_bytes)
+            .with_trace_policy(trace_policy)
+            .with_log_mode(log_mode);
+        match &export {
+            Some((tracer, logger)) => router.with_export(tracer.clone(), logger.clone()),
+            None => router,
         }
-        run_server(addr, router).await?;
-    } else {
-        info!("Usage:");
-        info!("  Process JSON file: conduit --input <file.json> [--export stdout|otlp]");
-        info!("  Start gRPC server: conduit --serve [--port 8080] [--export stdout|otlp]");
-        info!("");
-        info!("For Bazel, use: bazel build //... --bes_backend=grpc://localhost:{}", args.port);
-    }
+    };
 
-    if let Some(tp) = tracer_provider {
-        if let Err(e) = tp.shutdown() {
-            error!("TracerProvider shutdown reported error: {e:?}");
+    // Spans already queued must still flush when the command fails.
+    let result = match cli.command {
+        Command::Replay { file, .. } => {
+            let mut router = make_router();
+            let replayed = File::open(&file)
+                .map_err(anyhow::Error::from)
+                .and_then(|f| Ok(replay(f, &mut router)?));
+            router.finish();
+            replayed.map(|count| info!("Replayed {count} events from {}: {}", file.display(), router.summary()))
         }
-    }
-    if let Some(lp) = logger_provider {
-        if let Err(e) = lp.shutdown() {
-            error!("LoggerProvider shutdown reported error: {e:?}");
-        }
-    }
+        Command::Serve { port, listen_addr, .. } => serve(SocketAddr::new(listen_addr, port), make_router).await,
+    };
 
-    Ok(())
+    if let Some(exporter) = exporter {
+        exporter.shutdown().await;
+    }
+    result
 }
 
-fn process_json_file(path: &PathBuf, router: &mut EventRouter) -> anyhow::Result<()> {
-    info!("Processing BEP JSON file: {}", path.display());
-
-    let file = File::open(path)?;
-    let decoder = BepDecoder::new();
-    let events = decoder.decode_json_file(file)?;
-
-    info!("Loaded {} events from file", events.len());
-
-    for event in &events {
-        if let Err(e) = router.route(event) {
-            error!("Error routing event: {}", e);
-        }
-
-        if event.is_last_message() {
-            info!("Received last message");
-            break;
-        }
+async fn serve(
+    addr: SocketAddr,
+    make_router: impl Fn() -> EventRouter + Send + Sync + 'static,
+) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "Binding gRPC server to a non-loopback address. Conduit has no auth or TLS; \
+             ensure access is restricted via firewall / sidecar / network policy."
+        );
     }
-
-    // Print summary
-    let summary = router.state().summary();
-    println!("\n{}", summary);
-
-    Ok(())
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down"),
+            _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+        }
+    };
+    run_server(addr, make_router, shutdown).await
 }

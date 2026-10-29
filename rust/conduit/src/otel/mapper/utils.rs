@@ -64,23 +64,6 @@ pub(super) fn strip_ansi(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Convert a bytestream URI to a display-friendly form: show the path part (e.g. after
-/// the authority, such as `blobs/hash/size`) or leave as-is if no path or not bytestream.
-pub(super) fn bytestream_uri_to_display(uri: &str) -> Cow<'_, str> {
-    const PREFIX: &str = "bytestream://";
-    if !uri.starts_with(PREFIX) {
-        return Cow::Borrowed(uri);
-    }
-    let after_prefix = &uri[PREFIX.len()..];
-    if let Some(slash) = after_prefix.find('/') {
-        let path = &after_prefix[slash + 1..];
-        if !path.is_empty() {
-            return Cow::Owned(path.to_string());
-        }
-    }
-    Cow::Borrowed(uri)
-}
-
 /// Extract (start_nanos, end_nanos) from a `SpawnExec` via its
 /// `SpawnMetrics.start_time` + `total_time`. Returns `None` when timing
 /// data is absent.
@@ -129,34 +112,8 @@ pub fn clamp_time_range(
     }
 }
 
-/// Normalize label for matching: strip leading `@` so BEP `@@repo//:t` and exec log `@repo//:t` match.
-pub(super) fn normalize_label(s: &str) -> &str {
-    s.trim_start_matches('@')
-}
-
-/// Maximum size in bytes for each of progress_stderr and progress_stdout.
-/// Each stream is capped at 1 MB; when appending would exceed the cap, the
-/// existing buffer is truncated to keep the tail (recent output) and new
-/// content is appended. Enforced in [`crate::otel::mapper::OtelMapper::on_progress`].
-pub(super) const PROGRESS_CAP_BYTES: usize = 1024 * 1024; // 1 MB
 pub(super) const COMMAND_LINE_CAP_BYTES: usize = 4096; // 4 KB
 
-/// Byte length of the suffix added when we truncate from the front.
-pub(super) const PROGRESS_TRUNCATION_SUFFIX: &str = "\n...(truncated)\n";
-
-/// Return the byte offset into `s` such that `s[offset..]` is the last at most
-/// `max_tail_bytes` bytes of `s` at a valid UTF-8 character boundary.
-pub(super) fn tail_byte_offset(s: &str, max_tail_bytes: usize) -> usize {
-    if s.len() <= max_tail_bytes {
-        return 0;
-    }
-    let start = s.len() - max_tail_bytes;
-    let mut i = start;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i.min(s.len())
-}
 
 /// Truncate `s` to at most `max_bytes` bytes, stepping back to the nearest
 /// UTF-8 boundary and appending `suffix`. Returns the original string when
@@ -172,73 +129,17 @@ pub fn truncate_to_byte_limit(s: &str, max_bytes: usize, suffix: &str) -> String
     format!("{}{}", &s[..cut], suffix)
 }
 
-/// Append `new_content` to `buf` while keeping total size <= PROGRESS_CAP_BYTES.
-/// When appending would exceed the cap, truncates the existing buffer to keep
-/// the tail (recent output), adds a truncation marker, then appends the new content.
-pub(super) fn append_progress_capped(buf: &mut String, new_content: &str) {
-    let suffix_len = PROGRESS_TRUNCATION_SUFFIX.len();
-    let max_total = PROGRESS_CAP_BYTES;
-
-    if buf.len() + new_content.len() <= max_total {
-        buf.push_str(new_content);
-        return;
-    }
-
-    // Need to drop from the front: keep last (max_total - new_content.len() - suffix_len) bytes of buf.
-    let max_old_tail = max_total.saturating_sub(new_content.len()).saturating_sub(suffix_len);
-    if max_old_tail > 0 {
-        let offset = tail_byte_offset(buf, max_old_tail);
-        let tail = buf[offset..].to_string();
-        buf.clear();
-        buf.push_str(&tail);
-        buf.push_str(PROGRESS_TRUNCATION_SUFFIX);
-    } else {
-        buf.clear();
-        // New content alone exceeds cap: keep only the tail of new_content.
-        let keep_new = max_total.saturating_sub(suffix_len);
-        if keep_new > 0 {
-            let offset = tail_byte_offset(new_content, keep_new.min(new_content.len()));
-            buf.push_str(PROGRESS_TRUNCATION_SUFFIX);
-            buf.push_str(&new_content[offset..]);
-        }
-        return;
-    }
-
-    // Append new_content; if we're still over cap, trim from the end of new_content.
-    let remaining = max_total.saturating_sub(buf.len());
-    if new_content.len() <= remaining {
-        buf.push_str(new_content);
-    } else {
-        let end = new_content.len() - remaining;
-        let mut trim_start = end;
-        while trim_start < new_content.len() && !new_content.is_char_boundary(trim_start) {
-            trim_start += 1;
-        }
-        buf.push_str(&new_content[trim_start..]);
-        buf.push_str("\n...(truncated)");
-    }
-}
-
 /// Resolve a human-readable name for the Bazel workspace producing this
 /// trace. Used to populate `VCS_REPOSITORY_NAME` on the root span.
 ///
-/// Lookup order (first non-empty wins):
-///   1. `MODULE.bazel` -> `module(name = "...")` (bzlmod, default since 7.0).
-///   2. `WORKSPACE.bazel` / `WORKSPACE` -> `workspace(name = "...")` (legacy).
-///   3. Basename of `workspace_dir` (e.g. `/repos/bazel_conduit` -> `bazel_conduit`).
+/// `module(name = "...")` from `MODULE.bazel`, else the basename of
+/// `workspace_dir` (e.g. `/repos/bazel_conduit` -> `bazel_conduit`).
 ///
-/// I/O happens once per build at `BuildStarted` - both candidate files are
-/// small (typically <2 KiB) and read synchronously. Failures fall through
-/// to the next source rather than propagating, since this attribute is a
-/// hint rather than load-bearing.
+/// The file is read once per build at `BuildStarted`. It only exists when
+/// conduit shares a filesystem with Bazel; otherwise the basename is used.
 pub(super) fn detect_workspace_name(workspace_dir: &Path) -> Option<String> {
     if let Some(name) = read_starlark_name(&workspace_dir.join("MODULE.bazel"), "module") {
         return Some(name);
-    }
-    for candidate in ["WORKSPACE.bazel", "WORKSPACE"] {
-        if let Some(name) = read_starlark_name(&workspace_dir.join(candidate), "workspace") {
-            return Some(name);
-        }
     }
     let basename = workspace_dir.file_name()?.to_str()?;
     if basename.is_empty() {
@@ -249,7 +150,7 @@ pub(super) fn detect_workspace_name(workspace_dir: &Path) -> Option<String> {
 }
 
 /// Pull `name = "<value>"` out of the first `<func>(...)` block in a
-/// MODULE.bazel / WORKSPACE.bazel file. Substring-based and deliberately
+/// MODULE.bazel file. Substring-based and deliberately
 /// dumb - Starlark string escaping, commented-out blocks, or unusual
 /// formatting (e.g. `module (\n name="x"\n)`) trips it. That's fine for
 /// the canonical idioms emitted by `bazel new`, `bazel mod tidy`, and
@@ -297,4 +198,13 @@ pub(super) fn nanos_to_system_time(nanos: i64) -> SystemTime {
     } else {
         UNIX_EPOCH
     }
+}
+
+/// Current wall-clock time as nanoseconds since the Unix epoch. Used as an
+/// upper bound while clamping mid-build, since no event can end in the future.
+pub(super) fn wall_clock_now_nanos() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
 }

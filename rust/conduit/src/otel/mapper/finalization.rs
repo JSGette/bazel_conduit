@@ -1,18 +1,18 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use crate::otel::span::{KeyValue, SpanKind, Status};
 use super::super::attributes::*;
 use super::{nanos_to_system_time, shorten_label, spawn_time_range, ActionSpanInfo, ActionSpanKey, OtelMapper};
-use opentelemetry::trace::{Span, SpanKind};
-use opentelemetry::KeyValue;
 use spawn_proto::tools::protos::SpawnExec;
-use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) {
+/// `None` when no tailer ran, otherwise its outcome (`Err` carries the
+/// worker error).
+pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) -> Option<Result<(), String>> {
     let Some(mut state) = mapper.exec_log_state.take() else {
-        return;
+        return None;
     };
     state.handle.shutdown();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -47,27 +47,61 @@ pub(super) fn drain_and_stop_tailer(mapper: &mut OtelMapper) {
         mapper.on_compact_spawn(spawn);
     }
 
-    let worker_error = state.handle.take_error();
-    let mut attrs = vec![KeyValue::new(
-        "spawns_received",
-        mapper.compact_spawns_received as i64,
-    )];
-    if let Some(err) = worker_error {
-        attrs.push(KeyValue::new("status", "failed"));
-        attrs.push(KeyValue::new("error", err));
-    } else {
-        attrs.push(KeyValue::new("status", "ok"));
+    let spawns_received = mapper.compact_spawns_received;
+    match state.handle.take_error() {
+        Some(error) => {
+            warn!(spawns_received, error, "Compact exec log tailer failed");
+            Some(Err(error))
+        }
+        None => {
+            info!(spawns_received, "Compact exec log tailer finished");
+            Some(Ok(()))
+        }
     }
-    mapper.add_root_event("bazel.exec_log.tailer_finished", attrs);
 }
 
-pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper) {
+/// `budget` is how many successful actions may still get a span under the
+/// lightweight profile; ignored under full.
+pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper, budget: usize) {
     if mapper.pending_spawns.is_empty() {
         return;
     }
-    let mut groups: HashMap<ActionSpanKey, Vec<SpawnExec>> = HashMap::new();
-    for (key, spawns) in mapper.pending_spawns.drain() {
-        groups.entry(key).or_default().extend(spawns);
+    let mut groups: Vec<(ActionSpanKey, Vec<SpawnExec>)> = Vec::new();
+    for (key, spawns) in std::mem::take(&mut mapper.pending_spawns) {
+        let dropped_by_budget = !mapper.budget_dropped.is_empty()
+            && spawns.iter().any(|s| {
+                crate::exec_log::spawn_exec_candidate_keys(s)
+                    .iter()
+                    .any(|k| mapper.budget_dropped.contains(k))
+            });
+        let spawns = if dropped_by_budget {
+            mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(spawns.len() as u64);
+            Vec::new()
+        } else {
+            retained_spawns(mapper, spawns)
+        };
+        if !spawns.is_empty() {
+            groups.push((key, spawns));
+        }
+    }
+    if !mapper.trace_policy.is_full() {
+        // Groups with a failed attempt bypass the budget, like failed actions;
+        // the rest compete by duration (ties broken by key for stable output).
+        let (mut kept, mut successes): (Vec<_>, Vec<_>) = groups
+            .into_iter()
+            .partition(|(_, spawns)| spawns.iter().any(|s| s.exit_code != 0));
+        successes.sort_by(|(ka, a), (kb, b)| {
+            group_duration(b).cmp(&group_duration(a)).then_with(|| {
+                (&ka.target_label, &ka.mnemonic, &ka.primary_output)
+                    .cmp(&(&kb.target_label, &kb.mnemonic, &kb.primary_output))
+            })
+        });
+        for (_, spawns) in successes.drain(budget.min(successes.len())..) {
+            mapper.suppressed_actions = mapper.suppressed_actions.saturating_add(1);
+            mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(spawns.len() as u64);
+        }
+        kept.extend(successes);
+        groups = kept;
     }
     let group_count = groups.len();
     for (key, spawns) in groups {
@@ -79,8 +113,47 @@ pub(super) fn synthesise_orphan_actions(mapper: &mut OtelMapper) {
     );
 }
 
+/// Drop spawns the trace policy filters out, counting them for the root span.
+/// Without this the compact log would resurrect a synthetic action + spawn
+/// tree for every successful cache hit whose ActionExecuted never reached BEP.
+fn retained_spawns(mapper: &mut OtelMapper, spawns: Vec<SpawnExec>) -> Vec<SpawnExec> {
+    let total = spawns.len();
+    let spawns: Vec<SpawnExec> = spawns
+        .into_iter()
+        .filter(|s| {
+            let (exit_code, cache_hit, cacheable, duration_ms) =
+                crate::exec_log::spawn_trace_signal(s);
+            mapper
+                .trace_policy
+                .should_emit_spawn(exit_code, cache_hit, cacheable, duration_ms)
+        })
+        .collect();
+    let dropped = total - spawns.len();
+    mapper.suppressed_spawns = mapper.suppressed_spawns.saturating_add(dropped as u64);
+    spawns
+}
+
+fn spawns_time_range(spawns: &[SpawnExec]) -> (Option<i64>, Option<i64>) {
+    spawns
+        .iter()
+        .filter_map(spawn_time_range)
+        .fold((None, None), |(s, e), (ns, ne)| {
+            (
+                Some(s.map_or(ns, |v: i64| v.min(ns))),
+                Some(e.map_or(ne, |v: i64| v.max(ne))),
+            )
+        })
+}
+
+fn group_duration(spawns: &[SpawnExec]) -> i64 {
+    match spawns_time_range(spawns) {
+        (Some(start), Some(end)) => (end - start).max(0),
+        _ => 0,
+    }
+}
+
 pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
-    let fallback = mapper.root_span_end_from_wall_nanos.or(mapper.finish_time_nanos);
+    let root_end = mapper.root_span_end_from_wall_nanos.or(mapper.finish_time_nanos);
     let keys: Vec<ActionSpanKey> = mapper
         .action_span_cache
         .iter()
@@ -88,20 +161,21 @@ pub(super) fn finalize_and_end_remaining_open_actions(mapper: &mut OtelMapper) {
         .map(|(k, _)| k.clone())
         .collect();
     for key in keys {
-        mapper.finalize_and_end_action_entry(&key, fallback);
+        // Bound each still-open action by its parent target's end (an untimed
+        // internal action must not fall back to the whole-build end and spill
+        // past the target it hangs under). Falls back to the root end when the
+        // target end is unknown.
+        let bound = match (mapper.target_end_for(&key.target_label), root_end) {
+            (Some(target_end), Some(re)) => Some(target_end.min(re)),
+            (Some(target_end), None) => Some(target_end),
+            (None, re) => re,
+        };
+        mapper.finalize_and_end_action_entry(&key, bound);
     }
 }
 
 fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spawns: Vec<SpawnExec>) {
-    let (raw_start, raw_end) = spawns
-        .iter()
-        .filter_map(spawn_time_range)
-        .fold((None::<i64>, None::<i64>), |(s, e), (ns, ne)| {
-            (
-                Some(s.map_or(ns, |v| v.min(ns))),
-                Some(e.map_or(ne, |v| v.max(ne))),
-            )
-        });
+    let (raw_start, raw_end) = spawns_time_range(&spawns);
     let (clamped_start, clamped_end) = mapper.clamp_to_invocation(raw_start, raw_end);
 
     let parent_label = spawns
@@ -123,7 +197,19 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
         );
         return;
     };
-    mapper.record_synthetic_target_end(&parent_label, clamped_end);
+    // Keep the synth action inside its parent target: the target span may have
+    // been created earlier (from another spawn) with a later start than this
+    // orphan's spawn timestamps, which would push the child before its parent.
+    let clamped_start = match (clamped_start, mapper.target_start_for(&parent_label)) {
+        (Some(start), Some(target_start)) => Some(start.max(target_start)),
+        (None, target_start) => target_start,
+        (start, None) => start,
+    };
+    let clamped_end = match (clamped_start, clamped_end) {
+        (Some(start), Some(end)) => Some(end.max(start)),
+        (_, end) => end,
+    };
+    mapper.record_target_child_end(&parent_label, clamped_end);
 
     let span_name = if key.mnemonic.is_empty() {
         format!("action {} (synth)", shorten_label(&key.target_label))
@@ -135,19 +221,16 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
         )
     };
 
+    let success = spawns.iter().all(|s| s.exit_code == 0);
     let mut attrs = vec![
-        KeyValue::new(BAZEL_ACTION_SUCCESS, true),
+        KeyValue::new(BAZEL_ACTION_SUCCESS, success),
         KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
     ];
     if !key.mnemonic.is_empty() {
         attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, key.mnemonic.clone()));
     }
     if !key.target_label.is_empty() {
-        attrs.push(KeyValue::new(BAZEL_ACTION_LABEL, key.target_label.clone()));
-        attrs.push(KeyValue::new(
-            BAZEL_ACTION_LABEL_SHORT,
-            shorten_label(&key.target_label).to_string(),
-        ));
+        attrs.push(KeyValue::new(BAZEL_TARGET_LABEL, key.target_label.clone()));
     }
     if !key.primary_output.is_empty() {
         attrs.push(KeyValue::new(
@@ -173,6 +256,9 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
     };
     for spawn in &spawns {
         crate::exec_log::emit_spawn_span(&mapper.tracer, &info, spawn, &mapper.redactor);
+    }
+    if !success {
+        span.set_status(Status::Error { description: "a spawn failed".into() });
     }
 
     if let Some(nanos) = clamped_end {

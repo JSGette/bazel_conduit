@@ -15,9 +15,8 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 1. **1 trace = 1 Bazel invocation**
 2. **Root span** created on `BuildStarted`, closed on `BuildFinished`
 3. **Primary value** comes from **Target spans**
-4. `NamedSetOfFiles` is lazily resolved for outputs
-5. Correct handling of out-of-order events using `EventID` index
-6. Secondary parents are represented using **OTel Span Links**
+4. Correct handling of out-of-order events using `EventID` index
+5. Secondary parents are represented using **OTel Span Links**
 7. `ActionExecuted` spans are sampled (failed/slow only by default)
 8. `Progress` events are ignored if `stdout`/`stderr` are empty
 
@@ -54,12 +53,12 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 | BEP Event | Creates Span | Parent | Key Attributes | Action |
 |-----------|--------------|--------|----------------|--------|
 | `BuildStarted` | `bazel.invocation` | (root) | invocation_id, command | Start trace |
-| `OptionsParsed` | - | - | startup_options | Add to invocation |
+| `OptionsParsed` | - | - | explicit_cmd_line, tool_tag | Add to invocation |
 | `WorkspaceStatus` | - | - | user, host | Add to invocation |
-| `Configuration` | - | - | platform, mnemonic | Cache for targets |
+| `Configuration` | - | - | mnemonic | Cache for actions |
 | `PatternExpanded` | `bazel.phase.loading` | invocation | patterns | Optional phase span |
 | `TargetConfigured` | `bazel.target` | phase/invocation | label, kind | Start target span |
-| `NamedSetOfFiles` | - | - | files | Cache for outputs |
+| `NamedSetOfFiles` | - | - | - | Ignored (output files are not exported) |
 | `TargetCompleted` | - | - | success, outputs | End target span |
 | `ActionExecuted` | `bazel.action.{type}` | target | mnemonic, exit_code | Sampled |
 | `TestResult` | `bazel.test.attempt` | target | status, attempt | Test spans |
@@ -83,13 +82,6 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 - Build an index: `EventID -> Event` for out-of-order handling
 - Secondary parents become **Span Links** (not parent-child)
 
-## Outputs Handling
-
-1. `NamedSetOfFiles` events arrive with `id` (e.g., "3")
-2. Cache: `namedset_id -> [FileInfo]`
-3. `TargetCompleted` references `fileSets` with namedset IDs
-4. Resolve outputs lazily when completing target span
-
 ## Span Status Rules
 
 | Condition | OTel Status |
@@ -100,30 +92,36 @@ BEP Source -> Protobuf Decoder -> Correlator / Model -> OTel Mapper -> OTLP Expo
 | Test failed | `ERROR` |
 | Action exit_code != 0 | `ERROR` |
 
-## Sampling Policy
+## Trace Profile (emission policy)
 
-| Span Type | Policy |
-|-----------|--------|
-| Target spans | Always |
-| Action spans | Failed + top N slowest |
-| Test attempts | Only on failure |
-| Progress | Never |
+Emission is governed by a single `TracePolicy` (`rust/conduit/src/state/trace_profile.rs`) applied at every span choke point:
+
+| Profile | Behavior |
+|---------|----------|
+| `full` | Every action / spawn / target span. |
+| `lightweight` (default) | Keeps failed actions plus the `--max-action-spans` slowest successful ones (200 default), only the targets those belong to, and exec-log spawns that fail, miss the cache, or take at least `--trace-min-duration-ms` (500 ms default). Aggregate metrics stay on the root span. |
+
+Test spans are always emitted. `Fetch` events carry no timing, so they only feed the root counters `bazel.fetch.count` and `bazel.fetch.failed`. `Progress` becomes correlated log records, never spans.
 
 ## CLI Flags
 
+See the [README CLI Flags table](README.md#cli-flags) for the authoritative list. The trace-relevant ones:
+
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--input` | BEP input (file or `-` for stdin) | - |
-| `--grpc-port` | BES gRPC server port | 8080 |
-| `--otel-endpoint` | OTLP endpoint | localhost:4317 |
-| `--actions` | Action sampling: `none`, `failed`, `all` | `failed` |
-| `--log-level` | Log verbosity | `info` |
+| `serve` / `--port <PORT>` | Start BES gRPC server / its port | 8080 |
+| `replay <FILE>` | Read a binary BEP file (`--build_event_binary_file`) | - |
+| `--export <MODE>` | `none`, `stdout`, `otlp` | `none` |
+| `--otlp-endpoint <URL>` | OTLP endpoint | `http://localhost:4317` |
+| `--trace-profile <PROFILE>` | `lightweight`, `full` | `lightweight` |
+| `--max-action-spans <N>` | Lightweight successful-action budget | `200` |
+| `--trace-min-duration-ms <MS>` | Lightweight spawn duration threshold | `500` |
+| `--log-level <LEVEL>` | Log verbosity | `info` |
 
 ## Minimal MVP
 
 1. Parse BEP from JSON file or gRPC stream
 2. Create invocation span (BuildStarted → BuildFinished)
 3. Create target spans (TargetConfigured → TargetCompleted)
-4. Resolve outputs from NamedSetOfFiles
-5. Export to Datadog via OTLP
-6. Handle failed actions only (lightweight mode)
+4. Export to Datadog via OTLP
+5. Handle failed actions only (lightweight mode)

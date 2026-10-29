@@ -3,20 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::KeyValue;
 use tracing::{debug, info, warn};
 
 use super::super::attributes::*;
-use super::{ExecLogState, OtelMapper, TestResultEvent};
-use crate::otel::trace_context;
+use super::{ExecLogState, OtelMapper};
+use crate::otel::span::{self, Context, KeyValue, SpanContext, SpanId, SpanKind, Status};
 
 impl OtelMapper {
-    /// BuildStarted -> create root span `bazel.invocation`.
-    /// Prefers event_time_nanos (BES event time) when available so the trace reflects when the
-    /// build was observed; otherwise uses start_time_nanos from the payload.
+    /// BuildStarted -> create root span `bazel.invocation`, starting at the
+    /// command start time (falls back to the BES event time).
     pub fn on_build_started(
         &mut self,
         uuid: &str,
@@ -25,9 +20,11 @@ impl OtelMapper {
         event_time_nanos: Option<i64>,
     ) {
         self.cached_command = Some(command.to_string());
+        self.build_start_nanos = start_time_nanos.or(event_time_nanos);
 
-        let trace_id = trace_context::uuid_to_trace_id(uuid);
-        let parent_cx = trace_context::make_root_context(trace_id);
+        let trace_id = span::uuid_to_trace_id(uuid);
+        let parent_cx =
+            Context::new().with_remote_span_context(SpanContext::new(trace_id, SpanId::INVALID));
 
         let span_name = format!("bazel {command}");
         let mut builder = self
@@ -39,67 +36,15 @@ impl OtelMapper {
                 KeyValue::new(BAZEL_COMMAND, command.to_string()),
             ]);
 
-        // Sanity-check: if the BEP start time is more than 5 minutes
-        // from wall clock, it's probably stale (long-lived Bazel daemon).
-        // Fall back to wall clock to avoid multi-day trace durations.
-        let now_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        let five_min_nanos: i64 = 5 * 60 * 1_000_000_000;
-
-        let effective_start = event_time_nanos.or(start_time_nanos);
-        let sanitized_start = match effective_start {
-            Some(nanos) if (now_nanos - nanos).abs() > five_min_nanos => {
-                warn!(
-                    bep_start_nanos = nanos,
-                    wall_clock_nanos = now_nanos,
-                    drift_seconds = (now_nanos - nanos) / 1_000_000_000,
-                    "BEP start time deviates from wall clock by >5 min; using wall clock"
-                );
-                Some(now_nanos)
-            }
-            other => other,
-        };
-        if let Some(nanos) = sanitized_start {
+        if let Some(nanos) = start_time_nanos.or(event_time_nanos) {
             builder = builder.with_start_time(super::nanos_to_system_time(nanos));
             self.root_span_start_nanos = Some(nanos);
         }
         let span = self.tracer.build_with_context(builder, &parent_cx);
-        let cx = opentelemetry::Context::new().with_span(span);
+        let cx = Context::new().with_span(span);
 
         info!(trace_id = %trace_id, "Created root span for invocation {uuid}");
         self.root_context = Some(cx);
-
-        // Replay any fetch events that arrived before the root span.
-        if !self.pending_fetches.is_empty() {
-            let buffered: Vec<_> = std::mem::take(&mut self.pending_fetches);
-            info!("Replaying {} buffered fetch events", buffered.len());
-            for (url, success, arrival, downloader) in buffered {
-                self.emit_fetch_span(&url, success, arrival, downloader.as_deref());
-            }
-        }
-
-        // Replay test results that arrived before the root span (e.g. BES stream order).
-        if !self.pending_test_results.is_empty() {
-            let buffered: Vec<_> = std::mem::take(&mut self.pending_test_results);
-            info!("Replaying {} buffered test result events", buffered.len());
-            for b in &buffered {
-                self.on_test_result(&TestResultEvent {
-                    label: &b.label,
-                    status: b.status.as_deref(),
-                    attempt: b.attempt,
-                    run: b.run,
-                    shard: b.shard,
-                    cached: b.cached,
-                    strategy: b.strategy.as_deref(),
-                    start_time_nanos: b.start_time_nanos,
-                    duration_nanos: b.duration_nanos,
-                    hostname: b.hostname.as_deref(),
-                    cached_remotely: b.cached_remotely,
-                });
-            }
-        }
     }
 
     /// Extended BuildStarted fields -> set attributes on root span.
@@ -108,7 +53,6 @@ impl OtelMapper {
         workspace_dir: Option<&str>,
         working_dir: Option<&str>,
         build_tool_version: Option<&str>,
-        server_pid: Option<i64>,
         host: Option<&str>,
         user: Option<&str>,
     ) {
@@ -125,18 +69,11 @@ impl OtelMapper {
                 self.workspace_directory = Some(path);
             }
         }
-        // Retry a previously skipped relative exec-log path once workspace is known.
-        if let Some(path) = self.pending_exec_log_path.take() {
-            self.on_exec_log_detected(path);
-        }
         if let Some(v) = working_dir {
             self.set_root_attr(KeyValue::new(BAZEL_WORKING_DIR, v.to_string()));
         }
         if let Some(v) = build_tool_version {
             self.set_root_attr(KeyValue::new(BAZEL_BUILD_TOOL_VERSION, v.to_string()));
-        }
-        if let Some(v) = server_pid {
-            self.set_root_attr(KeyValue::new(BAZEL_SERVER_PID, v));
         }
         if let Some(v) = host {
             self.set_root_attr(KeyValue::new(BAZEL_WORKSPACE_HOST, v.to_string()));
@@ -146,16 +83,8 @@ impl OtelMapper {
         }
     }
 
-    /// OptionsParsed -> add attributes to root span.
-    pub fn on_options_parsed(
-        &mut self,
-        startup_options: &[String],
-        explicit_cmd_line: &[String],
-    ) {
-        if !startup_options.is_empty() {
-            let scrubbed = self.redactor.scrub_args(startup_options);
-            self.set_root_attr(KeyValue::new(BAZEL_STARTUP_OPTIONS, scrubbed.join(" ")));
-        }
+    /// OptionsParsed -> the explicit command line on the root span.
+    pub fn on_options_parsed(&mut self, explicit_cmd_line: &[String]) {
         if !explicit_cmd_line.is_empty() {
             let scrubbed = self.redactor.scrub_args(explicit_cmd_line);
             self.set_root_attr(KeyValue::new(BAZEL_EXPLICIT_CMD_LINE, scrubbed.join(" ")));
@@ -167,11 +96,6 @@ impl OtelMapper {
         if !tool_tag.is_empty() {
             self.set_root_attr(KeyValue::new(BAZEL_TOOL_TAG, tool_tag.to_string()));
         }
-    }
-
-    /// ActionMode -> record the detected processing mode on the root span.
-    pub fn on_action_mode(&mut self, mode: crate::state::ActionProcessingMode) {
-        self.set_root_attr(KeyValue::new(BAZEL_ACTION_MODE, mode.to_string()));
     }
 
     /// Compact-exec-log path detected (typically from BEP `OptionsParsed`).
@@ -192,17 +116,9 @@ impl OtelMapper {
             match self.workspace_directory.as_ref() {
                 Some(ws) => ws.join(&path),
                 None => {
-                    self.pending_exec_log_path = Some(path.clone());
                     warn!(
                         path = %path.display(),
-                        "Compact exec log path is relative but workspace_directory is not set yet; skipping tailer"
-                    );
-                    self.add_root_event(
-                        "bazel.exec_log.tailer_skipped",
-                        vec![
-                            KeyValue::new("path", path.display().to_string()),
-                            KeyValue::new("reason", "workspace_directory_not_set"),
-                        ],
+                        "Compact exec log path is relative but workspace_directory is unknown; skipping tailer"
                     );
                     return;
                 }
@@ -214,31 +130,20 @@ impl OtelMapper {
     fn start_compact_tailer(&mut self, path: PathBuf) {
         let handle = crate::exec_log::tailer::spawn(
             path.clone(),
+            self.build_start_nanos.map(super::nanos_to_system_time),
             self.exec_log_max_message_bytes,
             self.exec_log_max_decompressed_bytes,
         );
         info!(path = %path.display(), "Started compact exec log tailer");
-        self.add_root_event(
-            "bazel.exec_log.tailer_started",
-            vec![KeyValue::new("path", path.display().to_string())],
-        );
         self.exec_log_state = Some(ExecLogState { path, handle });
         self.compact_streaming_active = true;
     }
 
     /// `--execution_log_binary_file` / `--execution_log_json_file` observed
     /// in BEP `OptionsParsed`. Neither format is supported by conduit's
-    /// live streaming pipeline (no dedup table, no zstd framing); record a
-    /// root-span event so users can spot the misconfiguration in their
-    /// trace UI without grepping the conduit log.
+    /// live streaming pipeline (no dedup table, no zstd framing).
     pub fn on_unsupported_exec_log_flag(&mut self, flags: &str) {
-        self.add_root_event(
-            "bazel.exec_log.unsupported_format",
-            vec![
-                KeyValue::new("flags", flags.to_string()),
-                KeyValue::new("supported", "--execution_log_compact_file".to_string()),
-            ],
-        );
+        warn!(flags, "Unsupported exec log format; only --execution_log_compact_file is tailed");
     }
 
     /// WorkspaceStatus -> add workspace attributes to root span.
@@ -258,14 +163,6 @@ impl OtelMapper {
             };
             let scrubbed = self.redactor.scrub_value_by_name(key, value).into_owned();
             self.set_root_attr(KeyValue::new(attr_key, scrubbed));
-        }
-    }
-
-    /// UnstructuredCommandLine -> add full command line as attribute.
-    pub fn on_command_line(&mut self, args: &[String]) {
-        if !args.is_empty() {
-            let scrubbed = self.redactor.scrub_args(args);
-            self.set_root_attr(KeyValue::new(BAZEL_COMMAND_LINE, scrubbed.join(" ")));
         }
     }
 
@@ -304,6 +201,7 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "skipped targets",
+            self.root_span_start_nanos,
         );
 
         let Some(parent) = &self.skipped_context else {
@@ -313,7 +211,6 @@ impl OtelMapper {
         let short = shorten_label(label);
         let mut attrs = vec![
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_LABEL_SHORT, short.to_string()),
             KeyValue::new(BAZEL_TARGET_SUCCESS, false),
         ];
         if let Some(r) = reason {
@@ -337,42 +234,11 @@ impl OtelMapper {
         debug!("Created aborted-label span for {label}");
     }
 
-    /// Configuration -> span event on root span. Also caches mnemonic for action enrichment.
-    pub fn on_configuration(
-        &mut self,
-        config_id: &str,
-        mnemonic: Option<&str>,
-        platform: Option<&str>,
-    ) {
-        if let Some(m) = mnemonic {
+    /// Configuration -> cache its mnemonic (e.g. `k8-fastbuild`) for actions.
+    pub fn on_configuration(&mut self, config_id: &str, mnemonic: &str) {
+        if !mnemonic.is_empty() {
             self.configurations
-                .insert(config_id.to_string(), m.to_string());
+                .insert(config_id.to_string(), mnemonic.to_string());
         }
-        let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
-        if let Some(m) = mnemonic {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_MNEMONIC, m.to_string()));
-        }
-        if let Some(p) = platform {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_PLATFORM, p.to_string()));
-        }
-        self.add_root_event("configuration", attrs);
-        debug!("Added configuration event: {config_id}");
-    }
-
-    /// Configuration with cpu/is_tool -> add to root span event.
-    pub fn on_configuration_extended(
-        &mut self,
-        config_id: &str,
-        cpu: Option<&str>,
-        is_tool: Option<bool>,
-    ) {
-        let mut attrs = vec![KeyValue::new(BAZEL_CONFIG_ID, config_id.to_string())];
-        if let Some(c) = cpu {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_CPU, c.to_string()));
-        }
-        if let Some(t) = is_tool {
-            attrs.push(KeyValue::new(BAZEL_CONFIG_IS_TOOL, t));
-        }
-        self.add_root_event("configuration_detail", attrs);
     }
 }

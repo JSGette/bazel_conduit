@@ -14,19 +14,17 @@ autocfg,https://github.com/cuviper/autocfg,Apache-2.0 OR MIT,Josh Stone <cuviper
 axum,https://github.com/tokio-rs/axum,MIT,Copyright axum contributors
 axum-core,https://github.com/tokio-rs/axum,MIT,Copyright axum-core contributors
 base64,https://github.com/marshallpierce/rust-base64,MIT OR Apache-2.0,Marshall Pierce <marshall@mpierce.org>
+bazel,https://github.com/bazelbuild/bazel,Apache-2.0,Copyright The Bazel Authors
 bitflags,https://github.com/bitflags/bitflags,MIT OR Apache-2.0,The Rust Project Developers
 bumpalo,https://github.com/fitzgen/bumpalo,MIT OR Apache-2.0,Nick Fitzgerald <fitzgen@gmail.com>
 bytes,https://github.com/tokio-rs/bytes,MIT,Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
 cc,https://github.com/rust-lang/cc-rs,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
 cfg-if,https://github.com/rust-lang/cfg-if,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
-chrono,https://github.com/chronotope/chrono,MIT OR Apache-2.0,Copyright chrono contributors
 clap,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap contributors
 clap_builder,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap_builder contributors
 clap_derive,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap_derive contributors
 clap_lex,https://github.com/clap-rs/clap,MIT OR Apache-2.0,Copyright clap_lex contributors
 colorchoice,https://github.com/rust-cli/anstyle.git,MIT OR Apache-2.0,Copyright colorchoice contributors
-crossbeam-utils,https://github.com/crossbeam-rs/crossbeam,MIT OR Apache-2.0,Copyright crossbeam-utils contributors
-dashmap,https://github.com/xacrimon/dashmap,MIT,Acrimon <joel.wejdenstal@gmail.com>
 either,https://github.com/rayon-rs/either,MIT OR Apache-2.0,bluss
 equivalent,https://github.com/indexmap-rs/equivalent,Apache-2.0 OR MIT,Copyright equivalent contributors
 errno,https://github.com/lambda-fairy/rust-errno,MIT OR Apache-2.0,Chris Wong <lambda.fairy@gmail.com>; Dan Gohman <dev@sunfishcode.online>
@@ -37,17 +35,14 @@ fnv,https://github.com/servo/rust-fnv,Apache-2.0 / MIT,Alex Crichton <alex@alexc
 foldhash,https://github.com/orlp/foldhash,Zlib,Orson Peters <orsonpeters@gmail.com>
 futures-channel,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-channel contributors
 futures-core,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-core contributors
-futures-executor,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-executor contributors
-futures-macro,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-macro contributors
 futures-sink,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-sink contributors
 futures-task,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-task contributors
 futures-util,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-util contributors
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
 getrandom,https://github.com/rust-random/getrandom,MIT OR Apache-2.0,The Rand Project Developers
-glob,https://github.com/rust-lang/glob,MIT OR Apache-2.0,The Rust Project Developers
+googleapis,https://github.com/googleapis/googleapis,Apache-2.0,Copyright Google LLC
 h2,https://github.com/hyperium/h2,MIT,Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
-hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
@@ -72,7 +67,6 @@ lazy_static,https://github.com/rust-lang-nursery/lazy-static.rs,MIT OR Apache-2.
 leb128fmt,https://github.com/bluk/leb128fmt,MIT OR Apache-2.0,Bryant Luk <code@bryantluk.com>
 libc,https://github.com/rust-lang/libc,MIT OR Apache-2.0,The Rust Project Developers
 linux-raw-sys,https://github.com/sunfishcode/linux-raw-sys,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,Dan Gohman <dev@sunfishcode.online>
-lock_api,https://github.com/Amanieu/parking_lot,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 log,https://github.com/rust-lang/log,MIT OR Apache-2.0,The Rust Project Developers
 matchers,https://github.com/hawkw/matchers,MIT,Eliza Weisman <eliza@buoyant.io>
 matchit,https://github.com/ibraheemdev/matchit,MIT AND BSD-3-Clause,Ibraheem Ahmed <ibraheem@ibraheem.ca>
@@ -81,17 +75,9 @@ mime,https://github.com/hyperium/mime,MIT OR Apache-2.0,Sean McArthur <sean@sean
 mio,https://github.com/tokio-rs/mio,MIT,Carl Lerche <me@carllerche.com>; Thomas de Zeeuw <thomasdezeeuw@gmail.com>; Tokio Contributors <team@tokio.rs>
 multimap,https://github.com/havarnov/multimap,MIT OR Apache-2.0,Håvar Nøvik <havar.novik@gmail.com>
 nu-ansi-term,https://github.com/nushell/nu-ansi-term,MIT,ogham@bsago.me; Ryan Scheel (Havvy) <ryan.havvy@gmail.com>; Josh Triplett <josh@joshtriplett.org>; The Nushell Project Developers
-num-traits,https://github.com/rust-num/num-traits,MIT OR Apache-2.0,The Rust Project Developers
 once_cell,https://github.com/matklad/once_cell,MIT OR Apache-2.0,Aleksey Kladov <aleksey.kladov@gmail.com>
 once_cell_polyfill,https://github.com/polyfill-rs/once_cell_polyfill,MIT OR Apache-2.0,Copyright once_cell_polyfill contributors
-opentelemetry,https://github.com/open-telemetry/opentelemetry-rust,Apache-2.0,Copyright opentelemetry contributors
-opentelemetry-otlp,https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp,Apache-2.0,Copyright opentelemetry-otlp contributors
-opentelemetry-proto,https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto,Apache-2.0,Copyright opentelemetry-proto contributors
-opentelemetry-stdout,https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-stdout,Apache-2.0,Copyright opentelemetry-stdout contributors
-opentelemetry_sdk,https://github.com/open-telemetry/opentelemetry-rust,Apache-2.0,Copyright opentelemetry_sdk contributors
-ordered-float,https://github.com/reem/rust-ordered-float,MIT,Jonathan Reem <jonathan.reem@gmail.com>; Matt Brubeck <mbrubeck@limpet.net>
-parking_lot,https://github.com/Amanieu/parking_lot,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
-parking_lot_core,https://github.com/Amanieu/parking_lot,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
+opentelemetry-proto,https://github.com/open-telemetry/opentelemetry-proto,Apache-2.0,Copyright The OpenTelemetry Authors
 percent-encoding,https://github.com/servo/rust-url/,MIT OR Apache-2.0,The rust-url developers
 petgraph,https://github.com/petgraph/petgraph,MIT OR Apache-2.0,bluss; mitchmindtree
 pin-project,https://github.com/taiki-e/pin-project,Apache-2.0 OR MIT,Copyright pin-project contributors
@@ -114,21 +100,19 @@ r-efi,https://github.com/r-efi/r-efi,MIT OR Apache-2.0 OR LGPL-2.1-or-later,Copy
 rand,https://github.com/rust-random/rand,MIT OR Apache-2.0,The Rand Project Developers; The Rust Project Developers
 rand_chacha,https://github.com/rust-random/rand,MIT OR Apache-2.0,The Rand Project Developers; The Rust Project Developers; The CryptoCorrosion Contributors
 rand_core,https://github.com/rust-random/rand,MIT OR Apache-2.0,The Rand Project Developers; The Rust Project Developers
-redox_syscall,https://gitlab.redox-os.org/redox-os/syscall,MIT,Jeremy Soller <jackpot51@gmail.com>
 regex,https://github.com/rust-lang/regex,MIT OR Apache-2.0,The Rust Project Developers; Andrew Gallant <jamslam@gmail.com>
 regex-automata,https://github.com/rust-lang/regex,MIT OR Apache-2.0,The Rust Project Developers; Andrew Gallant <jamslam@gmail.com>
 regex-syntax,https://github.com/rust-lang/regex,MIT OR Apache-2.0,The Rust Project Developers; Andrew Gallant <jamslam@gmail.com>
 rustix,https://github.com/bytecodealliance/rustix,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,Dan Gohman <dev@sunfishcode.online>; Jakub Konka <kubkon@jakubkonka.com>
 rustversion,https://github.com/dtolnay/rustversion,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
-scopeguard,https://github.com/bluss/scopeguard,MIT OR Apache-2.0,bluss
 semver,https://github.com/dtolnay/semver,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
 serde,https://github.com/serde-rs/serde,MIT OR Apache-2.0,Erick Tryzelaar <erick.tryzelaar@gmail.com>; David Tolnay <dtolnay@gmail.com>
 serde_core,https://github.com/serde-rs/serde,MIT OR Apache-2.0,Erick Tryzelaar <erick.tryzelaar@gmail.com>; David Tolnay <dtolnay@gmail.com>
 serde_derive,https://github.com/serde-rs/serde,MIT OR Apache-2.0,Erick Tryzelaar <erick.tryzelaar@gmail.com>; David Tolnay <dtolnay@gmail.com>
 serde_json,https://github.com/serde-rs/json,MIT OR Apache-2.0,Erick Tryzelaar <erick.tryzelaar@gmail.com>; David Tolnay <dtolnay@gmail.com>
 sharded-slab,https://github.com/hawkw/sharded-slab,MIT,Eliza Weisman <eliza@buoyant.io>
-shlex,https://github.com/comex/rust-shlex,MIT OR Apache-2.0,comex <comexk@gmail.com>; Fenhl <fenhl@fenhl.net>; Adrian Taylor <adetaylor@chromium.org>; Alex Touchet <alextouchet@outlook.com>; Daniel Parks <dp+git@oxidized.org>; Garrett Berg <googberg@gmail.com>
 signal-hook-registry,https://github.com/vorner/signal-hook,MIT OR Apache-2.0,Michal 'vorner' Vaner <vorner@vorner.cz>; Masaki Hara <ackie.h.gmai@gmail.com>
+shlex,https://github.com/comex/rust-shlex,MIT OR Apache-2.0,comex <comexk@gmail.com>; Fenhl <fenhl@fenhl.net>; Adrian Taylor <adetaylor@chromium.org>; Alex Touchet <alextouchet@outlook.com>; Daniel Parks <dp+git@oxidized.org>; Garrett Berg <googberg@gmail.com>
 slab,https://github.com/tokio-rs/slab,MIT,Carl Lerche <me@carllerche.com>
 smallvec,https://github.com/servo/rust-smallvec,MIT OR Apache-2.0,The Servo Project Developers
 socket2,https://github.com/rust-lang/socket2,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>; Thomas de Zeeuw <thomasdezeeuw@gmail.com>
@@ -138,8 +122,6 @@ syn,https://github.com/dtolnay/syn,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail
 sync_wrapper,https://github.com/Actyx/sync_wrapper,Apache-2.0,Actyx AG <developer@actyx.io>
 tempfile,https://github.com/Stebalien/tempfile,MIT OR Apache-2.0,Steven Allen <steven@stebalien.com>; The Rust Project Developers; Ashley Mannix <ashleymannix@live.com.au>; Jason White <me@jasonwhite.io>
 thiserror,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
-thiserror,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
-thiserror-impl,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
 thiserror-impl,https://github.com/dtolnay/thiserror,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
 thread_local,https://github.com/Amanieu/thread_local-rs,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
 tokio,https://github.com/tokio-rs/tokio,MIT,Tokio Contributors <team@tokio.rs>

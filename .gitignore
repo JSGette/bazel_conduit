@@ -9,3 +9,4 @@ security-report/
 user.bazelrc
 .DS_Store
 proto/.DS_Store
+__pycache__/
