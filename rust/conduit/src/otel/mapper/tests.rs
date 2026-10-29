@@ -1591,6 +1591,26 @@ fn error_logs_drop_passing_test_output() {
 }
 
 #[test]
+fn held_test_output_is_capped() {
+    let (mut mapper, collector) = mapper_with_logger(LogMode::Errors);
+    for i in 0..MAX_LOG_RECORDS + 3 {
+        let out = format!("==================== Test output for //:t{i}:\nboom\n{TEST_OUTPUT_END}");
+        mapper.on_progress(None, Some(&out));
+    }
+    assert_eq!(mapper.error_logs.pending_blocks, MAX_LOG_RECORDS as usize);
+    summarize(&mut mapper, "//:t0", "FAILED");
+    assert_eq!(mapper.error_logs.pending_blocks, MAX_LOG_RECORDS as usize - 1);
+    summarize(&mut mapper, &format!("//:t{MAX_LOG_RECORDS}"), "PASSED");
+    assert_eq!(mapper.error_logs.dropped, 0, "a passing label's output is not suppressed");
+    mapper.finish();
+    assert_eq!(mapper.log_records, MAX_LOG_RECORDS);
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_TRACE_SUPPRESSED_LOGS).as_deref(), Some("2"));
+}
+
+#[test]
 fn open_error_block_is_emitted_at_finish() {
     let (mut mapper, _) = mapper_with_logger(LogMode::Errors);
     mapper.on_progress(Some("ERROR: boom\naction output\n"), None);
