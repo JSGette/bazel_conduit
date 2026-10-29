@@ -3,6 +3,7 @@
 
 use crate::otel::span::{LogData, Severity};
 use super::{strip_ansi, truncate_to_byte_limit, OtelMapper};
+use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
 
@@ -63,6 +64,13 @@ pub(super) fn handle_progress(mapper: &mut OtelMapper, stderr: Option<&str>, std
     emit(mapper, records);
 }
 
+pub(super) fn handle_test_summary(mapper: &mut OtelMapper, label: &str, failed: bool) {
+    if mapper.log_mode == LogMode::Errors {
+        let records = mapper.error_logs.test_summary(label, failed);
+        emit(mapper, records);
+    }
+}
+
 /// Emit the error block still open when the invocation ends.
 pub(super) fn flush_progress(mapper: &mut OtelMapper) {
     let records = mapper.error_logs.flush();
@@ -107,6 +115,12 @@ fn all_records(stderr: String, stdout: String) -> Vec<Record> {
 /// failed action's own stderr is printed unindented right after its
 /// `ERROR:`), plus `--test_output` blocks from either stream. Progress events
 /// carry console deltas, so blocks and even lines can span events.
+/// `--test_output=all` prints passing tests too, so a test output block is
+/// held until its label's `TestSummary`: shards, runs and attempts finish in
+/// any order, and only the summary knows whether any of them failed. A label
+/// built in several configurations has several summaries; any failure wins,
+/// but output arriving after a passing summary is dropped even if another
+/// configuration later fails (the banner does not name the configuration).
 #[derive(Default)]
 pub(super) struct ErrorLogParser {
     stderr_tail: String,
@@ -114,6 +128,8 @@ pub(super) struct ErrorLogParser {
     block: Option<Record>,
     stderr_test_output: Option<String>,
     stdout_test_output: Option<String>,
+    test_failed: HashMap<String, bool>,
+    pending_test_output: HashMap<String, Vec<String>>,
 }
 
 const TEST_OUTPUT_BANNER: &str = "==================== Test output for ";
@@ -121,36 +137,63 @@ const TEST_OUTPUT_BANNER: &str = "==================== Test output for ";
 impl ErrorLogParser {
     pub(super) fn feed(&mut self, stderr: &str, stdout: &str) -> Vec<Record> {
         let mut out = Vec::new();
+        let mut test_output = Vec::new();
         for line in complete_lines(&mut self.stderr_tail, stderr) {
-            self.stderr_line(&line, &mut out);
+            self.stderr_line(&line, &mut out, &mut test_output);
         }
         for line in complete_lines(&mut self.stdout_tail, stdout) {
-            test_output_line(&mut self.stdout_test_output, &line, &mut out);
+            test_output_line(&mut self.stdout_test_output, &line, &mut test_output);
         }
+        self.route_test_output(test_output, &mut out);
         out
+    }
+
+    pub(super) fn test_summary(&mut self, label: &str, failed: bool) -> Vec<Record> {
+        let failed = *self.test_failed.entry(label.to_string()).and_modify(|f| *f |= failed).or_insert(failed);
+        let pending = self.pending_test_output.remove(label).unwrap_or_default();
+        if !failed {
+            return Vec::new();
+        }
+        pending.into_iter().map(error_record).collect()
+    }
+
+    fn route_test_output(&mut self, blocks: Vec<String>, out: &mut Vec<Record>) {
+        for body in blocks {
+            let label = test_output_label(&body).to_string();
+            match self.test_failed.get(&label) {
+                Some(true) => out.push(error_record(body)),
+                Some(false) => {}
+                None => self.pending_test_output.entry(label).or_default().push(body),
+            }
+        }
     }
 
     pub(super) fn flush(&mut self) -> Vec<Record> {
         let mut out = Vec::new();
+        let mut test_output = Vec::new();
         let (stderr, stdout) = (std::mem::take(&mut self.stderr_tail), std::mem::take(&mut self.stdout_tail));
         if !stderr.is_empty() {
-            self.stderr_line(&stderr, &mut out);
+            self.stderr_line(&stderr, &mut out, &mut test_output);
         }
         if !stdout.is_empty() {
-            test_output_line(&mut self.stdout_test_output, &stdout, &mut out);
+            test_output_line(&mut self.stdout_test_output, &stdout, &mut test_output);
         }
         out.extend(self.block.take().map(finished));
-        for test_output in [self.stderr_test_output.take(), self.stdout_test_output.take()] {
-            out.extend(test_output.map(error_record));
-        }
+        test_output.extend(self.stderr_test_output.take());
+        test_output.extend(self.stdout_test_output.take());
+        self.route_test_output(test_output, &mut out);
+        // No TestSummary arrived (e.g. an interrupted build): keep the output.
+        let mut pending: Vec<_> = self.pending_test_output.drain().collect();
+        pending.sort();
+        out.extend(pending.into_iter().flat_map(|(_, bodies)| bodies).map(error_record));
         out
     }
 
-    fn stderr_line(&mut self, line: &str, out: &mut Vec<Record>) {
+    fn stderr_line(&mut self, line: &str, out: &mut Vec<Record>, test_output: &mut Vec<String>) {
         if line.starts_with(TEST_OUTPUT_BANNER) {
             out.extend(self.block.take().map(finished));
         }
-        if test_output_line(&mut self.stderr_test_output, line, out) {
+        if test_output_line(&mut self.stderr_test_output, line, test_output) {
             return;
         }
         let severity = if line.starts_with("ERROR:") || line.starts_with("FAIL:") {
@@ -172,9 +215,9 @@ impl ErrorLogParser {
 }
 
 /// Feeds `line` to a `--test_output` block; returns whether it belonged to one.
-fn test_output_line(state: &mut Option<String>, line: &str, out: &mut Vec<Record>) -> bool {
+fn test_output_line(state: &mut Option<String>, line: &str, done: &mut Vec<String>) -> bool {
     if line.starts_with(TEST_OUTPUT_BANNER) {
-        out.extend(state.take().map(error_record));
+        done.extend(state.take());
         *state = Some(line.to_string());
         return true;
     }
@@ -183,9 +226,17 @@ fn test_output_line(state: &mut Option<String>, line: &str, out: &mut Vec<Record
     };
     append_line(body, line);
     if line.len() >= 20 && line.bytes().all(|b| b == b'=') {
-        out.extend(state.take().map(error_record));
+        done.extend(state.take());
     }
     true
+}
+
+/// `==================== Test output for //pkg:t (shard 1 of 2):` -> `//pkg:t`.
+fn test_output_label(body: &str) -> &str {
+    let banner = body.lines().next().unwrap_or_default();
+    let name = banner.strip_prefix(TEST_OUTPUT_BANNER).unwrap_or(banner);
+    let name = name.strip_suffix(':').unwrap_or(name);
+    name.split(" (").next().unwrap_or(name)
 }
 
 fn error_record(body: String) -> Record {

@@ -1439,8 +1439,8 @@ fn error_logs_survive_progress_chunk_boundaries() {
         vec![
             (Severity::Error, "ERROR: //:broken failed: (Exit 1)\ncompiler: error: something bad".to_string()),
             (Severity::Warn, "WARNING: deprecated".to_string()),
-            (Severity::Error, "==================== Test output for //:t:\nline 1\nline 2\n====================".to_string()),
             (Severity::Error, "ERROR: tail block\nstill tail".to_string()),
+            (Severity::Error, "==================== Test output for //:t:\nline 1\nline 2\n====================".to_string()),
         ],
     );
 }
@@ -1463,6 +1463,43 @@ fn error_logs_keep_test_output_written_to_stderr() {
             ),
         ],
     );
+}
+
+const TEST_OUTPUT_END: &str = "================================================================================\n";
+
+fn summarize(mapper: &mut OtelMapper, label: &str, status: &str) {
+    mapper.on_test_summary(label, Some(status), Some(2), Some(1), Some(1), Some(2), Some(0));
+}
+
+/// `--test_output=all` prints passing tests too; only failed ones are errors.
+#[test]
+fn error_logs_drop_passing_test_output() {
+    let (mut mapper, _) = mapper_with_logger(LogMode::Errors);
+    for shard in ["shard 1 of 2", "shard 2 of 2"] {
+        let out = format!("==================== Test output for //:ok ({shard}):\nall good\n{TEST_OUTPUT_END}");
+        mapper.on_progress(Some("INFO: From Testing //:ok:\n"), Some(&out));
+    }
+    summarize(&mut mapper, "//:ok", "PASSED");
+    assert_eq!(mapper.log_records, 0);
+
+    for shard in ["shard 1 of 2", "shard 2 of 2"] {
+        let out = format!("==================== Test output for //:flaky ({shard}):\nboom\n{TEST_OUTPUT_END}");
+        mapper.on_progress(None, Some(&out));
+    }
+    assert_eq!(mapper.log_records, 0, "held until the TestSummary");
+    summarize(&mut mapper, "//:flaky", "FLAKY");
+    assert_eq!(mapper.log_records, 2);
+
+    let late = format!("==================== Test output for //:flaky:\nboom\n{TEST_OUTPUT_END}");
+    mapper.on_progress(None, Some(&late));
+    assert_eq!(mapper.log_records, 3, "status already known");
+
+    summarize(&mut mapper, "//:flaky", "PASSED");
+    mapper.on_progress(None, Some(&late));
+    assert_eq!(mapper.log_records, 4, "another configuration passing keeps the failure");
+
+    mapper.finish();
+    assert_eq!(mapper.log_records, 4);
 }
 
 #[test]

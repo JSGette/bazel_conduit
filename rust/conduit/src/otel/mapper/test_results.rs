@@ -77,6 +77,7 @@ impl OtelMapper {
         shard_count: Option<i32>,
         total_num_cached: Option<i32>,
     ) {
+        super::progress::handle_test_summary(self, label, overall_status != Some("PASSED"));
         let mut attrs = Vec::new();
         if let Some(s) = overall_status {
             attrs.push(KeyValue::new(BAZEL_TEST_OVERALL_STATUS, s.to_string()));
