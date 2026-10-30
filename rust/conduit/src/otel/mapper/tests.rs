@@ -1574,7 +1574,7 @@ fn build_metrics_set_root_attrs_and_root_contains_finish() {
 // Progress logs (`--logs`). Fixtures are Bazel 9 console chunks.
 // =====================================================================
 
-use super::progress::{error_record_summaries, LOG_RECORD_CAP_BYTES, MAX_LOG_RECORDS};
+use super::progress::{cap, error_record_summaries, LOG_RECORD_CAP_BYTES, MAX_LOG_RECORDS};
 use crate::otel::span::{Logger, Severity, Status};
 
 #[test]
@@ -1665,6 +1665,45 @@ fn error_logs_keep_test_output_written_to_stderr() {
             ),
         ],
     );
+}
+
+#[test]
+fn long_test_output_keeps_banner_and_tail() {
+    let mut stdout = String::from("==================== Test output for //:big:\n");
+    for i in 0..20_000 {
+        stdout.push_str(&format!("setup line {i} é\n"));
+    }
+    stdout.push_str("assertion failed: expected 3, got 4\n");
+    stdout.push_str(TEST_OUTPUT_END);
+    let lines: Vec<&str> = stdout.split_inclusive('\n').collect();
+    let chunks: Vec<String> = lines.chunks(100).map(|c| c.concat()).collect();
+    let chunks: Vec<(&str, &str)> = chunks.iter().map(|c| ("", c.as_str())).collect();
+
+    let records = error_record_summaries(&chunks);
+    assert_eq!(records.len(), 1);
+    let body = &records[0].1;
+    assert_eq!(&cap(body), body, "the emitter does not cut the tail again");
+    assert!(body.starts_with("==================== Test output for //:big:\n(truncated)..."));
+    assert!(body.contains("assertion failed: expected 3, got 4\n===="), "the end survives");
+    assert!(!body.contains("setup line 0 "), "the beginning goes");
+
+    let error = format!("ERROR: boom\n{}", "compiler: first error\n".repeat(5_000));
+    let records = error_record_summaries(&[(&error, "")]);
+    assert!(records[0].1.starts_with("ERROR: boom\ncompiler: first error"), "error blocks keep the head");
+}
+
+#[test]
+fn long_test_output_with_long_label_still_matches_its_summary() {
+    let label = format!("//:{}", "a".repeat(2_000));
+    let (mut mapper, _) = mapper_with_logger(LogMode::Errors);
+    mapper.on_progress(None, Some(&format!("==================== Test output for {label}:\n")));
+    for _ in 0..100 {
+        mapper.on_progress(None, Some(&"passing chatter\n".repeat(200)));
+    }
+    mapper.on_progress(None, Some(TEST_OUTPUT_END));
+    summarize(&mut mapper, &label, "PASSED");
+    mapper.finish();
+    assert_eq!(mapper.log_records, 0, "the banner survives trimming, so the summary finds it");
 }
 
 const TEST_OUTPUT_END: &str = "================================================================================\n";

@@ -10,6 +10,7 @@ use std::time::SystemTime;
 pub(super) const LOG_RECORD_CAP_BYTES: usize = 64 * 1024;
 pub(super) const MAX_LOG_RECORDS: u64 = 256;
 const TRUNCATED: &str = "...(truncated)";
+const TRUNCATED_HEAD: &str = "\n(truncated)...";
 
 /// Which BEP `Progress` output becomes OTLP log records (`--logs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -241,7 +242,11 @@ fn test_output_line(state: &mut Option<String>, line: &str, done: &mut Vec<Strin
     let Some(body) = state.as_mut() else {
         return false;
     };
-    append_line(body, line);
+    body.push('\n');
+    body.push_str(line);
+    if body.len() > 2 * LOG_RECORD_CAP_BYTES {
+        keep_banner_and_tail(body);
+    }
     if line.len() >= 20 && line.bytes().all(|b| b == b'=') {
         done.extend(state.take());
     }
@@ -256,8 +261,29 @@ fn test_output_label(body: &str) -> &str {
     name.split(" (").next().unwrap_or(name)
 }
 
-fn error_record(body: String) -> Record {
+/// Test output record: a test reports its failure at the end of its log.
+fn error_record(mut body: String) -> Record {
+    keep_banner_and_tail(&mut body);
     finished(Record { severity: Severity::Error, body })
+}
+
+/// Shrink a test output block to what [`cap`] passes unchanged, keeping the
+/// end of the output and the banner line, which names the test and routes
+/// the block to its `TestSummary`.
+fn keep_banner_and_tail(body: &mut String) {
+    let max = LOG_RECORD_CAP_BYTES - TRUNCATED.len();
+    if body.len() <= max {
+        return;
+    }
+    let mut banner = body.find('\n').unwrap_or(body.len()).min(max / 2);
+    while !body.is_char_boundary(banner) {
+        banner -= 1;
+    }
+    let mut start = body.len() - (max - banner - TRUNCATED_HEAD.len());
+    while !body.is_char_boundary(start) {
+        start += 1;
+    }
+    *body = format!("{}{TRUNCATED_HEAD}{}", &body[..banner], &body[start..]);
 }
 
 /// Appends `chunk` to `tail` and returns its complete lines, leaving an

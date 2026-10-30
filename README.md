@@ -201,8 +201,10 @@ records, correlated with the invocation's trace:
 - **`all`**: one info record per progress event and output stream.
 - **`none`**: no log records.
 
-Records are redacted, ANSI-stripped, and capped at 64 KiB. An invocation emits at most 256
-records; the rest are counted in `bazel.trace.suppressed_logs` on the root span.
+Records are redacted, ANSI-stripped, and capped at 64 KiB. `ERROR:` blocks keep their
+beginning, where compilers report the first error; test output keeps its banner and its end,
+where tests report the failure. An invocation emits at most 256 records; the rest are counted
+in `bazel.trace.suppressed_logs` on the root span.
 
 ## Execution log enrichment
 
