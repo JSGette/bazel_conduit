@@ -10,6 +10,7 @@ use std::time::SystemTime;
 pub(super) const LOG_RECORD_CAP_BYTES: usize = 64 * 1024;
 pub(super) const MAX_LOG_RECORDS: u64 = 256;
 const TRUNCATED: &str = "...(truncated)";
+const TRUNCATED_HEAD: &str = "\n(truncated)...";
 
 /// Which BEP `Progress` output becomes OTLP log records (`--logs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,6 +75,7 @@ pub(super) fn handle_test_summary(mapper: &mut OtelMapper, label: &str, failed: 
 /// Emit the error block still open when the invocation ends.
 pub(super) fn flush_progress(mapper: &mut OtelMapper) {
     let records = mapper.error_logs.flush();
+    mapper.suppressed_logs += std::mem::take(&mut mapper.error_logs.dropped);
     emit(mapper, records);
 }
 
@@ -130,6 +132,11 @@ pub(super) struct ErrorLogParser {
     stdout_test_output: Option<String>,
     test_failed: HashMap<String, bool>,
     pending_test_output: HashMap<String, Vec<String>>,
+    /// Held blocks are capped at what could still be emitted; drops count as
+    /// suppressed only once their label fails (or never gets a summary).
+    pub(super) pending_blocks: usize,
+    dropped_by_label: HashMap<String, u64>,
+    pub(super) dropped: u64,
 }
 
 const TEST_OUTPUT_BANNER: &str = "==================== Test output for ";
@@ -151,9 +158,12 @@ impl ErrorLogParser {
     pub(super) fn test_summary(&mut self, label: &str, failed: bool) -> Vec<Record> {
         let failed = *self.test_failed.entry(label.to_string()).and_modify(|f| *f |= failed).or_insert(failed);
         let pending = self.pending_test_output.remove(label).unwrap_or_default();
+        self.pending_blocks -= pending.len();
+        let dropped = self.dropped_by_label.remove(label).unwrap_or_default();
         if !failed {
             return Vec::new();
         }
+        self.dropped += dropped;
         pending.into_iter().map(error_record).collect()
     }
 
@@ -163,7 +173,13 @@ impl ErrorLogParser {
             match self.test_failed.get(&label) {
                 Some(true) => out.push(error_record(body)),
                 Some(false) => {}
-                None => self.pending_test_output.entry(label).or_default().push(body),
+                None if self.pending_blocks >= MAX_LOG_RECORDS as usize => {
+                    *self.dropped_by_label.entry(label).or_default() += 1;
+                }
+                None => {
+                    self.pending_blocks += 1;
+                    self.pending_test_output.entry(label).or_default().push(body);
+                }
             }
         }
     }
@@ -184,6 +200,8 @@ impl ErrorLogParser {
         self.route_test_output(test_output, &mut out);
         // No TestSummary arrived (e.g. an interrupted build): keep the output.
         let mut pending: Vec<_> = self.pending_test_output.drain().collect();
+        self.pending_blocks = 0;
+        self.dropped += self.dropped_by_label.drain().map(|(_, n)| n).sum::<u64>();
         pending.sort();
         out.extend(pending.into_iter().flat_map(|(_, bodies)| bodies).map(error_record));
         out
@@ -224,7 +242,11 @@ fn test_output_line(state: &mut Option<String>, line: &str, done: &mut Vec<Strin
     let Some(body) = state.as_mut() else {
         return false;
     };
-    append_line(body, line);
+    body.push('\n');
+    body.push_str(line);
+    if body.len() > 2 * LOG_RECORD_CAP_BYTES {
+        keep_banner_and_tail(body);
+    }
     if line.len() >= 20 && line.bytes().all(|b| b == b'=') {
         done.extend(state.take());
     }
@@ -239,8 +261,29 @@ fn test_output_label(body: &str) -> &str {
     name.split(" (").next().unwrap_or(name)
 }
 
-fn error_record(body: String) -> Record {
+/// Test output record: a test reports its failure at the end of its log.
+fn error_record(mut body: String) -> Record {
+    keep_banner_and_tail(&mut body);
     finished(Record { severity: Severity::Error, body })
+}
+
+/// Shrink a test output block to what [`cap`] passes unchanged, keeping the
+/// end of the output and the banner line, which names the test and routes
+/// the block to its `TestSummary`.
+fn keep_banner_and_tail(body: &mut String) {
+    let max = LOG_RECORD_CAP_BYTES - TRUNCATED.len();
+    if body.len() <= max {
+        return;
+    }
+    let mut banner = body.find('\n').unwrap_or(body.len()).min(max / 2);
+    while !body.is_char_boundary(banner) {
+        banner -= 1;
+    }
+    let mut start = body.len() - (max - banner - TRUNCATED_HEAD.len());
+    while !body.is_char_boundary(start) {
+        start += 1;
+    }
+    *body = format!("{}{TRUNCATED_HEAD}{}", &body[..banner], &body[start..]);
 }
 
 /// Appends `chunk` to `tail` and returns its complete lines, leaving an

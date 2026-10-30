@@ -2,6 +2,9 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
+# Keep in sync with Cargo.toml and MODULE.bazel.
+VERSION = "0.0.1-RC1"
+
 # Export Cargo files for rules_rs
 exports_files([
     "Cargo.toml",
@@ -79,11 +82,13 @@ rust_library(
         "@crates//:uuid",
         "@crates//:zstd",
     ],
+    version = VERSION,
 )
 
 rust_binary(
     name = "conduit",
     srcs = ["src/main.rs"],
+    version = VERSION,
     deps = [
         ":conduit_lib",
         "@crates//:anyhow",
@@ -97,6 +102,7 @@ rust_binary(
 rust_test(
     name = "conduit_lib_test",
     crate = ":conduit_lib",
+    version = VERSION,
     deps = [
         "@crates//:tempfile",
     ],

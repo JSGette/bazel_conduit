@@ -4,30 +4,29 @@
 
 # Configure the local Datadog Agent for use with bazel_conduit.
 #
+# The Agent must already have a valid API key (and site) whose org can ingest
+# OTLP traces and logs. This script never sets or changes `api_key:`.
+#
 # What it does, in order:
-#   1. Runs `dd-auth` to fetch a personal API key (and site).
-#   2. Locates datadog.yaml (macOS or Linux).
-#   3. Writes the API key into the file's top-level `api_key:` (idempotent).
-#   4. Ensures an OTLP receiver is configured (gRPC + HTTP, traces + logs).
+#   1. Locates datadog.yaml (macOS or Linux).
+#   2. Ensures an OTLP receiver is configured (gRPC + HTTP, traces + logs).
 #      - If `otlp_config:` already exists, its gRPC port is reused.
 #      - Otherwise a `# >>> conduit-managed >>>` block is appended, using
 #        the first free port from {4317, 14317, 24317, ...}.
-#   5. Restarts the agent (skip with --no-restart).
-#   6. Prints what to add to user.bazelrc.
-#   7. Execs `bazel run //rust/conduit:conduit` so the terminal becomes
+#   3. Restarts the agent (skip with --no-restart).
+#   4. Prints what to add to user.bazelrc.
+#   5. Execs `bazel run //rust/conduit:conduit` so the terminal becomes
 #      the conduit process (skip with --no-conduit).
 #
 # Tested on macOS (launchctl) and Linux (systemctl). No extra deps beyond
-# `bash`, `awk`, `grep`, `sed`, `lsof` (or /dev/tcp), `dd-auth`, `bazel`.
+# `bash`, `awk`, `lsof` (or /dev/tcp), `bazel`.
 
 set -euo pipefail
 
 # ---------- defaults ---------------------------------------------------------
-DOMAIN="app.datadoghq.com"
 NO_RESTART=0
 NO_CONDUIT=0
 DRY_RUN=0
-REFRESH_TOKEN=0
 CONDUIT_BES_PORT="${CONDUIT_BES_PORT:-8080}"
 CONDUIT_EXEC_LOG="${CONDUIT_EXEC_LOG:-}"
 CONDUIT_TARGET="${CONDUIT_TARGET:-//rust/conduit:conduit}"
@@ -40,13 +39,11 @@ log()  { printf '==> %s\n' "$*" >&2; }
 note() { printf '    %s\n' "$*" >&2; }
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '5,22p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
-Usage: setup_datadog_agent.sh [--domain DOMAIN] [--no-restart] [--no-conduit] [--dry-run]
+Usage: setup_datadog_agent.sh [--no-restart] [--no-conduit] [--dry-run]
 
-  --domain DOMAIN   Datadog org domain passed to dd-auth (default: app.datadoghq.com)
-  --refresh-token   Pass --no-cache to dd-auth to force a fresh PAT/key fetch
   --no-restart      Skip restarting the agent
   --no-conduit      Don't exec into `bazel run` for conduit at the end
   --dry-run         Print actions without modifying files, restarting, or running conduit
@@ -62,8 +59,6 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --domain)        DOMAIN="$2"; shift 2 ;;
-    --refresh-token) REFRESH_TOKEN=1; shift ;;
     --no-restart)    NO_RESTART=1; shift ;;
     --no-conduit)    NO_CONDUIT=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
@@ -76,9 +71,13 @@ done
 case "$(uname -s)" in
   Darwin)
     DD_YAML="/opt/datadog-agent/etc/datadog.yaml"
-    # User-level LaunchAgent. `kickstart -k` is the modern in-place restart
-    # (macOS 10.10+); requires the plist to be already loaded by launchd.
-    RESTART_CMD=(launchctl kickstart -k "gui/$(id -u)/com.datadoghq.agent")
+    # The installer registers either a system LaunchDaemon or a per-user
+    # LaunchAgent; `kickstart -k` needs the label already loaded.
+    if launchctl print system/com.datadoghq.agent >/dev/null 2>&1; then
+      RESTART_CMD=(sudo launchctl kickstart -k system/com.datadoghq.agent)
+    else
+      RESTART_CMD=(launchctl kickstart -k "gui/$(id -u)/com.datadoghq.agent")
+    fi
     ;;
   Linux)
     DD_YAML="/etc/datadog-agent/datadog.yaml"
@@ -102,24 +101,7 @@ run_priv() {
   if (( WRITE_AS_SUDO )); then sudo "$@"; else "$@"; fi
 }
 
-# ---------- step 1: dd-auth --------------------------------------------------
-command -v dd-auth >/dev/null || err "dd-auth not found in PATH"
-
-DD_AUTH_FLAGS=(--domain "$DOMAIN" -o)
-(( REFRESH_TOKEN )) && DD_AUTH_FLAGS+=(--no-cache)
-
-log "fetching credentials via dd-auth ${DD_AUTH_FLAGS[*]}"
-# `dd-auth -o` prints DD_API_KEY=..., DD_APP_KEY=..., DD_SITE=... -- one per line.
-DD_AUTH_OUT="$(dd-auth "${DD_AUTH_FLAGS[@]}")" \
-  || err "dd-auth failed; run 'dd-auth ${DD_AUTH_FLAGS[*]}' manually to debug"
-
-# Parse without exporting DD_APP_KEY into our env (we don't need it).
-DD_API_KEY="$(printf '%s\n' "$DD_AUTH_OUT" | awk -F= '$1=="DD_API_KEY"{print $2; exit}')"
-DD_SITE="$(  printf '%s\n' "$DD_AUTH_OUT" | awk -F= '$1=="DD_SITE"  {print $2; exit}')"
-[[ -n "$DD_API_KEY" ]] || err "dd-auth did not return DD_API_KEY"
-[[ -n "$DD_SITE"    ]] || DD_SITE="datadoghq.com"
-
-# ---------- step 2: discover/pick OTLP gRPC port -----------------------------
+# ---------- step 1: discover/pick OTLP gRPC port -----------------------------
 extract_existing_grpc_port() {
   # Look for the first `endpoint: <host>:<port>` under an `otlp_config:` block.
   # KISS: assume the first `endpoint:` after `otlp_config:` is the gRPC one
@@ -160,64 +142,42 @@ else
 fi
 OTLP_HTTP_PORT=$((OTLP_GRPC_PORT + 1))
 
-# ---------- step 3: edit datadog.yaml (atomic) -------------------------------
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+# ---------- step 2: append otlp_config to datadog.yaml -----------------------
+# The leading blank line also terminates a last line that lacks a newline.
+OTLP_BLOCK="
+# >>> conduit-managed >>>
+# Added by scripts/setup_datadog_agent.sh -- safe to edit or delete.
+otlp_config:
+  receiver:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:${OTLP_GRPC_PORT}
+      http:
+        endpoint: 0.0.0.0:${OTLP_HTTP_PORT}
+  traces:
+    enabled: true
+  logs:
+    enabled: true
+logs_enabled: true
+# <<< conduit-managed <<<"
 
-# Replace top-level `api_key:` value (or append if missing).
-# Then ensure an otlp_config block.
-awk -v key="$DD_API_KEY" -v site="$DD_SITE" -v has_otlp="$HAS_OTLP" \
-    -v grpc_port="$OTLP_GRPC_PORT" -v http_port="$OTLP_HTTP_PORT" '
-  BEGIN { api_done=0; site_done=0 }
-  /^api_key:/ && !api_done { print "api_key: " key; api_done=1; next }
-  /^site:/    && !site_done { print "site: " site; site_done=1; next }
-  { print }
-  END {
-    if (!api_done) print "api_key: " key
-    if (!site_done) print "site: " site
-    if (has_otlp == "0") {
-      print ""
-      print "# >>> conduit-managed >>>"
-      print "# Added by scripts/setup_datadog_agent.sh -- safe to edit or delete."
-      print "otlp_config:"
-      print "  receiver:"
-      print "    protocols:"
-      print "      grpc:"
-      print "        endpoint: 0.0.0.0:" grpc_port
-      print "      http:"
-      print "        endpoint: 0.0.0.0:" http_port
-      print "  traces:"
-      print "    enabled: true"
-      print "  logs:"
-      print "    enabled: true"
-      print "logs_enabled: true"
-      print "# <<< conduit-managed <<<"
-    }
-  }
-' "$DD_YAML" > "$TMP"
-
-# Idempotency: if the rendered file is byte-identical to what's already on
-# disk, skip both the rewrite and the agent restart.
-SKIP_WRITE=0
-if cmp -s "$DD_YAML" "$TMP"; then
-  SKIP_WRITE=1
-  log "datadog.yaml already matches dd-auth + otlp_config; skipping rewrite and restart"
-fi
-
-if (( DRY_RUN )); then
-  log "dry-run: would write the following diff to $DD_YAML"
-  diff -u "$DD_YAML" "$TMP" || true
-elif (( SKIP_WRITE )); then
-  :
+SKIP_WRITE="$HAS_OTLP"
+if (( SKIP_WRITE )); then
+  log "datadog.yaml already has otlp_config; skipping rewrite and restart"
+elif (( DRY_RUN )); then
+  log "dry-run: would append to $DD_YAML:"
+  printf '%s\n' "$OTLP_BLOCK"
 else
   BACKUP="${DD_YAML}.bak.$(date +%Y%m%d-%H%M%S)"
   log "backing up $DD_YAML -> $BACKUP"
   run_priv cp -p "$DD_YAML" "$BACKUP"
-  log "writing $DD_YAML"
-  run_priv install -m 0644 "$TMP" "$DD_YAML"
+  log "appending otlp_config to $DD_YAML"
+  # Appending in place keeps the owner, mode and ACLs of a file that holds
+  # the API key.
+  printf '%s\n' "$OTLP_BLOCK" | run_priv tee -a "$DD_YAML" >/dev/null
 fi
 
-# ---------- step 4: restart agent --------------------------------------------
+# ---------- step 3: restart agent --------------------------------------------
 if (( SKIP_WRITE )) || (( DRY_RUN )) || (( NO_RESTART )); then
   (( SKIP_WRITE )) && note "skipping restart (config unchanged)"
   (( DRY_RUN ))    && note "skipping restart (--dry-run)"
@@ -225,11 +185,11 @@ if (( SKIP_WRITE )) || (( DRY_RUN )) || (( NO_RESTART )); then
 else
   log "restarting agent: ${RESTART_CMD[*]}"
   if ! "${RESTART_CMD[@]}"; then
-    err "agent restart failed; revert with: run_priv mv $BACKUP $DD_YAML"
+    err "agent restart failed; revert with: sudo mv $BACKUP $DD_YAML"
   fi
 fi
 
-# ---------- step 5: print bazel snippet --------------------------------------
+# ---------- step 4: print bazel snippet --------------------------------------
 EXEC_LOG_RC=""
 if [[ -n "${CONDUIT_EXEC_LOG}" ]]; then
   EXEC_LOG_RC="common --execution_log_compact_file=${CONDUIT_EXEC_LOG}"$'\n'
@@ -244,11 +204,11 @@ ${EXEC_LOG_RC}# Optional: emit BEP for every action, not just the failing/test o
 build  --build_event_publish_all_actions
 
 Then run any bazel build/test as usual; traces and logs will land in
-your Datadog org via the local agent (site: ${DD_SITE}).
+your Datadog org via the local agent.
 ==================================================================
 EOF
 
-# ---------- step 6: launch conduit -------------------------------------------
+# ---------- step 5: launch conduit -------------------------------------------
 CONDUIT_ARGS=(serve --port "${CONDUIT_BES_PORT}"
               --export otlp --otlp-endpoint "http://localhost:${OTLP_GRPC_PORT}")
 if [[ -n "${CONDUIT_EXEC_LOG}" ]]; then

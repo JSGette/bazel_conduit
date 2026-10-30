@@ -36,6 +36,18 @@ bazel build //pkg:app                      root: command, patterns, exit code, b
 
 Traces use `service.name=bazel`.
 
+## Install
+
+[Releases](../../releases) ship single binaries for `linux-x86_64` and `linux-arm64` (glibc
+2.35 or newer, e.g. Ubuntu 22.04+) and `darwin-arm64` (macOS 14+), each with a `.sha256`:
+
+```bash
+curl -fsSLO https://github.com/JSGette/bazel_conduit/releases/download/v0.0.1-RC1/conduit-linux-x86_64
+curl -fsSLO https://github.com/JSGette/bazel_conduit/releases/download/v0.0.1-RC1/conduit-linux-x86_64.sha256
+shasum -a 256 -c conduit-linux-x86_64.sha256 && chmod +x conduit-linux-x86_64
+./conduit-linux-x86_64 --version
+```
+
 ## Running as a Datadog Agent sidecar
 
 Run conduit in the same pod (or on the same host) as the Datadog Agent, with the Agent's
@@ -147,6 +159,7 @@ which are `serve`-only.
 | `--port <PORT>` | BES gRPC port. | `8080` |
 | `--export <MODE>` | `none`, `stdout` (OTLP-JSON, one request per line), or `otlp` (gRPC). | `none` |
 | `--otlp-endpoint <URL>` | OTLP gRPC endpoint. | `http://localhost:4317` |
+| `--otlp-max-export-batch-size <N>` | Max spans per OTLP export request. Keep requests under the receiver's gRPC message limit (4 MiB by default). | `512` |
 | `--trace-profile <PROFILE>` | `lightweight` or `full`. See [Trace profiles](#trace-profiles). | `lightweight` |
 | `--max-action-spans <N>` | Lightweight: how many successful actions (the slowest) keep a span per invocation. | `200` |
 | `--trace-min-duration-ms <MS>` | Lightweight: minimum duration for a successful cache-hit spawn to keep a span. | `500` |
@@ -188,8 +201,10 @@ records, correlated with the invocation's trace:
 - **`all`**: one info record per progress event and output stream.
 - **`none`**: no log records.
 
-Records are redacted, ANSI-stripped, and capped at 64 KiB. An invocation emits at most 256
-records; the rest are counted in `bazel.trace.suppressed_logs` on the root span.
+Records are redacted, ANSI-stripped, and capped at 64 KiB. `ERROR:` blocks keep their
+beginning, where compilers report the first error; test output keeps its banner and its end,
+where tests report the failure. An invocation emits at most 256 records; the rest are counted
+in `bazel.trace.suppressed_logs` on the root span.
 
 ## Execution log enrichment
 
@@ -231,7 +246,7 @@ log record (`rust/conduit/src/otel/redact.rs`):
 - **Argv tokens**: the explicit command line, action command lines, and spawn command lines.
   The `VALUE` in `--flag=NAME=VALUE` becomes `***` when `NAME` matches.
 - **Name/value pairs**: workspace status entries, by key name.
-- **URLs**: userinfo in the `REPO_URL` build metadata.
+- **URLs**: userinfo in the repository URL, from `REPO_URL` build metadata or `.git`.
 - **Free text**: console output in log records, token by token.
 
 The pass-through form `--client_env=NAME` (no value on the wire) is left alone.
@@ -277,19 +292,26 @@ list. They are a de-facto schema and may change between releases.
 ### Repository identity
 
 Every span says which repository it belongs to, so Datadog does not infer a repository from
-another service named `bazel`. `vcs.repository.name` is the `module(name = ...)` from
-`MODULE.bazel`, else the workspace directory's basename. The `--build_metadata` keys Bazel
-documents for this override and extend it:
+another service named `bazel`. The values come from, in increasing priority:
 
-| `--build_metadata` key | Span attributes |
+1. **The workspace:** `vcs.repository.name` is the `module(name = ...)` from `MODULE.bazel`,
+   else the workspace directory's basename.
+2. **Its `.git`**, when conduit shares a filesystem with Bazel: the `origin` remote URL, the
+   `HEAD` commit, and the branch. Linked worktrees are followed to their main repository, so
+   a worktree named `datadog-agent-feature` still reports `datadog-agent`. Git is not run;
+   conduit reads the files.
+3. **The `--build_metadata` keys** Bazel documents for this. Empty values are ignored.
+
+| Source | Span attributes |
 | --- | --- |
-| `REPO_URL` | `vcs.repository.url.full`, `git.repository_url`, and `vcs.repository.name` from the URL's last path segment |
-| `COMMIT_SHA` | `vcs.ref.head.revision`, `git.commit.sha` |
-| `BRANCH` | `vcs.ref.head.name`, `git.branch` |
+| `REPO_URL`, or the `origin` URL | `vcs.repository.url.full`, `git.repository_url`, and `vcs.repository.name` from the URL's last path segment |
+| `COMMIT_SHA`, or `HEAD` | `vcs.ref.head.revision`, `git.commit.sha` |
+| `BRANCH`, or `HEAD`'s branch | `vcs.ref.head.name`, `git.branch` |
 
-Credentials in a `REPO_URL` (`https://user:token@host/...`) are dropped. Other keys land on
-the root span as `bazel.metadata.<KEY>`. Set the URL once in the repository's `.bazelrc`, and the commit and
-branch from CI:
+Credentials in the URL (`https://user:token@host/...`) are dropped. Other metadata keys land
+on the root span as `bazel.metadata.<KEY>`. When conduit does not see the checkout (sidecar
+mode, CI with a shallow or exported tree), set the URL in the repository's `.bazelrc` and the
+commit and branch from CI:
 
 ```
 common --build_metadata=REPO_URL=https://github.com/DataDog/datadog-agent
@@ -321,6 +343,16 @@ common --build_metadata=REPO_URL=https://github.com/DataDog/datadog-agent
   for sampling.
 - **Exec-log enrichment needs co-location** and arrives in bursts (see above).
 - **`TestProgress` and `ExecRequest` events are ignored.**
+- **Clients are trusted.** There is no cap on concurrent BES streams or on the memory a stream
+  holds, and with `--exec-log` conduit opens whatever path the build's
+  `--execution_log_compact_file` names, as conduit's user. Expose conduit only to build
+  machines you control.
+- **Exec-log draining blocks a runtime thread.** Finalizing an invocation with `--exec-log`
+  waits on one of conduit's async threads for up to 2 s for the log's last chunk. With many
+  such builds finishing at once, other streams stall meanwhile, and at SIGTERM some may miss
+  the 3 s finalize budget.
+- **`scripts/setup_datadog_agent.sh` detects OTLP shallowly.** Any `otlp_config:` block with an
+  `endpoint:` counts as configured, even if traces or logs are off in it.
 
 ## Development
 

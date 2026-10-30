@@ -27,6 +27,9 @@ use tracing::{debug, error, info, trace, warn};
 /// (BES sequence number, BEP event, BES event time in nanos)
 type RoutedEvent = (i64, crate::build_event_stream::BuildEvent, Option<i64>);
 
+/// BES `StreamId` as (build_id, invocation_id, component).
+type SessionKey = (String, String, i32);
+
 struct Session {
     tx: mpsc::WeakSender<RoutedEvent>,
     resumed: watch::Sender<u64>,
@@ -38,7 +41,7 @@ struct Session {
 /// reaper.
 struct Sessions {
     make_router: Box<dyn Fn() -> EventRouter + Send + Sync>,
-    live: Mutex<HashMap<String, Session>>,
+    live: Mutex<HashMap<SessionKey, Session>>,
     workers: Mutex<JoinSet<()>>,
     stop: watch::Receiver<bool>,
 }
@@ -70,15 +73,18 @@ impl Sessions {
 
     /// Sender into the invocation's worker; a retried stream for a live
     /// invocation resumes it instead of starting a partial trace. The watch
-    /// receiver fires when a later stream resumes the same invocation. An
-    /// empty key gets a private worker that nothing can resume. `None` once
+    /// receiver fires when a later stream resumes the same invocation. No
+    /// key gets a private worker that nothing can resume. `None` once
     /// shutdown has begun.
-    fn attach(&self, key: &str) -> Option<(mpsc::Sender<RoutedEvent>, watch::Receiver<u64>)> {
+    fn attach(
+        &self,
+        key: Option<SessionKey>,
+    ) -> Option<(mpsc::Sender<RoutedEvent>, watch::Receiver<u64>)> {
         let mut live = self.live.lock().unwrap();
         live.retain(|_, s| s.tx.strong_count() > 0);
-        if let Some(s) = live.get(key) {
+        if let Some(s) = key.as_ref().and_then(|k| live.get(k)) {
             if let Some(tx) = s.tx.upgrade() {
-                info!(key, "Resuming BES stream for live invocation");
+                info!(?key, "Resuming BES stream for live invocation");
                 s.resumed.send_modify(|n| *n += 1);
                 return Some((tx, s.resumed.subscribe()));
             }
@@ -95,22 +101,20 @@ impl Sessions {
             worker.await;
         });
         let (resumed, resumed_rx) = watch::channel(0);
-        if !key.is_empty() {
-            let session = Session { tx: tx.downgrade(), resumed };
-            live.insert(key.to_string(), session);
+        if let Some(key) = key {
+            live.insert(key, Session { tx: tx.downgrade(), resumed });
         }
         Some((tx, resumed_rx))
     }
 }
 
-/// Session key: the full BES `StreamId`, or empty (unresumable) without one.
-fn stream_key(ordered: &crate::bes_proto::OrderedBuildEvent) -> String {
+/// Session key: the full BES `StreamId`, or `None` (unresumable) without one.
+fn stream_key(ordered: &crate::bes_proto::OrderedBuildEvent) -> Option<SessionKey> {
     ordered
         .stream_id
         .as_ref()
         .filter(|s| !s.invocation_id.is_empty())
-        .map(|s| format!("{}/{}/{}", s.build_id, s.invocation_id, s.component))
-        .unwrap_or_default()
+        .map(|s| (s.build_id.clone(), s.invocation_id.clone(), s.component))
 }
 
 /// BES gRPC server.
@@ -254,7 +258,7 @@ impl PublishBuildEvent for BesServer {
                         );
 
                         if session.is_none() {
-                            session = sessions.attach(&stream_key(ordered));
+                            session = sessions.attach(stream_key(ordered));
                         }
                         let Some((tx, _)) = &session else {
                             let status = Status::unavailable("conduit is shutting down");
@@ -494,6 +498,24 @@ mod tests {
         watch::channel(false).1
     }
 
+    fn key(invocation_id: &str) -> Option<SessionKey> {
+        Some((String::new(), invocation_id.to_string(), 0))
+    }
+
+    #[test]
+    fn stream_key_keeps_fields_apart() {
+        let ordered = |build_id: &str, invocation_id: &str| crate::bes_proto::OrderedBuildEvent {
+            stream_id: Some(crate::bes_events::StreamId {
+                build_id: build_id.into(),
+                invocation_id: invocation_id.into(),
+                component: 0,
+            }),
+            ..Default::default()
+        };
+        assert_ne!(stream_key(&ordered("a/b", "c")), stream_key(&ordered("a", "b/c")));
+        assert_eq!(stream_key(&ordered("a", "")), None);
+    }
+
     #[tokio::test]
     async fn concurrent_streams_do_not_share_state() {
         let (tx_a, rx_a) = mpsc::channel(8);
@@ -528,19 +550,19 @@ mod tests {
     async fn retried_stream_resumes_live_invocation() {
         let sessions = Sessions::new(EventRouter::new, no_stop());
         let tx = |key| sessions.attach(key).unwrap().0;
-        let (first, first_resumed) = sessions.attach("inv-1").unwrap();
+        let (first, first_resumed) = sessions.attach(key("inv-1")).unwrap();
         assert!(!first_resumed.has_changed().unwrap());
-        let (resumed, resumed_rx) = sessions.attach("inv-1").unwrap();
+        let (resumed, resumed_rx) = sessions.attach(key("inv-1")).unwrap();
         assert!(first.same_channel(&resumed));
         assert!(first_resumed.has_changed().unwrap(), "broken stream must see the resume");
         assert!(!resumed_rx.has_changed().unwrap());
-        assert!(!first.same_channel(&tx("inv-2")));
-        assert!(!tx("").same_channel(&tx("")));
+        assert!(!first.same_channel(&tx(key("inv-2"))));
+        assert!(!tx(None).same_channel(&tx(None)));
 
         let weak = first.downgrade();
         drop((first, resumed));
         assert!(weak.upgrade().is_none(), "worker must finalize once all streams are gone");
-        assert_eq!(tx("inv-1").strong_count(), 1);
+        assert_eq!(tx(key("inv-1")).strong_count(), 1);
     }
 
     #[tokio::test]
@@ -559,11 +581,11 @@ mod tests {
     async fn shutdown_finalizes_attached_invocations() {
         let (stop_tx, stop_rx) = watch::channel(false);
         let sessions = Sessions::new(EventRouter::new, stop_rx);
-        let (tx, _) = sessions.attach("inv-1").unwrap();
+        let (tx, _) = sessions.attach(key("inv-1")).unwrap();
         tx.send(started(1, "uuid-a", "build")).await.unwrap();
 
         stop_tx.send_replace(true);
-        assert!(sessions.attach("inv-2").is_none(), "no new invocations once stopping");
+        assert!(sessions.attach(key("inv-2")).is_none(), "no new invocations once stopping");
         let drained = sessions.drain(Duration::from_secs(1)).await;
         assert_eq!(drained.ok(), Some(1), "live stream must not block shutdown");
         assert!(tx.is_closed());

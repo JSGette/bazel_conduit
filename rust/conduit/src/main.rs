@@ -20,7 +20,7 @@ use tracing_subscriber::FmtSubscriber;
 
 /// BEP to OpenTelemetry trace converter
 #[derive(Parser, Debug)]
-#[command(name = "conduit")]
+#[command(name = "conduit", version)]
 #[command(about = "Convert Bazel Build Event Protocol events to OpenTelemetry traces")]
 struct Cli {
     #[command(subcommand)]
@@ -153,14 +153,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { common, .. } | Command::Replay { common, .. } => common,
     };
 
-    // Set up logging
     let level = match args.log_level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "info" => Level::INFO,
         "warn" => Level::WARN,
         "error" => Level::ERROR,
-        _ => Level::INFO,
+        other => anyhow::bail!(
+            "invalid --log-level '{other}' (expected trace, debug, info, warn or error)"
+        ),
     };
 
     let subscriber = FmtSubscriber::builder()
@@ -173,14 +174,14 @@ async fn main() -> anyhow::Result<()> {
     info!("Conduit - BEP to OpenTelemetry converter");
     info!("Log level: {}", args.log_level);
 
-    // Parse export config
     let export_config = match args.export.as_str() {
+        "none" => ExportConfig::None,
         "stdout" => ExportConfig::Stdout,
         "otlp" => ExportConfig::Otlp {
             endpoint: args.otlp_endpoint.clone(),
             max_export_batch_size: args.otlp_max_export_batch_size,
         },
-        _ => ExportConfig::None,
+        other => anyhow::bail!("invalid --export '{other}' (expected none, stdout or otlp)"),
     };
     info!("Export mode: {:?}", export_config);
 
