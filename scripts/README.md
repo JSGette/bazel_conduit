@@ -14,48 +14,19 @@ The script is just an idempotent wrapper around the manual steps; both end at th
 - Datadog Agent installed locally
   - macOS: `brew install --cask datadog-agent` (or the official `.dmg`)
   - Linux: `DD_API_KEY=… DD_SITE=… bash -c "$(curl -L https://install.datadoghq.com/scripts/install_script_agent7.sh)"`
+- The Agent already configured with a valid API key and `site` for an org that can ingest OTLP traces and logs. Neither the script nor these steps manage the key; check it with `datadog-agent status` (`API Key valid`).
 - `bazel` / `bazelisk` on `PATH`
-- `dd-auth` (Datadog corp tooling) — only required if you don't already have a personal API key
 
 ---
 
-## 1. Get an API key
+## 1. Edit `datadog.yaml`
 
-If you have one already, skip to step 2.
+| Platform | Path                                  | Owner                                   | Edit with     |
+|----------|---------------------------------------|-----------------------------------------|---------------|
+| macOS    | `/opt/datadog-agent/etc/datadog.yaml` | `_dd-agent` (system install) or your user | `sudo $EDITOR` or direct edit |
+| Linux    | `/etc/datadog-agent/datadog.yaml`     | `dd-agent` user                         | `sudo $EDITOR`|
 
-```bash
-# Prints DD_API_KEY=…, DD_APP_KEY=…, DD_SITE=… one per line.
-# Add --no-cache to bypass the keychain cache and force a fresh fetch.
-dd-auth --domain app.datadoghq.com -o
-```
-
-The first time, macOS Keychain Access will prompt for your login password three times (once per stored item). Click **Always Allow** on each prompt to suppress future prompts. If you accidentally clicked plain "Allow", delete the entries and let `dd-auth` recreate them:
-
-```bash
-security delete-generic-password -s 'dd-auth' -a 'app.datadoghq.com:api-key' 2>/dev/null
-security delete-generic-password -s 'dd-auth' -a 'app.datadoghq.com:app-key' 2>/dev/null
-security delete-generic-password -s 'dd-auth' -a 'app.datadoghq.com:pat'     2>/dev/null
-```
-
----
-
-## 2. Edit `datadog.yaml`
-
-| Platform | Path                                  | Owner             | Edit with     |
-|----------|---------------------------------------|-------------------|---------------|
-| macOS    | `/opt/datadog-agent/etc/datadog.yaml` | your user account | direct edit   |
-| Linux    | `/etc/datadog-agent/datadog.yaml`     | `dd-agent` user   | `sudo $EDITOR`|
-
-Set / replace these top-level keys:
-
-```yaml
-api_key: <DD_API_KEY from step 1>
-site: <DD_SITE from step 1, e.g. datadoghq.com>
-```
-
-If your file already has a top-level `api_key:` (Datadog corp installs do), replace its value rather than adding a duplicate. **Do not** touch any `additional_endpoints:` blocks — those carry separate keys and are typically managed by IT.
-
-Then add an OTLP receiver block (skip if `otlp_config:` is already present and configured for both `traces` and `logs`):
+Add an OTLP receiver block (skip if `otlp_config:` is already present and configured for both `traces` and `logs`):
 
 ```yaml
 logs_enabled: true
@@ -76,11 +47,12 @@ If something else on the host already binds `4317`/`4318`, pick a different pair
 
 ---
 
-## 3. Restart the agent
+## 2. Restart the agent
 
 | Platform | Command                                                       |
 |----------|---------------------------------------------------------------|
-| macOS    | `launchctl kickstart -k gui/$(id -u)/com.datadoghq.agent`     |
+| macOS (system daemon) | `sudo launchctl kickstart -k system/com.datadoghq.agent` |
+| macOS (per-user agent) | `launchctl kickstart -k gui/$(id -u)/com.datadoghq.agent` |
 | Linux    | `sudo systemctl restart datadog-agent`                        |
 
 Verify the OTLP receiver is up:
@@ -93,7 +65,7 @@ You should see `OTLP receiver: enabled` and `API Keys status: API key ending wit
 
 ---
 
-## 4. Configure Bazel
+## 3. Configure Bazel
 
 Add to `user.bazelrc` (or `~/.bazelrc` for global, or `.bazelrc` if your repo allows committed config):
 
@@ -113,7 +85,7 @@ Bazel builds emit tens of thousands of spans, mostly fast cache hits. By default
 
 ---
 
-## 5. Run conduit
+## 4. Run conduit
 
 In a dedicated terminal:
 
@@ -131,7 +103,7 @@ Leave it running and trigger a build in another terminal:
 bazel build //your:target
 ```
 
-Traces should appear in your Datadog org under **APM → Services → bazel-conduit** within ~10 seconds of the build finishing.
+Traces should appear in your Datadog org under **APM → Services → bazel** within ~10 seconds of the build finishing.
 
 ---
 
@@ -139,9 +111,8 @@ Traces should appear in your Datadog org under **APM → Services → bazel-cond
 
 | Symptom                                                          | Likely cause                                                                                       | Fix                                                                                                  |
 |------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| `datadog-agent restart-service` "unknown command"                | That subcommand is Linux-only.                                                                     | macOS: `launchctl kickstart -k gui/$(id -u)/com.datadoghq.agent`.                                    |
-| Repeated keychain password prompts on every `dd-auth` invocation | Keychain ACL is set to "Confirm before allowing".                                                  | Click "Always Allow" on the next prompt, or delete + recreate the entries (see step 1).              |
-| `OTLP receiver: disabled` in `datadog-agent status`              | `otlp_config:` block missing or malformed in `datadog.yaml`.                                       | Re-check step 2; YAML indentation matters.                                                           |
-| Bazel build hangs at `--bes_backend=grpc://127.0.0.1:8080`       | conduit isn't running on that port.                                                                | Start conduit (step 5) or remove the `bes_backend` line from `bazelrc`.                              |
+| `datadog-agent restart-service` "unknown command"                | That subcommand is Linux-only.                                                                     | macOS: `sudo launchctl kickstart -k system/com.datadoghq.agent` (or `gui/$(id -u)/…` for a per-user install). |
+| `OTLP receiver: disabled` in `datadog-agent status`              | `otlp_config:` block missing or malformed in `datadog.yaml`.                                       | Re-check step 1; YAML indentation matters.                                                           |
+| Bazel build hangs at `--bes_backend=grpc://127.0.0.1:8080`       | conduit isn't running on that port.                                                                | Start conduit (step 4) or remove the `bes_backend` line from `bazelrc`.                              |
 | Traces show up but spawn child spans don't                       | conduit not started with `--exec-log`, `--execution_log_compact_file=` not set, or conduit and Bazel are on different hosts. | Start conduit with `--exec-log` and add the flag to `bazelrc`. Conduit reads the file locally — it must run on the same host as Bazel. |
-| API key in datadog.yaml doesn't match the org I'm targeting      | `dd-auth` cached an older key, or you authed against the wrong `--domain`.                         | `./setup_datadog_agent.sh --refresh-token --domain <correct-domain>` (or `dd-auth --no-cache …`).    |
+| Agent reports the API key invalid, or traces land in the wrong org | `api_key` / `site` in `datadog.yaml` are wrong or the key lacks ingest permission.                 | Fix the key and `site` in `datadog.yaml` yourself (the script doesn't touch them) and restart the agent. |
