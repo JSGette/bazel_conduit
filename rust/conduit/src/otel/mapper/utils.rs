@@ -2,7 +2,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spawn_proto::tools::protos::SpawnExec;
@@ -168,6 +169,100 @@ pub(super) fn repository_name_from_url(url: &str) -> Option<String> {
     let last = url.trim_end_matches('/').rsplit(['/', ':']).next()?;
     let name = last.strip_suffix(".git").unwrap_or(last);
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Origin URL, HEAD commit and branch of the checkout at a workspace; the
+/// fallback when Bazel sends no `--build_metadata` for them.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct GitInfo {
+    pub url: Option<String>,
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// Bounds every `.git` read; `packed-refs` is scanned line by line and runs
+/// to ~10 MiB in datadog-agent.
+const GIT_FILE_LIMIT: u64 = 64 << 20;
+
+/// Read [`GitInfo`] from `<workspace_dir>/.git` without running git. Handles
+/// linked worktrees, where `.git` is a `gitdir:` file and config and branch
+/// refs live in the main repository's `commondir`.
+pub(super) fn read_git_info(workspace_dir: &Path) -> GitInfo {
+    let Some(git_dir) = resolve_git_dir(workspace_dir) else {
+        return GitInfo::default();
+    };
+    let common_dir = read_bounded(&git_dir.join("commondir"))
+        .map(|p| git_dir.join(p.trim()))
+        .unwrap_or_else(|| git_dir.clone());
+    let head = read_bounded(&git_dir.join("HEAD")).unwrap_or_default();
+    let head = head.trim();
+    let (commit, branch) = match head.strip_prefix("ref: ") {
+        Some(refname) if refname.starts_with("refs/") && !refname.split('/').any(|c| c == "..") => (
+            resolve_ref(&common_dir, refname),
+            refname.strip_prefix("refs/heads/").map(str::to_string),
+        ),
+        Some(_) => (None, None),
+        None => (is_object_id(head).then(|| head.to_string()), None),
+    };
+    GitInfo { url: origin_url(&common_dir), commit, branch }
+}
+
+fn resolve_git_dir(workspace_dir: &Path) -> Option<PathBuf> {
+    let dot_git = workspace_dir.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let gitdir = read_bounded(&dot_git)?;
+    Some(workspace_dir.join(gitdir.trim().strip_prefix("gitdir:")?.trim()))
+}
+
+fn resolve_ref(common_dir: &Path, refname: &str) -> Option<String> {
+    if let Some(sha) = read_bounded(&common_dir.join(refname)) {
+        let sha = sha.trim();
+        if is_object_id(sha) {
+            return Some(sha.to_string());
+        }
+    }
+    let packed = BufReader::new(open_bounded(&common_dir.join("packed-refs"))?);
+    packed.lines().map_while(Result::ok).find_map(|line| {
+        let (sha, name) = line.split_once(' ')?;
+        (name == refname && is_object_id(sha)).then(|| sha.to_string())
+    })
+}
+
+fn origin_url(common_dir: &Path) -> Option<String> {
+    let config = read_bounded(&common_dir.join("config"))?;
+    let mut in_origin = false;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_origin = line == r#"[remote "origin"]"#;
+        } else if let Some((key, value)) = line.split_once('=').filter(|_| in_origin) {
+            if key.trim() == "url" {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// SHA-1 or SHA-256 object name.
+fn is_object_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Regular files only: the path comes from the BES client, and opening a
+/// FIFO would block the stream.
+fn open_bounded(path: &Path) -> Option<std::io::Take<std::fs::File>> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    Some(std::fs::File::open(path).ok()?.take(GIT_FILE_LIMIT))
+}
+
+fn read_bounded(path: &Path) -> Option<String> {
+    let mut content = String::new();
+    open_bounded(path)?.read_to_string(&mut content).ok()?;
+    Some(content)
 }
 
 /// Pull `name = "<value>"` out of the first `<func>(...)` block in a

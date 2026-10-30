@@ -1,6 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
 // This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
 
+use super::utils::GitInfo;
 use super::*;
 use crate::state::{TracePolicy, TraceProfile};
 
@@ -96,6 +97,119 @@ fn strip_url_credentials_drops_userinfo() {
         strip_url_credentials("git@github.com:o/r.git"),
         "git@github.com:o/r.git",
     );
+}
+
+const SHA_A: &str = "1111111111111111111111111111111111111111";
+const SHA_B: &str = "2222222222222222222222222222222222222222";
+
+fn write(path: &std::path::Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+#[test]
+fn read_git_info_from_checkout() {
+    let ws = tempfile::tempdir().unwrap();
+    let git = ws.path().join(".git");
+    write(&git.join("HEAD"), "ref: refs/heads/main\n");
+    write(&git.join("refs/heads/main"), &format!("{SHA_A}\n"));
+    write(
+        &git.join("config"),
+        "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = https://x/other.git\n\
+         [remote \"origin\"]\n\turl = https://github.com/DataDog/datadog-agent.git\n",
+    );
+    assert_eq!(
+        read_git_info(ws.path()),
+        GitInfo {
+            url: Some("https://github.com/DataDog/datadog-agent.git".into()),
+            commit: Some(SHA_A.into()),
+            branch: Some("main".into()),
+        },
+    );
+}
+
+#[test]
+fn read_git_info_from_linked_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let common = root.path().join("main/.git");
+    let wt_git = common.join("worktrees/wt");
+    write(&common.join("config"), "[remote \"origin\"]\n  url=git@github.com:o/r.git\n");
+    write(
+        &common.join("packed-refs"),
+        &format!("# pack-refs with: peeled\n{SHA_B} refs/heads/feature\n{SHA_A} refs/tags/v1\n"),
+    );
+    write(&wt_git.join("HEAD"), "ref: refs/heads/feature\n");
+    write(&wt_git.join("commondir"), "../..\n");
+    let ws = root.path().join("wt");
+    write(&ws.join(".git"), &format!("gitdir: {}\n", wt_git.display()));
+    assert_eq!(
+        read_git_info(&ws),
+        GitInfo {
+            url: Some("git@github.com:o/r.git".into()),
+            commit: Some(SHA_B.into()),
+            branch: Some("feature".into()),
+        },
+    );
+}
+
+#[test]
+fn read_git_info_detached_missing_and_hostile() {
+    let ws = tempfile::tempdir().unwrap();
+    assert_eq!(read_git_info(ws.path()), GitInfo::default());
+
+    write(&ws.path().join(".git/HEAD"), &format!("{SHA_A}\n"));
+    assert_eq!(
+        read_git_info(ws.path()),
+        GitInfo { commit: Some(SHA_A.into()), ..Default::default() },
+    );
+
+    for head in ["ref: ../../etc/passwd\n", "ref: refs/heads/../../../etc/passwd\n"] {
+        write(&ws.path().join(".git/HEAD"), head);
+        assert_eq!(read_git_info(ws.path()), GitInfo::default(), "{head}");
+    }
+
+    #[cfg(unix)]
+    {
+        let fifo_ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fifo_ws.path().join(".git")).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(fifo_ws.path().join(".git/HEAD"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(read_git_info(fifo_ws.path()), GitInfo::default(), "FIFO is not opened");
+    }
+}
+
+#[test]
+fn git_checkout_identifies_spans_until_build_metadata_overrides() {
+    let ws = tempfile::tempdir().unwrap();
+    let ws_dir = ws.path().join("datadog-agent-rules-wine-tools");
+    write(&ws_dir.join(".git/HEAD"), "ref: refs/heads/wine\n");
+    write(&ws_dir.join(".git/refs/heads/wine"), SHA_A);
+    write(
+        &ws_dir.join(".git/config"),
+        "[remote \"origin\"]\n\turl = https://u:tok@github.com/DataDog/datadog-agent.git\n",
+    );
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_build_started_extended(ws_dir.to_str(), None, None, None, None);
+    let root_cx = mapper.root_context.clone().unwrap();
+    let mut child = mapper.build_child_span(&root_cx, "child".into(), SpanKind::Internal, vec![], None);
+    mapper.on_build_metadata(&crate::build_event_stream::BuildMetadata {
+        metadata: HashMap::from([("COMMIT_SHA".into(), SHA_B.into())]),
+    });
+    child.end();
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let child = find_span(&spans, |s| s.name == "child").expect("child span");
+    assert_eq!(attr_value(&child, VCS_REPOSITORY_NAME).as_deref(), Some("datadog-agent"));
+    assert_eq!(
+        attr_value(&child, GIT_REPOSITORY_URL).as_deref(),
+        Some("https://github.com/DataDog/datadog-agent.git"),
+    );
+    assert_eq!(attr_value(&child, GIT_BRANCH).as_deref(), Some("wine"));
+    assert_eq!(attr_value(&child, GIT_COMMIT_SHA).as_deref(), Some(SHA_B), "metadata wins");
 }
 
 #[test]

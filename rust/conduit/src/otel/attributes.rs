@@ -95,9 +95,10 @@ pub const BAZEL_BUILD_TOOL_VERSION: &str = "bazel.build_tool_version";
 
 // VCS / repository identity on every span. The name comes from
 // `module(name = ...)` in MODULE.bazel, else the basename of
-// `workspace_directory`; a `--build_metadata=REPO_URL=...` overrides it.
-// URL, commit and branch come from `--build_metadata=REPO_URL|COMMIT_SHA|BRANCH`
-// and are emitted under both the OTel `vcs.*` and the Datadog `git.*` names.
+// `workspace_directory`; a repository URL overrides it. URL, commit and branch
+// come from the workspace's `.git` (origin, HEAD), overridden by
+// `--build_metadata=REPO_URL|COMMIT_SHA|BRANCH`, and are emitted under both
+// the OTel `vcs.*` and the Datadog `git.*` names.
 pub const VCS_REPOSITORY_NAME: &str = "vcs.repository.name";
 pub const VCS_REPOSITORY_URL: &str = "vcs.repository.url.full";
 pub const VCS_REF_HEAD_REVISION: &str = "vcs.ref.head.revision";

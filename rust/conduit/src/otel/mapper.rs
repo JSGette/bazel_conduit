@@ -59,8 +59,9 @@ mod utils;
 use self::action_attrs::{action_status, build_action_attrs, build_action_span_name};
 use self::test_attrs::{build_test_attrs, build_test_span_name, test_status};
 use self::utils::{
-    detect_workspace_name, nanos_to_system_time, repository_name_from_url, spawn_time_range,
-    strip_ansi, strip_url_credentials, wall_clock_now_nanos, COMMAND_LINE_CAP_BYTES,
+    detect_workspace_name, nanos_to_system_time, read_git_info, repository_name_from_url,
+    spawn_time_range, strip_ansi, strip_url_credentials, wall_clock_now_nanos,
+    COMMAND_LINE_CAP_BYTES,
 };
 
 pub use self::progress::LogMode;
@@ -672,13 +673,7 @@ impl OtelMapper {
     pub fn on_build_metadata(&mut self, metadata: &crate::build_event_stream::BuildMetadata) {
         for (key, value) in &metadata.metadata {
             match key.as_str() {
-                "REPO_URL" => {
-                    let url = strip_url_credentials(value);
-                    if let Some(name) = repository_name_from_url(&url) {
-                        self.tracer.set_shared_attribute(KeyValue::new(VCS_REPOSITORY_NAME, name));
-                    }
-                    self.set_vcs_attrs([VCS_REPOSITORY_URL, GIT_REPOSITORY_URL], url);
-                }
+                "REPO_URL" => self.set_repository_url(value),
                 "COMMIT_SHA" => {
                     self.set_vcs_attrs([VCS_REF_HEAD_REVISION, GIT_COMMIT_SHA], value.clone())
                 }
@@ -687,6 +682,29 @@ impl OtelMapper {
                     .set_root_attr(KeyValue::new(format!("bazel.metadata.{key}"), value.clone())),
             }
         }
+    }
+
+    /// Defaults from the workspace's `.git`; BuildMetadata, which Bazel posts
+    /// after BuildStarted, overrides them.
+    fn set_git_fallback(&self, workspace_dir: &std::path::Path) {
+        let git = read_git_info(workspace_dir);
+        if let Some(url) = git.url {
+            self.set_repository_url(&url);
+        }
+        if let Some(sha) = git.commit {
+            self.set_vcs_attrs([VCS_REF_HEAD_REVISION, GIT_COMMIT_SHA], sha);
+        }
+        if let Some(branch) = git.branch {
+            self.set_vcs_attrs([VCS_REF_HEAD_NAME, GIT_BRANCH], branch);
+        }
+    }
+
+    fn set_repository_url(&self, url: &str) {
+        let url = strip_url_credentials(url);
+        if let Some(name) = repository_name_from_url(&url) {
+            self.tracer.set_shared_attribute(KeyValue::new(VCS_REPOSITORY_NAME, name));
+        }
+        self.set_vcs_attrs([VCS_REPOSITORY_URL, GIT_REPOSITORY_URL], url);
     }
 
     fn set_vcs_attrs(&self, keys: [&'static str; 2], value: String) {

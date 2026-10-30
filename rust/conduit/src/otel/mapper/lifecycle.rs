@@ -66,6 +66,7 @@ impl OtelMapper {
                 if let Some(name) = super::detect_workspace_name(&path) {
                     self.tracer.set_shared_attribute(KeyValue::new(VCS_REPOSITORY_NAME, name));
                 }
+                self.set_git_fallback(&path);
                 self.workspace_directory = Some(path);
             }
         }
