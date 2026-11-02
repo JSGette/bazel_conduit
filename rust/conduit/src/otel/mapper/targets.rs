@@ -303,6 +303,11 @@ impl OtelMapper {
         description: Option<&str>,
         event_time_nanos: Option<i64>,
     ) {
+        // Bazel can report one skipped target twice (ConfiguredLabel and
+        // TargetConfigured). Completed targets only close at finish.
+        if self.closed_targets.contains(label) {
+            return;
+        }
         // Consume the configured metadata (if any).
         let configured = self.configured_targets.remove(label);
         // End any open span from target_contexts to avoid leaks.
