@@ -1057,11 +1057,12 @@ fn cached_spawn_chain_is_nested_inside_root_window() {
     mapper.root_span_end_from_wall_nanos = Some(invocation_start + 2_000_000_000);
     mapper.compact_streaming_active = true;
 
-    mapper.on_action_completed(action_event_for(
-        "//pkg:cached",
-        "GoCompilePkg",
-        "bazel-out/cached.a",
-    ));
+    let reported_at = invocation_start + 1_000_000_000;
+    mapper.on_action_completed(ActionCompletedEvent {
+        event_time_nanos: Some(reported_at),
+        cached: None,
+        ..action_event_for("//pkg:cached", "GoCompilePkg", "bazel-out/cached.a")
+    });
     mapper.on_compact_spawn(spawn_exec_with_metrics(
         "//pkg:cached",
         "GoCompilePkg",
@@ -1090,8 +1091,8 @@ fn cached_spawn_chain_is_nested_inside_root_window() {
     assert!(action.end_time <= target.end_time);
     assert!(target.end_time <= root.end_time);
     assert_eq!(target.end_time, action.end_time);
-    assert!(action.start_time < action.end_time);
-    assert!(spawn.start_time < spawn.end_time);
+    assert_eq!(action.start_time, nanos_to_system_time(reported_at));
+    assert_eq!(action.end_time, nanos_to_system_time(reported_at));
 }
 
 #[test]
@@ -1230,6 +1231,82 @@ fn lightweight_budget_keeps_slowest_successes_and_all_failures() {
         attr_value(&root, BAZEL_TRACE_SUPPRESSED_ACTIONS).as_deref(),
         Some("2"),
     );
+}
+
+/// An action timed before the build started is a cache hit replaying an
+/// older run, even when Bazel does not say it was cached.
+#[test]
+fn action_predating_build_is_placed_at_report_time() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_action_completed(ActionCompletedEvent {
+        start_time_nanos: Some(200_000_000),
+        end_time_nanos: Some(800_000_000),
+        event_time_nanos: Some(3_000_000_000),
+        cached: None,
+        ..action_event_for("//:old", "Genrule", "bazel-out/old")
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let action = find_span(&spans, |s| s.name == "action Genrule //:old").expect("action span");
+    assert_eq!(action.start_time, nanos_to_system_time(3_000_000_000));
+    assert_eq!(action.end_time, nanos_to_system_time(3_000_000_000));
+}
+
+#[test]
+fn cached_action_inside_build_takes_no_time() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_action_completed(ActionCompletedEvent {
+        start_time_nanos: Some(2_000_000_000),
+        end_time_nanos: Some(4_000_000_000),
+        event_time_nanos: Some(4_500_000_000),
+        cached: Some(true),
+        ..action_event_for("//:hit", "Genrule", "bazel-out/hit")
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let action = find_span(&spans, |s| s.name == "action Genrule //:hit").expect("action span");
+    assert_eq!(action.start_time, nanos_to_system_time(4_500_000_000));
+    assert_eq!(action.end_time, nanos_to_system_time(4_500_000_000));
+}
+
+/// An explicit cache miss keeps its timing even if its clock runs behind.
+#[test]
+fn reported_cache_miss_keeps_its_duration() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_action_completed(ActionCompletedEvent {
+        start_time_nanos: Some(900_000_000),
+        end_time_nanos: Some(3_000_000_000),
+        event_time_nanos: Some(3_100_000_000),
+        cached: Some(false),
+        ..action_event_for("//:miss", "Genrule", "bazel-out/miss")
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let action = find_span(&spans, |s| s.name == "action Genrule //:miss").expect("action span");
+    assert_eq!(action.start_time, nanos_to_system_time(1_000_000_000));
+    assert_eq!(action.end_time, nanos_to_system_time(3_000_000_000));
+}
+
+/// A cache hit's original runtime must not win the budget over real work.
+#[test]
+fn lightweight_budget_ranks_cache_hits_as_instant() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.set_trace_policy(TracePolicy::new(TraceProfile::Lightweight, 500, 1));
+
+    mapper.on_action_completed(ActionCompletedEvent {
+        start_time_nanos: Some(-60_000_000_000),
+        end_time_nanos: Some(0),
+        event_time_nanos: Some(2_000_000_000),
+        cached: None,
+        ..action_event_for("//:hit", "Genrule", "bazel-out/hit")
+    });
+    mapper.on_action_completed(timed_action("//:work", true, 50));
+    mapper.finish();
+
+    assert_eq!(action_names(&collector.snapshot()), ["action Genrule //:work"]);
 }
 
 /// A successful target completes after the budget settles: it survives

@@ -83,6 +83,8 @@ pub struct ActionCompletedEvent {
     pub stderr_path: Option<String>,
     pub start_time_nanos: Option<i64>,
     pub end_time_nanos: Option<i64>,
+    /// When Bazel reported the action in this build.
+    pub event_time_nanos: Option<i64>,
     pub cached: Option<bool>,
     pub runner: Option<String>,
 }

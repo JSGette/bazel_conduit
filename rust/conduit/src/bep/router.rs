@@ -584,6 +584,7 @@ impl EventRouter {
                         start_time_nanos: start_nanos,
                         // Internal actions (Symlink, ...) carry no times.
                         end_time_nanos: end_nanos.or(event_time_nanos),
+                        event_time_nanos,
                         cached,
                         runner,
                     });
