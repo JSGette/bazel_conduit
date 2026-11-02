@@ -1,6 +1,6 @@
 [package]
 name = "conduit"
-version = "0.0.1-RC1"
+version = "0.0.1-RC2"
 edition = "2024"
 rust-version = "1.93"
 description = "BEP to OpenTelemetry trace converter"

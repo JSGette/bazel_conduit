@@ -42,8 +42,8 @@ Traces use `service.name=bazel`.
 2.35 or newer, e.g. Ubuntu 22.04+) and `darwin-arm64` (macOS 14+), each with a `.sha256`:
 
 ```bash
-curl -fsSLO https://github.com/JSGette/bazel_conduit/releases/download/v0.0.1-RC1/conduit-linux-x86_64
-curl -fsSLO https://github.com/JSGette/bazel_conduit/releases/download/v0.0.1-RC1/conduit-linux-x86_64.sha256
+curl -fsSLO https://github.com/JSGette/bazel_conduit/releases/download/v0.0.1-RC2/conduit-linux-x86_64
+curl -fsSLO https://github.com/JSGette/bazel_conduit/releases/download/v0.0.1-RC2/conduit-linux-x86_64.sha256
 shasum -a 256 -c conduit-linux-x86_64.sha256 && chmod +x conduit-linux-x86_64
 ./conduit-linux-x86_64 --version
 ```
