@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::super::attributes::*;
 use super::{ExecLogState, OtelMapper};
-use crate::otel::span::{self, Context, KeyValue, SpanContext, SpanId, SpanKind, Status};
+use crate::otel::span::{self, Context, KeyValue, SpanContext, SpanId, SpanKind};
 
 impl OtelMapper {
     /// BuildStarted -> create root span `bazel.invocation`, starting at the
@@ -186,53 +186,6 @@ impl OtelMapper {
                 vec![KeyValue::new(BAZEL_PATTERNS, patterns.join(", "))],
             );
         }
-    }
-
-    /// UnconfiguredLabel / ConfiguredLabel with Aborted payload ->
-    /// record as a span under the "skipped" parent (root-cause failure).
-    pub fn on_aborted_label(
-        &mut self,
-        label: &str,
-        reason: Option<&str>,
-        description: Option<&str>,
-        event_time_nanos: Option<i64>,
-    ) {
-        Self::ensure_group_span(
-            &mut self.skipped_context,
-            &self.root_context,
-            &self.tracer,
-            "skipped targets",
-            self.root_span_start_nanos,
-        );
-
-        let Some(parent) = &self.skipped_context else {
-            return;
-        };
-
-        let short = shorten_label(label);
-        let mut attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_SUCCESS, false),
-        ];
-        if let Some(r) = reason {
-            attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_REASON, r.to_string()));
-        }
-        if let Some(d) = description {
-            attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_DESCRIPTION, d.to_string()));
-        }
-
-        self.build_and_end_child_span(
-            parent,
-            format!("target {short}"),
-            SpanKind::Internal,
-            attrs,
-            Status::Error {
-                description: std::borrow::Cow::Owned(description.unwrap_or("aborted").to_string()),
-            },
-            None,
-            event_time_nanos,
-        );
-        debug!("Created aborted-label span for {label}");
     }
 
     /// Configuration -> cache its mnemonic (e.g. `k8-fastbuild`) for actions.

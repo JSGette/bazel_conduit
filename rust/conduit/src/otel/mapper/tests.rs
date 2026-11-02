@@ -506,6 +506,42 @@ fn test_summary_for_skipped_target_adds_no_span() {
     assert_eq!(attr_value(targets[0], BAZEL_TARGET_SYNTHETIC), None);
 }
 
+#[test]
+fn skipped_targets_share_one_instant() {
+    let (mut mapper, collector) = mapper_with_collector();
+    // Analysis-time skip, then skips reported after execution and out of order.
+    mapper.on_target_skipped("//pkg:a", Some("ANALYSIS_FAILURE"), None, Some(20_000_000_000));
+    mapper.on_target_skipped("//pkg:b", Some("SKIPPED"), None, Some(190_000_000_000));
+    mapper.on_target_skipped("//pkg:c", Some("SKIPPED"), None, Some(10_000_000_000));
+    mapper.on_build_finished(Some(0), Some(200_000_000_000), None);
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let first = nanos_to_system_time(20_000_000_000);
+    let group = find_span(&spans, |s| s.name == "skipped targets").expect("skipped group");
+    assert_eq!((group.start_time, group.end_time), (first, first));
+    let children: Vec<_> = spans.iter().filter(|s| s.name.starts_with("target //pkg:")).collect();
+    assert_eq!(children.len(), 3);
+    for child in children {
+        assert_eq!(child.parent_span_id, group.span_context.span_id());
+        assert_eq!((child.start_time, child.end_time), (first, first), "{}", child.name);
+    }
+}
+
+#[test]
+fn skipped_target_before_build_start_stays_inside_root() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_target_skipped("//pkg:early", Some("SKIPPED"), None, Some(500_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    let group = find_span(&spans, |s| s.name == "skipped targets").expect("skipped group");
+    let child = find_span(&spans, |s| s.name == "target //pkg:early").expect("skipped target");
+    assert_eq!(group.start_time, root.start_time);
+    assert_eq!(child.start_time, root.start_time);
+}
+
 /// Events after `TargetCompleted` (late actions, tests and their summary)
 /// land on the real target span, which completes at finish.
 #[test]

@@ -290,6 +290,9 @@ pub struct OtelMapper {
     /// Created lazily on first skipped target, ended in [`finish`].
     skipped_context: Option<Context>,
 
+    /// Timestamp shared by every skipped target and the `skipped` span.
+    skipped_at: Option<i64>,
+
     /// Cached configurations: config hash → mnemonic (e.g. `k8-fastbuild`).
     configurations: HashMap<String, String>,
 
@@ -433,6 +436,7 @@ impl OtelMapper {
             target_start_nanos: HashMap::new(),
             closed_targets: HashSet::new(),
             skipped_context: None,
+            skipped_at: None,
             configurations: HashMap::new(),
             cached_command: None,
             cached_patterns: Vec::new(),
@@ -638,11 +642,8 @@ impl OtelMapper {
             let mut builder = tracer
                 .span_builder(name)
                 .with_kind(SpanKind::Internal);
-            // Anchor group spans at the invocation start. They are created
-            // lazily on their first child, which can arrive late (e.g. the
-            // first skipped target on an interrupted build); without an
-            // explicit start the span would begin at "now" and a child whose
-            // event time predates creation would fall outside the parent.
+            // Without an explicit start the span would begin at "now", after
+            // its first child's event time when events are processed late.
             if let Some(nanos) = start_nanos {
                 builder = builder.with_start_time(nanos_to_system_time(nanos));
             }
@@ -764,6 +765,7 @@ impl OtelMapper {
         if let Some(cx) = self.skipped_context.take() {
             cx.span().end();
         }
+        self.skipped_at = None;
         for (_, cx) in self.target_contexts.drain() {
             cx.span().end();
         }
@@ -923,10 +925,10 @@ impl OtelMapper {
         }
         self.configured_targets.clear();
 
-        // End the `skipped targets` parent span.
         if let Some(cx) = self.skipped_context.take() {
             cx.span().set_status(Status::Unset);
-            if let Some(nanos) = effective_end {
+            let end = self.skipped_at.take().or(effective_end);
+            if let Some(nanos) = end {
                 cx.span().end_with_timestamp(nanos_to_system_time(nanos));
             } else {
                 cx.span().end();
