@@ -27,7 +27,7 @@ impl OtelMapper {
             self.emit_action(&ev);
             return;
         }
-        let duration_nanos = match (ev.start_time_nanos, ev.end_time_nanos) {
+        let duration_nanos = match self.action_time_range(&ev) {
             (Some(start), Some(end)) => (end - start).max(0),
             _ => 0,
         };
@@ -54,11 +54,33 @@ impl OtelMapper {
             .into_iter()
             .map(|Reverse(b)| b.event)
             .collect();
-        kept.sort_by_key(|ev| ev.start_time_nanos.or(ev.end_time_nanos));
+        kept.sort_by_key(|ev| {
+            let (start, end) = self.action_time_range(ev);
+            start.or(end)
+        });
         for ev in &kept {
             self.emit_action(ev);
         }
         kept.len()
+    }
+
+    /// Bazel reports a cache hit with the timing of the run that filled the
+    /// cache. Such an action took no time in this build, so it is placed at
+    /// the moment Bazel reported it. Before Bazel 10 `cached` is unknown, and
+    /// a start before the build is the only sign of a cache hit.
+    fn action_time_range(&self, ev: &ActionCompletedEvent) -> (Option<i64>, Option<i64>) {
+        let cached = ev.cached.unwrap_or_else(|| {
+            matches!(
+                (ev.start_time_nanos, self.root_span_start_nanos),
+                (Some(start), Some(root_start)) if start < root_start
+            )
+        });
+        if cached {
+            let at = ev.event_time_nanos.or(ev.end_time_nanos);
+            (at, at)
+        } else {
+            (ev.start_time_nanos, ev.end_time_nanos)
+        }
     }
 
     /// Create the `action {mnemonic} {label}` span. With the compact exec log
@@ -72,9 +94,10 @@ impl OtelMapper {
 
         // Clamp action timing before creating a synthetic target so its
         // lifecycle can use the same child bounds.
+        let (start, end) = self.action_time_range(ev);
         let (clamped_start, clamped_end) = clamp_time_range(
-            ev.start_time_nanos,
-            ev.end_time_nanos,
+            start,
+            end,
             self.root_span_start_nanos,
             self.root_span_end_from_wall_nanos.or(self.finish_time_nanos),
         );

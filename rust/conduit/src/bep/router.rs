@@ -501,6 +501,16 @@ impl EventRouter {
                         );
                     }
                 }
+                if let Some(BepPayload::Aborted(a)) = &event.payload {
+                    if let Some(mapper) = &mut self.mapper {
+                        mapper.on_target_skipped(
+                            &t.label,
+                            Some(a.reason().as_str_name()),
+                            Some(a.description.as_str()),
+                            event_time_nanos,
+                        );
+                    }
+                }
                 Ok(())
             }
             BepId::TargetCompleted(t) => {
@@ -574,6 +584,7 @@ impl EventRouter {
                         start_time_nanos: start_nanos,
                         // Internal actions (Symlink, ...) carry no times.
                         end_time_nanos: end_nanos.or(event_time_nanos),
+                        event_time_nanos,
                         cached,
                         runner,
                     });
@@ -973,6 +984,54 @@ mod tests {
         assert_eq!((test.start_time, test.end_time), (build_clock, build_clock));
         let root = spans.iter().find(|s| s.name.starts_with("bazel ")).expect("root span");
         assert_eq!(root.end_time, UNIX_EPOCH + Duration::from_secs(105), "no BuildFinished: root ends on the build clock");
+    }
+
+    #[test]
+    fn every_skipped_target_gets_one_span() {
+        use crate::build_event_stream::build_event::Payload;
+        use crate::build_event_stream::build_event_id::{ConfiguredLabelId, Id, TargetConfiguredId};
+        use crate::build_event_stream::aborted::AbortReason;
+        use crate::build_event_stream::{Aborted, BuildEvent, BuildEventId, BuildStarted};
+        use crate::otel::span::{Sink, Tracer};
+        use crate::otel::OtelMapper;
+
+        let event = |id: Id, payload: Payload| BuildEvent {
+            id: Some(BuildEventId { id: Some(id) }),
+            payload: Some(payload),
+            ..Default::default()
+        };
+        let aborted = || {
+            Payload::Aborted(Aborted { reason: AbortReason::AnalysisFailure as i32, ..Default::default() })
+        };
+        let configured = |label: &str| {
+            event(Id::TargetConfigured(TargetConfiguredId { label: label.into(), ..Default::default() }), aborted())
+        };
+        let started = event(
+            Id::Started(Default::default()),
+            Payload::Started(BuildStarted { uuid: "u".into(), command: "build".into(), ..Default::default() }),
+        );
+
+        let (sink, spans) = Sink::memory();
+        let mut router = super::EventRouter::new().with_mapper(OtelMapper::new(Tracer::new(sink), None));
+        // Bazel 9 order for an analysis failure and the target that depends on it.
+        for ev in [
+            started,
+            event(Id::ConfiguredLabel(ConfiguredLabelId { label: "//:broken".into(), ..Default::default() }), aborted()),
+            configured("//:broken"),
+            configured("//:needs_broken"),
+        ] {
+            router.route_build_event(&ev, None).unwrap();
+        }
+        router.finish();
+
+        let mut skipped: Vec<String> = spans
+            .snapshot()
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .filter(|n| n.starts_with("target "))
+            .collect();
+        skipped.sort();
+        assert_eq!(skipped, ["target //:broken", "target //:needs_broken"]);
     }
 
     #[test]

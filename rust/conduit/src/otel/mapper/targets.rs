@@ -303,6 +303,11 @@ impl OtelMapper {
         description: Option<&str>,
         event_time_nanos: Option<i64>,
     ) {
+        // Bazel can report one skipped target twice (ConfiguredLabel and
+        // TargetConfigured). Completed targets only close at finish.
+        if self.closed_targets.contains(label) {
+            return;
+        }
         // Consume the configured metadata (if any).
         let configured = self.configured_targets.remove(label);
         // End any open span from target_contexts to avoid leaks.
@@ -312,12 +317,20 @@ impl OtelMapper {
             debug!("Ended leaked target span for {label} on skip");
         }
 
+        let instant = event_time_nanos.or_else(super::wall_clock_now_nanos);
+        let (instant, _) = self.clamp_to_invocation(instant, instant);
+        // Skipped targets take no time, but Bazel reports them both during
+        // analysis and after execution; one shared instant keeps the group
+        // from spanning the build.
+        let instant = self.skipped_at.or(instant);
+        self.skipped_at = instant;
+
         Self::ensure_group_span(
             &mut self.skipped_context,
             &self.root_context,
             &self.tracer,
             "skipped targets",
-            self.root_span_start_nanos,
+            instant,
         );
 
         let parent = match &self.skipped_context {
@@ -342,8 +355,7 @@ impl OtelMapper {
             attrs.push(KeyValue::new(BAZEL_TARGET_ABORT_DESCRIPTION, d.to_string()));
         }
 
-        let (_, clamped_event) = self.clamp_to_invocation(None, event_time_nanos);
-        let instant = clamped_event
+        let instant = instant
             .map(super::nanos_to_system_time)
             .unwrap_or_else(SystemTime::now);
 
