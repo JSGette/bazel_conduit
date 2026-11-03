@@ -31,7 +31,7 @@ errno,https://github.com/lambda-fairy/rust-errno,MIT OR Apache-2.0,Chris Wong <l
 fastrand,https://github.com/smol-rs/fastrand,Apache-2.0 OR MIT,Stjepan Glavina <stjepang@gmail.com>
 find-msvc-tools,https://github.com/rust-lang/cc-rs,MIT OR Apache-2.0,Copyright find-msvc-tools contributors
 fixedbitset,https://github.com/petgraph/fixedbitset,MIT OR Apache-2.0,bluss
-fnv,https://github.com/servo/rust-fnv,Apache-2.0 / MIT,Alex Crichton <alex@alexcrichton.com>
+fnv,https://github.com/servo/rust-fnv,Apache-2.0 OR MIT,Alex Crichton <alex@alexcrichton.com>
 foldhash,https://github.com/orlp/foldhash,Zlib,Orson Peters <orsonpeters@gmail.com>
 futures-channel,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-channel contributors
 futures-core,https://github.com/rust-lang/futures-rs,MIT OR Apache-2.0,Copyright futures-core contributors
@@ -55,7 +55,7 @@ httpdate,https://github.com/pyfisch/httpdate,MIT OR Apache-2.0,Pyfisch <pyfisch@
 hyper,https://github.com/hyperium/hyper,MIT,Sean McArthur <sean@seanmonstar.com>
 hyper-timeout,https://github.com/hjr3/hyper-timeout,MIT OR Apache-2.0,Herman J. Radtke III <herman@hermanradtke.com>
 hyper-util,https://github.com/hyperium/hyper-util,MIT,Sean McArthur <sean@seanmonstar.com>
-id-arena,https://github.com/fitzgen/id-arena,MIT/Apache-2.0,Nick Fitzgerald <fitzgen@gmail.com>; Aleksey Kladov <aleksey.kladov@gmail.com>
+id-arena,https://github.com/fitzgen/id-arena,MIT OR Apache-2.0,Nick Fitzgerald <fitzgen@gmail.com>; Aleksey Kladov <aleksey.kladov@gmail.com>
 indexmap,https://github.com/bluss/indexmap,Apache-2.0 OR MIT,Copyright indexmap contributors
 indexmap,https://github.com/indexmap-rs/indexmap,Apache-2.0 OR MIT,Copyright indexmap contributors
 is_terminal_polyfill,https://github.com/polyfill-rs/is_terminal_polyfill,MIT OR Apache-2.0,Copyright is_terminal_polyfill contributors
@@ -66,6 +66,7 @@ js-sys,https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys,MI
 lazy_static,https://github.com/rust-lang-nursery/lazy-static.rs,MIT OR Apache-2.0,Marvin Löbel <loebel.marvin@gmail.com>
 leb128fmt,https://github.com/bluk/leb128fmt,MIT OR Apache-2.0,Bryant Luk <code@bryantluk.com>
 libc,https://github.com/rust-lang/libc,MIT OR Apache-2.0,The Rust Project Developers
+libzstd,https://github.com/facebook/zstd,BSD-3-Clause OR GPL-2.0-only,"Meta Platforms, Inc. and affiliates"
 linux-raw-sys,https://github.com/sunfishcode/linux-raw-sys,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,Dan Gohman <dev@sunfishcode.online>
 log,https://github.com/rust-lang/log,MIT OR Apache-2.0,The Rust Project Developers
 matchers,https://github.com/hawkw/matchers,MIT,Eliza Weisman <eliza@buoyant.io>
@@ -179,4 +180,4 @@ zerocopy-derive,https://github.com/google/zerocopy,BSD-2-Clause OR Apache-2.0 OR
 zmij,https://github.com/dtolnay/zmij,MIT,David Tolnay <dtolnay@gmail.com>
 zstd,https://github.com/gyscos/zstd-rs,MIT,Alexandre Bury <alexandre.bury@gmail.com>
 zstd-safe,https://github.com/gyscos/zstd-rs,MIT OR Apache-2.0,Alexandre Bury <alexandre.bury@gmail.com>
-zstd-sys,https://github.com/gyscos/zstd-rs,MIT/Apache-2.0,Alexandre Bury <alexandre.bury@gmail.com>
+zstd-sys,https://github.com/gyscos/zstd-rs,MIT OR Apache-2.0,Alexandre Bury <alexandre.bury@gmail.com>
