@@ -1,0 +1,13 @@
+# Unless explicitly stated otherwise all files in this repository are licensed under the Apache-2.0 License.
+# This product includes software developed at Datadog (https://www.datadoghq.com/) Copyright 2026 Datadog, Inc.
+
+# Permissive licenses only. A crate offering several licenses (e.g. "MIT OR LGPL-2.1") passes
+# when one of them is allowed.
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+]

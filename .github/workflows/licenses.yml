@@ -1,0 +1,23 @@
+name: licenses
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: install cargo-deny
+        run: cargo install --locked cargo-deny@0.19.5
+
+      - name: check licenses
+        run: cargo deny --manifest-path rust/conduit/Cargo.toml check licenses
