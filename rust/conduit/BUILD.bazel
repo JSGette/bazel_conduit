@@ -3,7 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 package(default_visibility = ["//visibility:public"])
 
 # Keep in sync with Cargo.toml and MODULE.bazel.
-VERSION = "0.0.1-RC1"
+VERSION = "0.0.1-RC2"
 
 # Export Cargo files for rules_rs
 exports_files([
