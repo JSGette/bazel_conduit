@@ -8,9 +8,9 @@ license = "Apache-2.0"
 
 [dependencies]
 # Proto / gRPC
-prost = "0.13"
-prost-types = "0.13"
-tonic = "0.12"
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
 
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -27,11 +27,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 anyhow = "1"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 # Prost toolchain plugins (only needed for Bazel proto gen)
-protoc-gen-prost = "0.4"
-protoc-gen-tonic = "0.4"
+protoc-gen-prost = "0.5"
+protoc-gen-tonic = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
