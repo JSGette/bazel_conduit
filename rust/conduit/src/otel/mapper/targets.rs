@@ -304,7 +304,7 @@ impl OtelMapper {
 
     /// TargetCompleted with `aborted` payload -> create a brief span under
     /// the "skipped" parent and end it immediately. The lightweight profile
-    /// only keeps failure aborts.
+    /// drops targets that were never built (SKIPPED, NO_BUILD, NO_ANALYZE).
     pub fn on_target_skipped(
         &mut self,
         label: &str,
@@ -320,14 +320,20 @@ impl OtelMapper {
         // Consume the configured metadata (if any).
         let configured = self.configured_targets.remove(label);
         // End any open span from target_contexts to avoid leaks.
-        if let Some(existing) = self.target_contexts.remove(label) {
+        let had_span = self.target_contexts.remove(label).map(|existing| {
             existing.span().set_status(Status::Unset);
             existing.span().end();
             debug!("Ended leaked target span for {label} on skip");
-        }
+        });
 
         let failed = is_failure_abort(reason);
-        if !failed && !self.trace_policy.is_full() {
+        // Interrupted targets may have run actions that are emitted at finish
+        // and would recreate the target, so only never-built targets go.
+        if !failed
+            && had_span.is_none()
+            && reason != Some("USER_INTERRUPTED")
+            && !self.trace_policy.is_full()
+        {
             self.synthetic_target_labels.remove(label);
             self.target_child_end_nanos.remove(label);
             self.closed_targets.insert(label.to_string());

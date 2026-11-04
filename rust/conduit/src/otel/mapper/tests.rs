@@ -554,7 +554,7 @@ fn failure_aborts_are_span_errors() {
 }
 
 #[test]
-fn lightweight_keeps_only_failure_aborts() {
+fn lightweight_drops_never_built_targets() {
     let (mut mapper, collector) = mapper_with_collector();
     lightweight(&mut mapper);
     mapper.on_target_skipped("//pkg:skipped", Some("SKIPPED"), None, Some(1_200_000_000));
@@ -562,11 +562,23 @@ fn lightweight_keeps_only_failure_aborts() {
     mapper.on_target_skipped("//pkg:skipped", Some("SKIPPED"), None, Some(1_200_000_000));
     mapper.on_target_skipped("//pkg:no_build", Some("NO_BUILD"), None, Some(1_200_000_000));
     mapper.on_target_skipped("//pkg:broken", Some("ANALYSIS_FAILURE"), None, Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:interrupted", Some("USER_INTERRUPTED"), None, Some(1_200_000_000));
+    // Already exported by a retained child: not suppressed.
+    mapper.target_parent_context("//pkg:opened", None);
+    mapper.on_target_skipped("//pkg:opened", Some("SKIPPED"), None, Some(1_200_000_000));
     mapper.finish();
 
     let spans = collector.snapshot();
     let targets: Vec<&str> = spans.iter().filter(|s| s.name.starts_with("target ")).map(|s| s.name.as_ref()).collect();
-    assert_eq!(targets, ["target //pkg:broken"]);
+    for kept in ["target //pkg:broken", "target //pkg:interrupted", "target //pkg:opened"] {
+        assert!(targets.contains(&kept), "{kept} missing: {targets:?}");
+    }
+    for dropped in ["target //pkg:skipped", "target //pkg:no_build"] {
+        assert!(!targets.contains(&dropped), "{dropped} emitted: {targets:?}");
+    }
+    let interrupted = find_span(&spans, |s| s.name == "target //pkg:interrupted").expect("interrupted");
+    assert_eq!(interrupted.status, Status::Unset);
+    assert_eq!(attr_value(&interrupted, BAZEL_TARGET_SUCCESS), None);
     let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
     assert_eq!(attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(), Some("2"));
 }
