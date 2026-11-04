@@ -584,6 +584,47 @@ fn lightweight_drops_never_built_targets() {
 }
 
 #[test]
+fn every_span_has_an_operation_name() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    mapper.on_compact_spawn(spawn_exec_with_metrics(
+        "//pkg:orphan",
+        "JavaCompile",
+        "bazel-out/orphan.jar",
+        "remote cache hit",
+        true,
+    ));
+    mapper.on_target_configured("//pkg:t", Some("cc_test"), &[], Some(1_100_000_000), None);
+    mapper.on_action_completed(action_event_for("//pkg:t", "CppCompile", "bazel-out/t.o"));
+    mapper.on_test_result(&TestResultEvent {
+        label: "//pkg:t",
+        status: Some("PASSED"),
+        attempt: Some(1),
+        run: None,
+        shard: None,
+        cached: Some(false),
+        strategy: None,
+        start_time_nanos: Some(1_300_000_000),
+        duration_nanos: Some(100_000_000),
+        hostname: None,
+        cached_remotely: None,
+    });
+    mapper.on_target_completed("//pkg:t", true, &[], Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:broken", Some("ANALYSIS_FAILURE"), None, Some(1_200_000_000));
+    mapper.finish();
+
+    let ops: std::collections::BTreeSet<String> = collector
+        .snapshot()
+        .iter()
+        .map(|s| attr_value(s, OPERATION_NAME).unwrap_or_else(|| panic!("no operation.name on {}", s.name)))
+        .collect();
+    assert_eq!(
+        ops.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["bazel.action", "bazel.invocation", "bazel.skipped_targets", "bazel.spawn", "bazel.target", "bazel.test"],
+    );
+}
+
+#[test]
 fn skipped_target_before_build_start_stays_inside_root() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.on_target_skipped("//pkg:early", Some("SKIPPED"), None, Some(500_000_000));

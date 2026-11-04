@@ -5,6 +5,10 @@
 //!
 //! Follows the naming convention `bazel.<component>.<field>`.
 
+/// Datadog operation name. Without it Datadog falls back to the span kind
+/// ("Internal"); the span name stays the resource name.
+pub const OPERATION_NAME: &str = "operation.name";
+
 // Trace-level (from BuildStarted / invocation metadata)
 pub const BAZEL_INVOCATION_ID: &str = "bazel.invocation_id";
 pub const BAZEL_COMMAND: &str = "bazel.command";

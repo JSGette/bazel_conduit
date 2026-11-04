@@ -63,7 +63,10 @@ impl OtelMapper {
         start_nanos_override: Option<i64>,
     ) -> Context {
         let short = shorten_label(label);
-        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        let mut attrs = vec![
+            KeyValue::new(OPERATION_NAME, "bazel.target"),
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+        ];
         if let Some(k) = &configured.kind {
             attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
         }
@@ -156,6 +159,7 @@ impl OtelMapper {
     ) -> Context {
         let short = shorten_label(label);
         let attrs = vec![
+            KeyValue::new(OPERATION_NAME, "bazel.target"),
             KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
             KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
         ];
@@ -355,6 +359,7 @@ impl OtelMapper {
             &self.root_context,
             &self.tracer,
             "skipped targets",
+            "bazel.skipped_targets",
             instant,
         );
 
@@ -364,7 +369,10 @@ impl OtelMapper {
         };
 
         let short = shorten_label(label);
-        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        let mut attrs = vec![
+            KeyValue::new(OPERATION_NAME, "bazel.target"),
+            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
+        ];
         if failed {
             attrs.push(KeyValue::new(BAZEL_TARGET_SUCCESS, false));
         }

@@ -636,6 +636,7 @@ impl OtelMapper {
         root_context: &Option<Context>,
         tracer: &Tracer,
         name: &'static str,
+        operation: &'static str,
         start_nanos: Option<i64>,
     ) {
         if slot.is_some() {
@@ -644,7 +645,8 @@ impl OtelMapper {
         if let Some(root_cx) = root_context {
             let mut builder = tracer
                 .span_builder(name)
-                .with_kind(SpanKind::Internal);
+                .with_kind(SpanKind::Internal)
+                .with_attributes(vec![KeyValue::new(OPERATION_NAME, operation)]);
             // Without an explicit start the span would begin at "now", after
             // its first child's event time when events are processed late.
             if let Some(nanos) = start_nanos {
