@@ -291,6 +291,7 @@ pub(crate) fn emit_spawn_span(
 fn build_spawn_attributes(s: &SpawnExec, redactor: &Redactor) -> Vec<KeyValue> {
     let mut attrs = Vec::with_capacity(16);
 
+    attrs.push(KeyValue::new(OPERATION_NAME, "bazel.spawn"));
     attrs.push(KeyValue::new(BAZEL_SPAWN_RUNNER, s.runner.clone()));
     attrs.push(KeyValue::new(BAZEL_SPAWN_CACHE_HIT, s.cache_hit));
     if !s.remote_cacheable {

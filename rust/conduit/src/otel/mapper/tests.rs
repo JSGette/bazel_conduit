@@ -543,16 +543,85 @@ fn failure_aborts_are_span_errors() {
     mapper.finish();
 
     let spans = collector.snapshot();
-    let status = |label: &str| {
-        find_span(&spans, |s| s.name == format!("target {label}"))
-            .expect(label)
-            .status
-    };
-    assert_eq!(status("//pkg:analysis"), Status::error("ANALYSIS_FAILURE"));
-    assert_eq!(status("//pkg:incomplete"), Status::error("INCOMPLETE"));
-    assert_eq!(status("//pkg:skipped"), Status::Unset);
-    assert_eq!(status("//pkg:no_build"), Status::Unset);
-    assert_eq!(status("//pkg:interrupted"), Status::Unset);
+    let target = |label: &str| find_span(&spans, |s| s.name == format!("target {label}")).expect(label);
+    assert_eq!(target("//pkg:analysis").status, Status::error("ANALYSIS_FAILURE"));
+    assert_eq!(target("//pkg:incomplete").status, Status::error("INCOMPLETE"));
+    assert_eq!(target("//pkg:skipped").status, Status::Unset);
+    assert_eq!(target("//pkg:no_build").status, Status::Unset);
+    assert_eq!(target("//pkg:interrupted").status, Status::Unset);
+    assert_eq!(attr_value(&target("//pkg:analysis"), BAZEL_TARGET_SUCCESS).as_deref(), Some("false"));
+    assert_eq!(attr_value(&target("//pkg:skipped"), BAZEL_TARGET_SUCCESS), None);
+}
+
+#[test]
+fn lightweight_drops_never_built_targets() {
+    let (mut mapper, collector) = mapper_with_collector();
+    lightweight(&mut mapper);
+    mapper.on_target_skipped("//pkg:skipped", Some("SKIPPED"), None, Some(1_200_000_000));
+    // Bazel reports some skips twice; count each target once.
+    mapper.on_target_skipped("//pkg:skipped", Some("SKIPPED"), None, Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:no_build", Some("NO_BUILD"), None, Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:broken", Some("ANALYSIS_FAILURE"), None, Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:interrupted", Some("USER_INTERRUPTED"), None, Some(1_200_000_000));
+    // Already exported by a retained child: not suppressed.
+    mapper.target_parent_context("//pkg:opened", None);
+    mapper.on_target_skipped("//pkg:opened", Some("SKIPPED"), None, Some(1_200_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let targets: Vec<&str> = spans.iter().filter(|s| s.name.starts_with("target ")).map(|s| s.name.as_ref()).collect();
+    for kept in ["target //pkg:broken", "target //pkg:interrupted", "target //pkg:opened"] {
+        assert!(targets.contains(&kept), "{kept} missing: {targets:?}");
+    }
+    for dropped in ["target //pkg:skipped", "target //pkg:no_build"] {
+        assert!(!targets.contains(&dropped), "{dropped} emitted: {targets:?}");
+    }
+    let interrupted = find_span(&spans, |s| s.name == "target //pkg:interrupted").expect("interrupted");
+    assert_eq!(interrupted.status, Status::Unset);
+    assert_eq!(attr_value(&interrupted, BAZEL_TARGET_SUCCESS), None);
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(), Some("2"));
+}
+
+#[test]
+fn every_span_has_an_operation_name() {
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.compact_streaming_active = true;
+    mapper.on_compact_spawn(spawn_exec_with_metrics(
+        "//pkg:orphan",
+        "JavaCompile",
+        "bazel-out/orphan.jar",
+        "remote cache hit",
+        true,
+    ));
+    mapper.on_target_configured("//pkg:t", Some("cc_test"), &[], Some(1_100_000_000), None);
+    mapper.on_action_completed(action_event_for("//pkg:t", "CppCompile", "bazel-out/t.o"));
+    mapper.on_test_result(&TestResultEvent {
+        label: "//pkg:t",
+        status: Some("PASSED"),
+        attempt: Some(1),
+        run: None,
+        shard: None,
+        cached: Some(false),
+        strategy: None,
+        start_time_nanos: Some(1_300_000_000),
+        duration_nanos: Some(100_000_000),
+        hostname: None,
+        cached_remotely: None,
+    });
+    mapper.on_target_completed("//pkg:t", true, &[], Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:broken", Some("ANALYSIS_FAILURE"), None, Some(1_200_000_000));
+    mapper.finish();
+
+    let ops: std::collections::BTreeSet<String> = collector
+        .snapshot()
+        .iter()
+        .map(|s| attr_value(s, OPERATION_NAME).unwrap_or_else(|| panic!("no operation.name on {}", s.name)))
+        .collect();
+    assert_eq!(
+        ops.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["bazel.action", "bazel.invocation", "bazel.skipped_targets", "bazel.spawn", "bazel.target", "bazel.test"],
+    );
 }
 
 #[test]

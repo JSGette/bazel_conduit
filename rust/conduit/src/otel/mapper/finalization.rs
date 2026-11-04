@@ -223,6 +223,7 @@ fn synthesise_one_orphan_action(mapper: &mut OtelMapper, key: ActionSpanKey, spa
 
     let success = spawns.iter().all(|s| s.exit_code == 0);
     let mut attrs = vec![
+        KeyValue::new(OPERATION_NAME, "bazel.action"),
         KeyValue::new(BAZEL_ACTION_SUCCESS, success),
         KeyValue::new(BAZEL_TARGET_SYNTHETIC, true),
     ];
