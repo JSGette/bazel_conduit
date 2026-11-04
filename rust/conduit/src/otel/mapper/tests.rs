@@ -1710,6 +1710,23 @@ fn build_metrics_set_root_attrs_and_root_contains_finish() {
     assert_eq!(root.end_time, super::nanos_to_system_time(5_000_000_000));
 }
 
+#[test]
+fn build_metrics_omit_peak_heap_without_major_gc() {
+    use crate::build_event_stream::build_metrics::MemoryMetrics;
+    use crate::build_event_stream::BuildMetrics;
+
+    let (mut mapper, collector) = mapper_with_collector();
+    mapper.on_build_metrics(&BuildMetrics {
+        memory_metrics: Some(MemoryMetrics::default()),
+        ..Default::default()
+    });
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_METRICS_PEAK_HEAP_POST_GC), None);
+}
+
 // =====================================================================
 // Progress logs (`--logs`). Fixtures are Bazel 9 console chunks.
 // =====================================================================
