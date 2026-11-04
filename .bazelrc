@@ -1,1 +1,4 @@
+common --enable_platform_specific_config
+common:linux --host_platform=//platforms:local_gnu
+
 try-import %workspace%/user.bazelrc
