@@ -29,12 +29,12 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - uses: bazel-contrib/setup-bazel@4fd964a13a440a8aeb0be47350db2fc640f19ca8 # 0.15.0
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
           disk-cache: release-${{ matrix.platform }}
@@ -77,7 +77,7 @@ jobs:
             otool -l "$BIN" | grep -A3 LC_BUILD_VERSION | grep minos
           fi
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: conduit-${{ matrix.platform }}
           path: out/*
@@ -91,14 +91,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
 
       - run: ls -la artifacts/
 
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ inputs.tag || github.ref_name }}
