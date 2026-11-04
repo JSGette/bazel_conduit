@@ -10,6 +10,14 @@ use tracing::{debug, warn};
 use super::super::attributes::*;
 use super::{ConfiguredTarget, DeferredTarget, OtelMapper};
 
+// USER_INTERRUPTED: the root span already carries the non-zero exit code.
+const NON_FAILURE_ABORTS: [&str; 4] = ["SKIPPED", "NO_BUILD", "NO_ANALYZE", "USER_INTERRUPTED"];
+
+/// Whether an `Aborted` reason means the target failed to build.
+fn is_failure_abort(reason: Option<&str>) -> bool {
+    !reason.is_some_and(|r| NON_FAILURE_ABORTS.contains(&r))
+}
+
 impl OtelMapper {
     /// TargetConfigured -> store metadata for deferred span creation.
     ///
@@ -369,7 +377,12 @@ impl OtelMapper {
         let span = self.tracer.build_with_context(builder, parent);
         let cx = Context::new().with_span(span);
 
-        cx.span().set_status(Status::Unset);
+        let status = if is_failure_abort(reason) {
+            Status::error(reason.unwrap_or("UNKNOWN").to_string())
+        } else {
+            Status::Unset
+        };
+        cx.span().set_status(status);
         cx.span().end_with_timestamp(instant);
         self.synthetic_target_labels.remove(label);
         self.target_child_end_nanos.remove(label);
