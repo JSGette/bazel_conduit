@@ -65,6 +65,7 @@ use self::utils::{
 };
 
 pub use self::progress::LogMode;
+pub(crate) use self::targets::is_failure_abort;
 pub use self::utils::{clamp_time_range, truncate_to_byte_limit};
 
 /// Arguments for [`OtelMapper::on_action_completed`]. Owned, because the

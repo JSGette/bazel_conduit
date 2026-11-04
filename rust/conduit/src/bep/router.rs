@@ -18,6 +18,7 @@ use crate::otel::span::{Logger, Tracer};
 use crate::build_event_stream::build_event::Payload as BepPayload;
 use crate::build_event_stream::build_event_id::Id as BepId;
 use crate::build_event_stream::BuildEvent;
+use crate::otel::mapper::is_failure_abort;
 use crate::otel::{ActionCompletedEvent, LogMode, OtelMapper, Redactor, TestResultEvent};
 use crate::state::{
     TracePolicy, TraceProfile, DEFAULT_MAX_ACTION_SPANS, DEFAULT_TRACE_MIN_DURATION_MS,
@@ -517,7 +518,9 @@ impl EventRouter {
                 let label = t.label.clone();
                 if let Some(BepPayload::Aborted(a)) = &event.payload {
                     self.summary.targets += 1;
-                    self.summary.failed_targets += 1;
+                    if is_failure_abort(Some(a.reason().as_str_name())) {
+                        self.summary.failed_targets += 1;
+                    }
                     if let Some(mapper) = &mut self.mapper {
                         mapper.on_target_skipped(
                             &label,
@@ -1032,6 +1035,34 @@ mod tests {
             .collect();
         skipped.sort();
         assert_eq!(skipped, ["target //:broken", "target //:needs_broken"]);
+    }
+
+    #[test]
+    fn only_failure_aborts_count_as_failed_targets() {
+        use crate::build_event_stream::build_event::Payload;
+        use crate::build_event_stream::build_event_id::{Id, TargetCompletedId};
+        use crate::build_event_stream::aborted::AbortReason;
+        use crate::build_event_stream::{Aborted, BuildEvent, BuildEventId};
+
+        let aborted = |label: &str, reason: AbortReason| BuildEvent {
+            id: Some(BuildEventId {
+                id: Some(Id::TargetCompleted(TargetCompletedId { label: label.into(), ..Default::default() })),
+            }),
+            payload: Some(Payload::Aborted(Aborted { reason: reason as i32, ..Default::default() })),
+            ..Default::default()
+        };
+
+        let mut router = super::EventRouter::new();
+        for ev in [
+            aborted("//:windows_only", AbortReason::Skipped),
+            aborted("//:no_build", AbortReason::NoBuild),
+            aborted("//:broken", AbortReason::AnalysisFailure),
+        ] {
+            router.route_build_event(&ev, None).unwrap();
+        }
+
+        assert_eq!(router.summary().targets, 3);
+        assert_eq!(router.summary().failed_targets, 1);
     }
 
     #[test]

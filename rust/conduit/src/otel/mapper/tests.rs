@@ -543,16 +543,32 @@ fn failure_aborts_are_span_errors() {
     mapper.finish();
 
     let spans = collector.snapshot();
-    let status = |label: &str| {
-        find_span(&spans, |s| s.name == format!("target {label}"))
-            .expect(label)
-            .status
-    };
-    assert_eq!(status("//pkg:analysis"), Status::error("ANALYSIS_FAILURE"));
-    assert_eq!(status("//pkg:incomplete"), Status::error("INCOMPLETE"));
-    assert_eq!(status("//pkg:skipped"), Status::Unset);
-    assert_eq!(status("//pkg:no_build"), Status::Unset);
-    assert_eq!(status("//pkg:interrupted"), Status::Unset);
+    let target = |label: &str| find_span(&spans, |s| s.name == format!("target {label}")).expect(label);
+    assert_eq!(target("//pkg:analysis").status, Status::error("ANALYSIS_FAILURE"));
+    assert_eq!(target("//pkg:incomplete").status, Status::error("INCOMPLETE"));
+    assert_eq!(target("//pkg:skipped").status, Status::Unset);
+    assert_eq!(target("//pkg:no_build").status, Status::Unset);
+    assert_eq!(target("//pkg:interrupted").status, Status::Unset);
+    assert_eq!(attr_value(&target("//pkg:analysis"), BAZEL_TARGET_SUCCESS).as_deref(), Some("false"));
+    assert_eq!(attr_value(&target("//pkg:skipped"), BAZEL_TARGET_SUCCESS), None);
+}
+
+#[test]
+fn lightweight_keeps_only_failure_aborts() {
+    let (mut mapper, collector) = mapper_with_collector();
+    lightweight(&mut mapper);
+    mapper.on_target_skipped("//pkg:skipped", Some("SKIPPED"), None, Some(1_200_000_000));
+    // Bazel reports some skips twice; count each target once.
+    mapper.on_target_skipped("//pkg:skipped", Some("SKIPPED"), None, Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:no_build", Some("NO_BUILD"), None, Some(1_200_000_000));
+    mapper.on_target_skipped("//pkg:broken", Some("ANALYSIS_FAILURE"), None, Some(1_200_000_000));
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let targets: Vec<&str> = spans.iter().filter(|s| s.name.starts_with("target ")).map(|s| s.name.as_ref()).collect();
+    assert_eq!(targets, ["target //pkg:broken"]);
+    let root = find_span(&spans, |s| s.parent_span_id == SpanId::INVALID).expect("root span");
+    assert_eq!(attr_value(&root, BAZEL_TRACE_SUPPRESSED_TARGETS).as_deref(), Some("2"));
 }
 
 #[test]

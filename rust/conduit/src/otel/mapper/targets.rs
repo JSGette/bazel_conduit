@@ -14,7 +14,7 @@ use super::{ConfiguredTarget, DeferredTarget, OtelMapper};
 const NON_FAILURE_ABORTS: [&str; 4] = ["SKIPPED", "NO_BUILD", "NO_ANALYZE", "USER_INTERRUPTED"];
 
 /// Whether an `Aborted` reason means the target failed to build.
-fn is_failure_abort(reason: Option<&str>) -> bool {
+pub(crate) fn is_failure_abort(reason: Option<&str>) -> bool {
     !reason.is_some_and(|r| NON_FAILURE_ABORTS.contains(&r))
 }
 
@@ -303,7 +303,8 @@ impl OtelMapper {
     }
 
     /// TargetCompleted with `aborted` payload -> create a brief span under
-    /// the "skipped" parent and end it immediately.
+    /// the "skipped" parent and end it immediately. The lightweight profile
+    /// only keeps failure aborts.
     pub fn on_target_skipped(
         &mut self,
         label: &str,
@@ -323,6 +324,16 @@ impl OtelMapper {
             existing.span().set_status(Status::Unset);
             existing.span().end();
             debug!("Ended leaked target span for {label} on skip");
+        }
+
+        let failed = is_failure_abort(reason);
+        if !failed && !self.trace_policy.is_full() {
+            self.synthetic_target_labels.remove(label);
+            self.target_child_end_nanos.remove(label);
+            self.closed_targets.insert(label.to_string());
+            self.suppressed_targets = self.suppressed_targets.saturating_add(1);
+            debug!("Suppressed skipped target span for {label} (lightweight)");
+            return;
         }
 
         let instant = event_time_nanos.or_else(super::wall_clock_now_nanos);
@@ -347,10 +358,10 @@ impl OtelMapper {
         };
 
         let short = shorten_label(label);
-        let mut attrs = vec![
-            KeyValue::new(BAZEL_TARGET_LABEL, label.to_string()),
-            KeyValue::new(BAZEL_TARGET_SUCCESS, false),
-        ];
+        let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, label.to_string())];
+        if failed {
+            attrs.push(KeyValue::new(BAZEL_TARGET_SUCCESS, false));
+        }
         if let Some(configured) = &configured {
             if let Some(k) = &configured.kind {
                 attrs.push(KeyValue::new(BAZEL_TARGET_KIND, k.clone()));
@@ -377,7 +388,7 @@ impl OtelMapper {
         let span = self.tracer.build_with_context(builder, parent);
         let cx = Context::new().with_span(span);
 
-        let status = if is_failure_abort(reason) {
+        let status = if failed {
             Status::error(reason.unwrap_or("UNKNOWN").to_string())
         } else {
             Status::Unset
