@@ -55,7 +55,8 @@ pub(super) fn apply_build_metrics(mapper: &mut OtelMapper, m: &BuildMetrics) {
         }
     }
 
-    if let Some(mm) = &m.memory_metrics {
+    // Bazel reports 0 when no major GC ran: no sample, not a heap size.
+    if let Some(mm) = m.memory_metrics.as_ref().filter(|mm| mm.peak_post_gc_heap_size > 0) {
         attrs.push(KeyValue::new(BAZEL_METRICS_PEAK_HEAP_POST_GC, mm.peak_post_gc_heap_size));
     }
     if let Some(tm) = &m.target_metrics {
