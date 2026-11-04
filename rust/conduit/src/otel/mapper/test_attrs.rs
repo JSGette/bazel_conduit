@@ -27,7 +27,10 @@ pub(super) fn test_status(ev: &TestResultEvent<'_>) -> Status {
 }
 
 pub(super) fn build_test_attrs(ev: &TestResultEvent<'_>) -> Vec<KeyValue> {
-    let mut attrs = vec![KeyValue::new(BAZEL_TARGET_LABEL, ev.label.to_string())];
+    let mut attrs = vec![
+        KeyValue::new(OPERATION_NAME, "bazel.test"),
+        KeyValue::new(BAZEL_TARGET_LABEL, ev.label.to_string()),
+    ];
     if let Some(v) = ev.status {
         attrs.push(KeyValue::new(BAZEL_TEST_STATUS, v.to_string()));
     }

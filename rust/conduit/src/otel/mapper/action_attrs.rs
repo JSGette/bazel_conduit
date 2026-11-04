@@ -32,7 +32,10 @@ pub(super) fn build_action_attrs(
     configurations: &HashMap<String, String>,
     redactor: &Redactor,
 ) -> Vec<KeyValue> {
-    let mut attrs = vec![KeyValue::new(BAZEL_ACTION_SUCCESS, ev.success)];
+    let mut attrs = vec![
+        KeyValue::new(OPERATION_NAME, "bazel.action"),
+        KeyValue::new(BAZEL_ACTION_SUCCESS, ev.success),
+    ];
 
     if let Some(v) = ev.mnemonic.as_deref() {
         attrs.push(KeyValue::new(BAZEL_ACTION_MNEMONIC, v.to_string()));

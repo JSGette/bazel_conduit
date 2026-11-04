@@ -32,6 +32,7 @@ impl OtelMapper {
             .span_builder(span_name)
             .with_kind(SpanKind::Internal)
             .with_attributes(vec![
+                KeyValue::new(OPERATION_NAME, "bazel.invocation"),
                 KeyValue::new(BAZEL_INVOCATION_ID, uuid.to_string()),
                 KeyValue::new(BAZEL_COMMAND, command.to_string()),
             ]);
