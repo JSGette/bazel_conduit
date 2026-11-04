@@ -529,6 +529,33 @@ fn skipped_targets_share_one_instant() {
 }
 
 #[test]
+fn failure_aborts_are_span_errors() {
+    let (mut mapper, collector) = mapper_with_collector();
+    for (label, reason) in [
+        ("//pkg:analysis", "ANALYSIS_FAILURE"),
+        ("//pkg:incomplete", "INCOMPLETE"),
+        ("//pkg:skipped", "SKIPPED"),
+        ("//pkg:no_build", "NO_BUILD"),
+        ("//pkg:interrupted", "USER_INTERRUPTED"),
+    ] {
+        mapper.on_target_skipped(label, Some(reason), None, Some(1_200_000_000));
+    }
+    mapper.finish();
+
+    let spans = collector.snapshot();
+    let status = |label: &str| {
+        find_span(&spans, |s| s.name == format!("target {label}"))
+            .expect(label)
+            .status
+    };
+    assert_eq!(status("//pkg:analysis"), Status::error("ANALYSIS_FAILURE"));
+    assert_eq!(status("//pkg:incomplete"), Status::error("INCOMPLETE"));
+    assert_eq!(status("//pkg:skipped"), Status::Unset);
+    assert_eq!(status("//pkg:no_build"), Status::Unset);
+    assert_eq!(status("//pkg:interrupted"), Status::Unset);
+}
+
+#[test]
 fn skipped_target_before_build_start_stays_inside_root() {
     let (mut mapper, collector) = mapper_with_collector();
     mapper.on_target_skipped("//pkg:early", Some("SKIPPED"), None, Some(500_000_000));
